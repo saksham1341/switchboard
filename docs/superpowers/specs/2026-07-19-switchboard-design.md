@@ -33,14 +33,6 @@ any egress, topology as configuration.
 - No plugin loader, adapter registry, or config-driven adapter discovery. Adapters are
   wired explicitly in code.
 
-## Scope discipline
-
-The generality lives in the *shape*, not in features. If the generic version costs more
-than roughly two days over a purpose-built GitHub→Discord script, the trade is wrong.
-
-**v1 ships PR notifications from GitHub into a Discord channel, running on the Pi.**
-An elegant bus that never posts a message is a failure.
-
 ## Architecture
 
 ```
@@ -126,9 +118,9 @@ Pi has no UPS, so power loss during a write is a realistic failure mode, not a h
 
 Single file. Migration to another host is a file copy.
 
-## Topics and filtering
+## Kinds and filtering
 
-### Topic naming
+### Kind naming
 
 Hierarchical, dot-separated, `source.entity.action`:
 
@@ -137,57 +129,63 @@ github.home.pr.opened
 github.home.check_run.failed
 ```
 
-Wildcards follow NATS convention: `*` matches one token, `>` matches one or more trailing
-tokens.
+This is a **naming convention only** — used for logs, grouping, and metrics. There is no
+subject matcher, no trie, and no wildcard syntax. Filtering is done by predicates (below).
 
-```
-github.*.pr.*              all PR activity, any repo
-github.*.check_run.failed  CI failures anywhere
-github.>                   everything from GitHub
-```
+### Filtering is predicates, not patterns
 
-This appears in every adapter and every config, so it is deliberately fixed early —
-changing it later is a full sweep. Flat kinds are a subset, so nothing is lost.
-
-### Two-level filtering
-
-An egress declares a coarse gate; its handlers refine it.
+An egress declares a coarse gate; its handlers refine it. Both are plain functions.
 
 ```ts
+type Filter = (e: Event) => boolean
+
 interface Egress<Ctx> {
   name: string
-  filter?: string           // coarse gate, e.g. 'github.>'
+  filter?: Filter           // coarse gate, e.g. e => e.source === 'github'
   handlers: Handler<Ctx>[]
   context(): Ctx            // utilities handed to handlers
 }
 
 interface Handler<Ctx> {
   name: string
-  filter: string            // 'github.*.pr.*'
+  filter: Filter            // e => e.kind.includes('.pr.')
   handle(e: Event, ctx: Ctx): Promise<void>
 }
 ```
 
-The effective filter for a handler is `egress.filter AND handler.filter`, computed once at
-attach time so matching remains a single trie lookup at publish time.
+Predicates were chosen over pattern matching because they strictly subsume it — any subject
+wildcard is expressible as a string predicate — while also being able to read `payload`,
+which a subject matcher fundamentally cannot:
 
-### Filters register upward
+```ts
+filter: e => e.source === 'github' && (e.payload as PrPayload).labels.includes('urgent')
+```
 
-`broker.attach(egress)` walks `egress.handlers` and indexes each effective filter into the
-broker's subscription trie. Filters are **not** evaluated privately inside the egress.
+A pattern language would be a less capable mechanism that we would then need to extend.
+
+### Filters are evaluated by the broker, not privately by the egress
+
+`broker.attach(egress)` registers each handler's effective filter — `egress.filter(e) &&
+handler.filter(e)` — with the broker.
 
 This is load-bearing: if the egress filtered internally, the broker could not know the
-target set at publish time, so it could not write delivery rows before dispatching. A crash
-mid-fan-out would leave no record of which handlers had already run. The logical model is
-still "the egress fans out to handlers whose filters pass" — the broker just knows the
-filter set so it can be durable about it.
+target set at publish time, so it could not write delivery rows before dispatching, and a
+crash mid-fan-out would leave no record of which handlers had already run. The logical
+model is still "the egress fans out to handlers whose filters pass" — the broker simply
+owns the evaluation so it can be durable about the result.
+
+Filters do not need to be serializable. They are evaluated in-process at publish time, and
+what is persisted is the resulting set of handler IDs — plain strings.
 
 Publish becomes:
 
 ```
-publish(e) → match effective filters → write N pending Delivery rows
+publish(e) → evaluate filters → write N pending Delivery rows
            → dispatch each → update status
 ```
+
+Filters must be pure and cheap: they run once per handler per event, on the publish path.
+Side effects or I/O in a filter is a layering violation — that work belongs in `handle`.
 
 ### Handler context
 
@@ -226,9 +224,6 @@ interface EventMap {
 publish<K extends keyof EventMap>(kind: K, payload: EventMap[K]): void
 ```
 
-Wildcards remain a *subscription-side* concept only. Publishers always emit concrete topics;
-only filters use `*` and `>`.
-
 One file. Core stays generic; adapters get full type checking.
 
 ## Delivery semantics
@@ -262,10 +257,10 @@ Subscribed GitHub webhook events:
 
 CI successes are never relayed. Failures only.
 
-**Broker:** `InMemoryBroker` — subscription trie, SQLite-WAL persistence, retry loop,
+**Broker:** `InMemoryBroker` — filter registry, SQLite-WAL persistence, retry loop,
 replay on boot.
 
-**Egress:** `DiscordEgress` — one handler, filter `github.>`, posting to a single channel
+**Egress:** `DiscordEgress` — one handler, filter `e => e.source === 'github'`, posting to a single channel
 via a Discord channel webhook URL. No bot application, no gateway connection, no
 interactions endpoint.
 
@@ -296,7 +291,7 @@ type-checked, and greppable.
 const broker = new InMemoryBroker({ wal: './switchboard.db' })
 broker.attach(new DiscordEgress({
   webhookUrl: env.DISCORD_WEBHOOK_URL,
-  filter: 'github.>',
+  filter: e => e.source === 'github',
   handlers: [prToEng],
 }))
 await new GitHubIngress({ secret: env.GITHUB_WEBHOOK_SECRET }).start(broker.publish)
@@ -317,8 +312,8 @@ await new GitHubIngress({ secret: env.GITHUB_WEBHOOK_SECRET }).start(broker.publ
 
 ## Testing
 
-- **Unit:** filter/wildcard matching (`*` and `>` semantics, egress∧handler conjunction),
-  backoff schedule, dedup.
+- **Unit:** filter evaluation (egress∧handler conjunction, a failing egress gate short-
+  circuiting its handlers), backoff schedule, dedup.
 - **Integration:** recorded real GitHub webhook payloads → broker → fake egress, asserting
   correct topics and delivery rows.
 - **Durability:** publish, kill the process mid-dispatch, restart, assert pending deliveries
@@ -338,15 +333,16 @@ Deliberately designed for, not built:
 - **Discord ingress / GitHub egress:** each provider becomes a connector implementing both
   halves. Additive; no refactor of the event type.
 - **NATS or Redis broker:** swap `InMemoryBroker` behind the existing interface when
-  multi-process fan-out is genuinely needed. The interface is deliberately shaped as a
-  subset of NATS semantics so the swap is mechanical rather than a redesign.
+  multi-process fan-out is genuinely needed. Since filters are predicates rather than
+  subjects, a remote broker would subscribe coarsely (by `source`, using `kind` as the
+  subject) and keep predicate refinement in-process. Nothing about predicate filtering
+  blocks that migration.
 - **Multi-channel routing:** additional handlers with narrower filters. No core change.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| Scope inflation into a "platform" that never ships | Hard v1 scope above; two-day generality budget |
 | Building a worse NATS feature-by-feature | Keep implementation minimal; swap out rather than grow |
 | Pi power loss corrupting the log | SQLite WAL mode; durability test in the suite |
 | Residential network unreliability | Retry with backoff; WAL survives disconnection |
