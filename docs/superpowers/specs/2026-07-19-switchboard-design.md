@@ -7,9 +7,10 @@
 ## Summary
 
 Switchboard is a general-purpose, event-driven relay engine. Ingress adapters publish
-events onto a broker; egress adapters subscribe and act on them. The core is domain-agnostic
-— it owns durability, filtering, retry, and delivery state. All domain knowledge lives in
-adapters.
+events; egress handlers consume and act on them. All domain knowledge lives in adapters;
+durability, leasing, retry, and dead-lettering are delegated to
+[mamamia](https://github.com/saksham1341/mamamia), an existing append-only log with
+consumer groups and JIT leasing.
 
 The first application is GitHub repository activity relayed into Discord. The engine itself
 knows nothing about GitHub or Discord.
@@ -23,136 +24,298 @@ any egress, topology as configuration.
   received — including across process crashes and restarts.
 - Keep the core generic so new providers are new adapters, not core changes.
 - Run on a Raspberry Pi today, move to a hosted environment later with no code change.
-- Stay small. The abstraction is cheap; the implementation must stay embarrassingly small.
-- Async-first throughout. Every interface boundary returns a promise; no interface in this
-  design returns a bare value.
+- Reuse mamamia rather than reimplementing a queue. Switchboard contributes the persistent
+  backends mamamia's roadmap already calls for.
+- Async-first throughout. Every interface boundary is a coroutine.
 
 ## Non-goals (v1)
 
 - No writes back to GitHub. Read-only relay.
 - No Discord slash commands. One-way feed only.
 - No multi-channel routing. One channel.
-- No external broker (Redis/NATS). In-memory implementation behind an interface.
-- No plugin loader, adapter registry, or config-driven adapter discovery. Adapters are
-  wired explicitly in code.
+- No plugin loader or config-driven adapter discovery. Adapters are wired explicitly in code.
+- No mamamia TCP server. The `Orchestrator` is used in-process as a library; the
+  client/server and binary protocol layers are unused.
 - **No backfill of events missed while offline.** If the process is down when a webhook
-  fires, GitHub's delivery fails and that event is lost. This is accepted: at current
-  volume the cost of a missed notification is near zero, and the Pi is a temporary home.
-  See *Future work* for the recovery path if this stops being acceptable.
+  fires, GitHub's delivery fails and that event is lost. Accepted: at current volume the
+  cost of a missed notification is near zero, and the Pi is a temporary home. See
+  *Future work* for the recovery path if that changes.
+
+## Why mamamia
+
+The delivery semantics Switchboard needs — durable log, per-consumer progress, exclusive
+claim while processing, retry with a dead-letter ceiling — are exactly what mamamia
+implements. Three of its decisions are better than what an independent design reached:
+
+- **Leases carry an owner and an expiry** (`core/models.py`). Crash recovery is automatic:
+  an expired lease is simply reacquirable. No boot-time reset hook, and no assumption that
+  only one process is running.
+- **Lazy reap** (`server/orchestrator.py`): a message in `IN_PROGRESS` with no live lease is
+  reset to `PENDING` on read. Correctness lives on the read path, so the background
+  `reap_expired()` is housekeeping rather than a correctness dependency.
+- **Ownership check on settle** (`server/orchestrator.py`): a worker whose lease expired
+  cannot settle a message another worker now holds. Without this, a handler that times out
+  and *then* completes would corrupt the state of the retry already in flight.
+
+The one thing mamamia lacks is persistence — its storage, state, and lease backends are all
+in-memory. Its README lists a SQLite/WAL backend as future work. Switchboard's core
+deliverable is exactly that, which makes this reuse rather than adoption of a dependency
+that fits by accident.
 
 ## Architecture
 
 ```
-GitHub ──webhook──▶ GitHubIngress ──publish──▶ ┌─────────────┐
-                                               │   Broker    │
-                                    ┌──────────┤  (in-mem)   │
-                                    │          └──────┬──────┘
-                              [ SQLite WAL ]          │ match filters
-                              events (append)         │ write deliveries
-                              deliveries (status)     ▼
-                                               DiscordEgress
-                                                 ├─ handler: pr-to-eng
-                                                 └─ handler: ci-to-alerts
-                                                          │
-                                                          ▼
-                                                      Discord
+GitHub ──webhook──▶ GitHubIngress
+                          │ publish()
+                          ▼
+                   ┌──────────────────────────────────┐
+                   │  mamamia Orchestrator            │
+                   │    IMessageStorage  ─┐           │
+                   │    IStateStore       ├─ SQLite   │
+                   │    ILeaseManager    ─┘   (WAL)   │
+                   └──────────────────────────────────┘
+                          │ acquire_next(group_id=handler)
+            ┌─────────────┼─────────────┐
+            ▼             ▼             ▼
+       handler task  handler task  handler task
+       (log-all)     (pr-to-eng)   (ci-to-alerts)
+            │             │             │
+            └─────────────┴─────────────┘
+                          ▼
+                   LoggerEgress / DiscordEgress
 ```
 
 ### Layer boundaries
 
-**Core owns** (never duplicated in adapters): the WAL, deduplication, filter matching,
-retry and backoff, delivery state, dead-lettering, dispatch ordering.
+**mamamia owns:** the append-only log, per-group offsets and message state, leases, retry
+counts, dead-lettering.
+
+**Switchboard core owns:** the SQLite backends, the event envelope, adapter lifecycle, the
+per-handler consumer loops, and dispatch timeouts.
 
 **Adapters own** translation only: bytes → `Event` on ingress, `Event` → side effect on
-egress. An adapter performing its own scheduling or retry is in the wrong layer.
-
-This boundary is the single most important rule in the codebase. Every adapter that
-reimplements retry does so subtly wrong, and that bug class is never fully cleared.
+egress. An adapter doing its own scheduling or retry is in the wrong layer. This is the
+single most important rule in the codebase — an adapter that reimplements retry does so
+subtly wrong, and that bug class is never fully cleared.
 
 ## Data model
 
 ### Event — an immutable fact
 
-```ts
-type Event = {
-  id: string          // ULID, assigned by core
-  kind: string        // 'github.home.pr.opened'
-  source: string      // 'github'
-  at: string          // ISO 8601, when it occurred
-  dedupeKey?: string  // provider-supplied idempotency key
-  payload: unknown    // adapter-defined, opaque to core
-  meta: Record<string, string>
-}
+An event is the `payload` of a mamamia message. It carries no targets, no status, and no
+reply address; those are delivery concerns.
+
+```python
+@dataclass(frozen=True)
+class Event:
+    id: str                      # ULID, assigned by core
+    kind: str                    # 'github.home.pr.opened'
+    source: str                  # 'github'
+    at: str                      # ISO 8601, when it occurred
+    payload: dict                # adapter-defined, opaque to core
+    dedupe_key: str | None = None
+    meta: dict[str, str] = field(default_factory=dict)
 ```
 
-An event carries no targets, no status, no reply address. Those are delivery concerns.
-"Was it delivered?" is not a property of the fact that a PR opened.
+`meta` carries transport-level provenance that is not part of the fact itself — delivery id,
+signature algorithm, receipt timestamp. Adapters write it; handlers may read it; the core
+only persists it.
 
-### Delivery — a unit of work owed to one handler
+### Delivery state — owned by mamamia
 
-```ts
-type Delivery = {
-  id: string
-  eventId: string
-  handlerId: string    // 'discord/pr-to-eng'
-  status: 'pending' | 'processing' | 'success' | 'failed' | 'dead'
-  attempts: number
-  lastError?: string
-  nextRetryAt?: string
-  startedAt?: string   // set on transition to 'processing'
-  replyTo?: string     // reserved for commands; unused in v1
-}
-```
+Switchboard has **no deliveries table.** Per-handler delivery state is mamamia's
+per-`(log_id, group_id, message_id)` state, plus its lease and retry count.
 
-Deliveries are distinct from events because their lifecycles differ:
+The mapping is exact, and was arrived at independently on both sides:
 
-| | `events` | `deliveries` |
-|---|---|---|
-| Mutability | append-only, never updated | status mutates |
-| Cardinality | one per received webhook | one per matching handler |
-| Meaning | a fact that happened | work owed to one handler |
+| Switchboard concept | mamamia concept |
+|---|---|
+| event log | `log_id` (one log, `'events'`) |
+| handler | `group_id` (consumer group) |
+| delivery | `(group_id, message_id)` state + lease + retry count |
+| in flight | `IN_PROGRESS` + live lease |
+| delivered | `PROCESSED` |
+| retryable failure | `FAILED`, retry count incremented |
+| dead-lettered | `DEAD` (retry ceiling reached) |
 
-Delivery identity is `(event, handler)` — not `(event, connector)`. If `#eng` succeeds
-and `#alerts` fails, only `#alerts` retries. A single status field on the event cannot
-represent two outcomes and would force either a duplicate post or a false failure.
+A handler is precisely a consumer group over the event log. Because every group
+independently consumes every message, fan-out is inherent — there is nothing to compute or
+persist at publish time.
 
-Replay on boot is then `SELECT * FROM deliveries WHERE status = 'pending'`.
+### Storage backends
 
-### Storage
+Switchboard implements all three mamamia interfaces against one SQLite database in
+`journal_mode=WAL`:
 
-SQLite with `PRAGMA journal_mode=WAL`. Chosen over a hand-rolled append-only log because
-fsync durability, torn writes, replay, and compaction are already solved there — and the
-Pi has no UPS, so power loss during a write is a realistic failure mode, not a hypothetical.
+- `SQLiteMessageStorage` — append-only `messages` table, monotonic index per log.
+- `SQLiteStateStore` — `(log_id, group_id, message_id) → state`, plus base offsets and
+  retry counts.
+- `SQLiteLeaseManager` — `(log_id, group_id, message_id) → owner_id, expiry`, with
+  acquisition as a single conditional `INSERT ... ON CONFLICT` so a lease cannot be granted
+  twice.
 
-Single file. Migration to another host is a file copy.
+SQLite is chosen over a hand-rolled log because fsync durability, torn writes, and crash
+recovery are already solved there — and the Pi has no UPS, so power loss mid-write is a
+realistic failure mode. Single file; migration to another host is a file copy.
+
+Lease acquisition must be atomic in a single statement, not read-then-write. This is the one
+place where a race would silently double-deliver.
 
 ### Retention
 
 Unbounded growth on an SD card is not acceptable, so both tables are bounded:
 
-- **Deliveries** are pruned once terminal. `success` rows are deleted immediately.
-  `dead` rows are retained (capped at the most recent 500) — pruning them on arrival would
-  destroy the only record of what failed, which is the entire point of dead-lettering.
-- **Events** are a bounded log: the oldest rows are deleted beyond a cap
-  (`WAL_MAX_EVENTS`, default 10,000). An event is never pruned while it still has
-  non-terminal deliveries.
+- **State rows** are pruned once terminal. `PROCESSED` rows are deleted behind the group's
+  base offset. `DEAD` rows are retained (capped at the most recent 500) — pruning them would
+  destroy the only record of what failed, which is the point of dead-lettering.
+- **Messages** are a bounded log: oldest rows deleted beyond `WAL_MAX_EVENTS` (default
+  10,000), never below the lowest base offset across groups.
 
-Consequence: `dedupeKey` uniqueness is only as durable as the event log. Once an event ages
-out, a redelivery of that same webhook would be processed as new. At current volume this
-window is months, so it is accepted rather than tracked separately.
+Consequence: `dedupe_key` uniqueness is only as durable as the log. Once a message ages out,
+a redelivery of that webhook is processed as new. At current volume that window is months,
+so it is accepted rather than tracked separately.
 
 ### Schema migrations
 
-`PRAGMA user_version` plus an ordered array of migration functions, applied in a transaction
-on boot. This is what `user_version` exists for; it is roughly thirty lines and adds no
-dependency.
+`PRAGMA user_version` plus an ordered list of migration callables applied in a transaction on
+boot. That is what `user_version` exists for; roughly thirty lines, no dependency. Alembic is
+viable now that the stack is Python, but it targets SQLAlchemy and we are using raw
+`aiosqlite` — worth revisiting only if the schema starts moving often.
 
-Alembic is SQLAlchemy-specific and Python-only, so it is not an option on this stack. The
-Node equivalents (Drizzle Kit, Umzug, Kysely's migrator) are all reasonable, but each brings
-a dependency and a CLI step to earn its keep — worth revisiting if the schema starts moving
-often, or if we adopt a query builder for other reasons.
+## Core interfaces
 
-## Kinds and filtering
+### Broker
+
+A thin facade over mamamia's `Orchestrator`. Its job is to own the envelope, assign
+identity, and run consumer loops — not to reimplement queueing.
+
+```python
+class Broker(Protocol):
+    async def publish(self, event: EventInput) -> PublishResult:
+        """Append an event to the log.
+
+        Returns once the message is durably committed — NOT once handlers have run.
+        This is what lets any ingress acknowledge its transport quickly.
+        """
+
+    def attach(self, egress: Egress) -> None:
+        """Register an egress and its handlers. Each handler becomes a consumer group.
+        Idempotent by egress name."""
+
+    async def start(self) -> None:
+        """Run migrations, then start one consumer task per handler."""
+
+    async def stop(self) -> None:
+        """Stop consumer tasks, release held leases, close the database."""
+
+    def on(self, hook: Literal['success', 'failed', 'dead'],
+           fn: Callable[[Event, str], None]) -> None:
+        """Process-local observability. Not persisted, not replayed."""
+```
+
+```python
+@dataclass
+class EventInput:
+    kind: str
+    source: str
+    payload: dict
+    at: str | None = None            # defaults to receipt time
+    dedupe_key: str | None = None
+    meta: dict[str, str] = field(default_factory=dict)
+
+@dataclass
+class PublishResult:
+    status: Literal['accepted', 'duplicate']
+    event_id: str
+```
+
+`EventInput` has no `id` — the core assigns a ULID. Adapters supply facts; the core owns
+identity.
+
+`PublishResult` no longer reports a fan-out count. With consumer groups, no delivery rows
+exist at publish time; every group implicitly owes every message.
+
+There is no `publish_and_wait`. It was designed to support commands, and commands are out of
+scope; when they arrive, the natural form is a correlation id plus a reply handler rather
+than a blocking publish, since the awaiting caller does not survive a restart anyway.
+
+### Ingress
+
+```python
+class Ingress(Protocol):
+    name: str
+    async def start(self, publish: Publish) -> None: ...
+    async def stop(self) -> None: ...
+
+Publish = Callable[[EventInput], Awaitable[PublishResult]]
+```
+
+An ingress owns its transport entirely — the core runs no HTTP server. `GitHubIngress`
+starts a listener, verifies the HMAC, calls `publish`, and responds `200` as soon as
+`publish` returns. Because `publish` only awaits the log append, that response stays fast
+regardless of how slow any egress is, which keeps GitHub's 10-second webhook timeout
+irrelevant.
+
+The ingress receives only the `publish` callable, not the broker — it cannot attach
+egresses or inspect delivery state.
+
+### Egress and handlers
+
+```python
+Filter = Callable[[Event], bool]
+
+class Handler(Protocol):
+    name: str                        # 'pr-to-eng' → group_id 'discord/pr-to-eng'
+    filter: Filter
+    timeout_s: float | None          # per-dispatch cap; defaults to broker's 30s
+    lease_s: float | None            # lease duration; defaults to timeout_s * 2
+    async def handle(self, event: Event, ctx: Any) -> None: ...
+
+class Egress(Protocol):
+    name: str                        # 'discord'
+    filter: Filter | None            # coarse gate
+    handlers: list[Handler]
+    def context(self) -> Any:        # utilities handed to its handlers
+        ...
+```
+
+The egress owns the connection, auth, and rate limiter once. Attaching five handlers does
+not create five rate limiters competing for the same API quota.
+
+Handler context is typed per egress, so a Discord handler gets Discord capabilities without
+holding its own credentials:
+
+```python
+class DiscordCtx(Protocol):
+    async def send(self, channel: str, msg: DiscordMessage) -> MessageRef: ...
+    async def edit(self, ref: MessageRef, msg: DiscordMessage) -> None: ...
+```
+
+### Filtering
+
+Filters are predicates, not patterns. They subsume any subject-wildcard scheme while also
+being able to read `payload`, which a subject matcher fundamentally cannot:
+
+```python
+filter = lambda e: e.source == 'github' and 'urgent' in e.payload.get('labels', [])
+```
+
+The effective filter for a handler is `egress.filter(e) and handler.filter(e)`.
+
+Filters are evaluated **in the handler's own consumer loop**, at acquire time. An event that
+fails the filter is settled immediately as success and the loop moves on.
+
+This is a change from an earlier draft, which required filters to be registered upward to
+the broker so it could write delivery rows before dispatching. That requirement was an
+artifact of precomputing deliveries; mamamia creates per-group state lazily, defaulting any
+unseen `(group, message)` to `PENDING`, so there is nothing to precompute and no window in
+which a crash could lose track of who owed what.
+
+Filters must be pure and cheap — they run once per handler per event. I/O in a filter is a
+layering violation; that work belongs in `handle`.
+
+Cost: a handler still transitions state for every event it filters out. At current volume
+this is a few rows per day and is not worth optimising away.
 
 ### Kind naming
 
@@ -163,299 +326,86 @@ github.home.pr.opened
 github.home.check_run.failed
 ```
 
-This is a **naming convention only** — used for logs, grouping, and metrics. There is no
-subject matcher, no trie, and no wildcard syntax. Filtering is done by predicates (below).
-
-### Filtering is predicates, not patterns
-
-An egress declares a coarse gate; its handlers refine it. Both are plain functions.
-
-```ts
-type Filter = (e: Event) => boolean
-
-interface Egress<Ctx> {
-  name: string
-  filter?: Filter           // coarse gate, e.g. e => e.source === 'github'
-  handlers: Handler<Ctx>[]
-  context(): Ctx            // utilities handed to handlers
-}
-
-interface Handler<Ctx> {
-  name: string
-  filter: Filter            // e => e.kind.includes('.pr.')
-  timeoutMs?: number        // per-dispatch cap; defaults to the broker's 30s
-  handle(e: Event, ctx: Ctx): Promise<void>
-}
-```
-
-Predicates were chosen over pattern matching because they strictly subsume it — any subject
-wildcard is expressible as a string predicate — while also being able to read `payload`,
-which a subject matcher fundamentally cannot:
-
-```ts
-filter: e => e.source === 'github' && (e.payload as PrPayload).labels.includes('urgent')
-```
-
-A pattern language would be a less capable mechanism that we would then need to extend.
-
-### Filters are evaluated by the broker, not privately by the egress
-
-`broker.attach(egress)` registers each handler's effective filter — `egress.filter(e) &&
-handler.filter(e)` — with the broker.
-
-This is load-bearing: if the egress filtered internally, the broker could not know the
-target set at publish time, so it could not write delivery rows before dispatching, and a
-crash mid-fan-out would leave no record of which handlers had already run. The logical
-model is still "the egress fans out to handlers whose filters pass" — the broker simply
-owns the evaluation so it can be durable about the result.
-
-Filters do not need to be serializable. They are evaluated in-process at publish time, and
-what is persisted is the resulting set of handler IDs — plain strings.
-
-Publish becomes:
-
-```
-publish(e) → evaluate filters → write N pending Delivery rows
-           → dispatch each → update status
-```
-
-Filters must be pure and cheap: they run once per handler per event, on the publish path.
-Side effects or I/O in a filter is a layering violation — that work belongs in `handle`.
-
-### Handler context
-
-Handlers receive typed utilities from their egress, so a Discord handler gets Discord
-capabilities without importing transport concerns or holding its own credentials:
-
-```ts
-type DiscordCtx = {
-  send(channel: string, msg: DiscordMessage): Promise<MessageRef>
-  edit(ref: MessageRef, msg: DiscordMessage): Promise<void>
-  thread(ref: MessageRef, name: string): Promise<ThreadRef>
-}
-```
-
-The egress owns the connection, auth, and rate limiter once. Attaching five handlers does
-not create five rate limiters competing against the same API quota.
-
-## Core interfaces
-
-### Broker
-
-```ts
-interface Broker {
-  /**
-   * Durably record an event and the deliveries it fans out to.
-   *
-   * Resolves once the event row and all delivery rows are committed to the WAL —
-   * NOT once handlers have run. Dispatch proceeds in the background.
-   * This guarantee is what lets any ingress acknowledge its transport quickly.
-   */
-  publish(input: EventInput): Promise<PublishResult>
-
-  /**
-   * As `publish`, but additionally waits for every delivery's FIRST dispatch
-   * attempt to settle, and reports per-handler outcomes.
-   *
-   * Waits for the first attempt only — never for terminal state. Awaiting the full
-   * retry budget could block for the better part of ten minutes.
-   *
-   * Times out after `opts.timeoutMs` (default 30s). A timeout affects only the
-   * caller's view: the deliveries remain durable and continue retrying in the
-   * background.
-   */
-  publishAndWait(input: EventInput, opts?: { timeoutMs?: number }): Promise<SettledResult>
-
-  /** Register an egress and index its handlers' effective filters. Idempotent by name. */
-  attach<Ctx>(egress: Egress<Ctx>): void
-
-  /** Start dispatch and retry loops, replaying pending deliveries from the WAL. */
-  start(): Promise<void>
-
-  /** Stop accepting work, drain in-flight dispatches, close the WAL. */
-  stop(): Promise<void>
-
-  /** Process-local observability. Not persisted, not replayed. */
-  on(hook: 'success' | 'failed' | 'dead', fn: (d: Delivery, e: Event) => void): void
-}
-
-type EventInput = {
-  kind: string
-  source: string
-  payload: unknown
-  at?: string                        // defaults to receipt time
-  dedupeKey?: string
-  meta?: Record<string, string>
-}
-
-type PublishResult =
-  | { status: 'accepted'; eventId: string; deliveries: number }
-  | { status: 'duplicate'; eventId: string }   // dedupeKey already seen
-
-type SettledResult = PublishResult & {
-  outcomes: Array<{
-    handlerId: string
-    result: 'success' | 'failed' | 'timeout'
-    error?: string
-  }>
-}
-```
-
-Two methods rather than one method with a `wait` flag: the return types genuinely differ,
-and a boolean that changes a return shape needs overloads to type honestly. Separate names
-also make every blocking call site greppable.
-
-Both are `async`. The distinction is what they await, not whether they block a thread —
-the entire system is async-first, and no interface in this document returns a bare value.
-
-Waiters are held in memory, keyed by event id. A crash discards the waiter but not the
-work: deliveries are already durable and resume on boot. Nothing awaiting a `publishAndWait`
-survives a restart, which is correct — the caller didn't either.
-
-`id` is absent from `EventInput` — the core assigns a ULID. Adapters supply facts; the
-core owns identity.
-
-`PublishResult` reports the fan-out count so an ingress can log "accepted, 2 deliveries"
-without querying the WAL.
-
-### Ingress
-
-```ts
-interface Ingress {
-  name: string
-  start(publish: Publish): Promise<void>
-  stop(): Promise<void>
-}
-
-type Publish = (input: EventInput) => Promise<PublishResult>
-```
-
-An ingress owns its own transport entirely — the core runs no HTTP server. `GitHubIngress`
-starts an HTTP listener, verifies the HMAC, calls `publish`, and responds `200` as soon as
-`publish` resolves. Because `publish` does not await dispatch, that response is fast
-regardless of how slow Discord is, which keeps GitHub's 10-second webhook timeout
-irrelevant to us.
-
-The ingress is handed only the `publish` function, not the broker — it has no way to
-attach egresses, inspect deliveries, or otherwise reach across the seam.
-
-## Typed event kinds
-
-The core treats `payload` as `unknown`. Adapters need real types, so a registry at the
-edges provides inference without leaking domain types into the core:
-
-The registry keys on the *invariant* part of the topic — the variable token (repo) is not
-part of the key, because a wildcard string is not a matchable TypeScript key and inference
-would silently never fire:
-
-```ts
-interface EventMap {
-  'github.pr.opened': { repo: string; number: number; title: string; url: string; author: string }
-  'github.check_run.failed': { repo: string; name: string; url: string; sha: string }
-}
-
-// Adapter publishes against the invariant key; core composes the concrete topic
-// by interpolating the entity token: 'github.pr.opened' + repo 'home'
-//   → 'github.home.pr.opened'
-publish<K extends keyof EventMap>(kind: K, payload: EventMap[K]): void
-```
-
-One file. Core stays generic; adapters get full type checking.
+A naming convention only — used for logs, grouping, and metrics. There is no subject
+matcher and no wildcard syntax.
 
 ## The dispatcher
 
-One loop owns all outbound work. There is no separate "deliver now" path and "retry later"
-path — first attempts and retries are the same operation on the same rows, which removes an
-entire class of divergence between them.
+One asyncio task per handler. Each task is an independent mamamia consumer:
 
-`publish` writes rows and returns. It never dispatches inline.
+```python
+async def consume(handler, ctx, orchestrator):
+    group_id = f"{egress.name}/{handler.name}"
+    while running:
+        msg = await orchestrator.acquire_next(
+            log_id="events", group_id=group_id,
+            client_id=instance_id, duration=handler.lease_s,
+        )
+        if msg is None:
+            await asyncio.sleep(1.0)
+            continue
 
-```
-loop:
-  free = maxConcurrent - inFlight
-  if free > 0:
-    claim = UPDATE deliveries SET status='processing', startedAt=now
-            WHERE id IN (
-              SELECT id FROM deliveries
-              WHERE status = 'pending'
-                 OR (status = 'failed' AND nextRetryAt <= now)
-              ORDER BY nextRetryAt
-              LIMIT :free
-            )
-            RETURNING *
-    for each claimed: dispatch WITHOUT awaiting the batch
-                      (on settle → 'success' | 'failed', decrement inFlight)
-  sleep 1s
-```
+        event = Event(**msg.payload)
+        if not passes_filter(event):
+            await orchestrator.settle(..., success=True)
+            continue
 
-**The `processing` state is what makes the loop safe to leave.** Claiming rows before
-dispatch means the next tick cannot see them, so the loop never waits for a batch to finish.
-A slow handler occupies one concurrency slot and delays nothing else.
-
-The alternative — awaiting the whole batch before sleeping — also prevents double dispatch,
-but converts any slow handler into a global stall. That is a worse failure than the one it
-prevents, and it is why the claim-then-release model is used instead.
-
-**The claim must be atomic** with respect to the read that selected the rows: a single
-`UPDATE ... WHERE id IN (SELECT ...)` statement, not a read followed by a separate write.
-SQLite executes it as one statement, so no row can be claimed twice.
-
-**Crash recovery.** Rows left `processing` by a crash are reset on boot:
-
-```sql
-UPDATE deliveries SET status = 'pending' WHERE status = 'processing'
+        try:
+            async with asyncio.timeout(handler.timeout_s):
+                await handler.handle(event, ctx)
+            await orchestrator.settle(..., success=True)
+        except Exception:
+            await orchestrator.settle(..., success=False)
 ```
 
-This is safe because Switchboard runs as a single dispatcher process — nothing can
-legitimately be `processing` at startup. Running two instances against one WAL would break
-this, and would require an owner/lease column instead. Single-process is an assumption of
-this design, not an accident.
+**A slow handler blocks only itself.** Each handler is its own task and its own consumer
+group with its own offset, so one blocked handler cannot delay any other. This is the
+property the design exists to provide, and it comes free from consumer groups.
 
-**Stale sweep.** Defense in depth for a `processing` row whose dispatch never settles inside
-a live process: rows with `startedAt < now - 2 × timeout` are returned to `pending`. The
-per-dispatch timeout should make this unreachable; it exists because "unreachable" states
-that own a row forever are expensive to diagnose.
+**Leases replace an in-flight set.** `acquire_next` atomically marks the message
+`IN_PROGRESS` and takes a lease, so no other task or process can pick it up. Nothing needs
+tracking in memory.
 
-**Per-dispatch timeout.** Every dispatch is raced against a timeout; exceeding it marks that
-delivery `failed` for normal retry and frees its slot. Default 30s, overridable per handler
-(see `Handler.timeoutMs`) — a handler posting a webhook and one driving a slow API have
-genuinely different expectations, and a single global value would be wrong for one of them.
+**Crash recovery is automatic.** Leases expire. A message left `IN_PROGRESS` by a crash is
+reacquired once its lease lapses — no boot-time reset, no stale sweeper, and no
+single-process assumption.
 
-**Concurrency cap.** `maxConcurrent` (default 5) bounds dispatches in flight *across* ticks,
-not within a batch. The loop claims only `maxConcurrent - inFlight` rows per tick, so work
-cannot accumulate unboundedly while earlier dispatches are still running.
+**Per-dispatch timeout**, default 30s, overridable per handler: a webhook POST and a slow
+API call have genuinely different expectations. Exceeding it settles the delivery as failed
+for normal retry.
 
-**No wake-on-publish.** Dispatch latency is therefore up to one poll interval. A deliberate
-trade: ≤1s is imperceptible on a notification, and it keeps a moving part out of the loop.
-With atomic claiming it would be safe to add — `Promise.race([sleep(1000), wake])` — so this
-is a simplicity choice, not a correctness one.
+**Lease duration defaults to `2 × timeout_s`** so a lease cannot lapse while its handler is
+still legitimately working — otherwise another task could acquire the same message
+concurrently. The ownership check in `settle` is the backstop when that assumption fails.
+
+**Polling interval is 1s** when the log is drained. Dispatch latency is therefore up to one
+second, deliberately: it is imperceptible on a notification and keeps a wake-signal
+mechanism out of the loop.
 
 ## Delivery semantics
 
-- **At-least-once.** A crash between "delivered" and "marked sent" replays that delivery.
-  For notifications a duplicate is noise, which is the correct trade against loss.
-- **Deduplication** on `dedupeKey` — GitHub's `X-GitHub-Delivery` UUID. Rejected duplicates
+- **At-least-once.** A crash between handler success and `settle` replays that message once
+  the lease expires. For notifications a duplicate is noise, which is the right trade
+  against loss.
+- **Deduplication** on `dedupe_key` — GitHub's `X-GitHub-Delivery` UUID. Rejected duplicates
   are logged, not errored.
-- **Retry** with exponential backoff and jitter: 1s, 2s, 4s … capped at 5 minutes.
-- **Dead-letter** after 10 attempts. Status `dead`, retained for inspection, never retried
-  automatically. Prevents a poison event from retrying forever.
-- **Isolation.** Each dispatch is independently caught. One throwing handler marks only its
-  own delivery row and never blocks siblings.
-- **No ordering guarantee.** Deliveries dispatch concurrently and independently. Strict
-  per-handler ordering is incompatible with per-delivery backoff — a failed `pr.opened`
-  retrying in 30s while `pr.merged` succeeds immediately reorders them regardless. The
-  alternative, head-of-line blocking, would stall a channel for the full retry budget on
-  one poison event. Out-of-order notifications are the cheaper failure; each message
-  carries its own timestamp and is independently meaningful.
+- **Retry** is mamamia's `FAILED` state with an incrementing count; Switchboard applies
+  exponential backoff with jitter (1s, 2s, 4s … capped at 5 minutes) by deferring reacquire.
+- **Dead-letter** after 10 attempts: state `DEAD`, retained for inspection, never retried
+  automatically.
+- **Isolation.** A handler's failure affects only its own consumer group.
+- **No ordering guarantee.** A failed message retried after backoff will land after messages
+  that succeeded immediately. Strict ordering is incompatible with per-message retry, and
+  the alternative — head-of-line blocking — would stall a channel for the full retry budget
+  on one poison event. Each notification carries its own timestamp and is independently
+  meaningful.
 
 ## v1 scope
 
-**Ingress:** `GitHubIngress` — HTTP endpoint, HMAC-SHA256 signature verification via
-Octokit, maps webhook payloads to events.
+**Ingress:** `GitHubIngress` — an HTTP endpoint, HMAC-SHA256 verification via stdlib `hmac`
+with `compare_digest`, mapping webhook payloads to events.
 
-Subscribed GitHub webhook events:
-
-| GitHub event | Topic |
+| GitHub event | Kind |
 |---|---|
 | `pull_request` (opened/closed/merged) | `github.<repo>.pr.<action>` |
 | `pull_request_review` (submitted) | `github.<repo>.review.<state>` |
@@ -465,127 +415,129 @@ Subscribed GitHub webhook events:
 
 CI successes are never relayed. Failures only.
 
-**Broker:** `InMemoryBroker` — filter registry, SQLite-WAL persistence, retry loop,
-replay on boot.
+**Core:** SQLite/WAL implementations of `IMessageStorage`, `IStateStore`, and
+`ILeaseManager`; migrations; the broker facade; per-handler consumer tasks.
 
-**Egress:** `LoggerEgress` — one handler, filter `e => e.source === 'github'`, writing each
-event to stdout as structured JSON.
+**Egress:** `LoggerEgress` — one handler, filter `e.source == 'github'`, writing structured
+JSON to stdout.
 
-Discord is deliberately *not* the first egress. A logger closes the vertical slice —
-webhook → HMAC → event → WAL → delivery → dispatch → output — with no external
-dependency, no message formatting decisions, and no rate limits. Every durability and
-retry property can be exercised against it. `DiscordEgress` then becomes a pure
-translation problem against a system already proven to work, and message design is
-deferred to the point where we can see real events flowing.
+Discord is deliberately not the first egress. A logger closes the vertical slice — webhook →
+HMAC → event → log → lease → dispatch → output — with no external dependency, no message
+formatting decisions, and no rate limits. Every durability and retry property can be
+exercised against it, so `DiscordEgress` later becomes a pure translation problem against a
+system already proven to work.
 
-`LoggerEgress` also stays useful permanently: attached alongside Discord with filter
-`() => true`, it is the debug tap.
+`LoggerEgress` also stays useful permanently: attached with `filter=lambda e: True`, it is
+the debug tap.
 
 **Not in v1:** Discord egress, commands, Discord ingress, GitHub egress, multi-channel
-routing, slash commands, identity mapping.
+routing, identity mapping.
 
 ### v1.1 — Discord egress
 
-`DiscordEgress` posting to a single channel via a channel webhook URL. No bot application,
-no gateway connection, no interactions endpoint. Message format is an open question to be
-settled against real captured events, not designed up front.
+`DiscordEgress` posting to a single channel via a channel webhook URL, using `httpx`. No bot
+application, no gateway connection, no interactions endpoint. Message format is an open
+question to be settled against real captured events, not designed up front.
 
-## Deployment
+## Stack and deployment
 
-- **Runtime:** Node 22 + TypeScript, shipped as a Docker image built for `linux/arm64`.
-  Docker is what delivers portability — the identical image runs on the Pi today and on a
-  VPS later with no code change.
-- **Ingress reachability:** Cloudflare Tunnel. The Pi is behind residential NAT and has no
+- **Runtime:** Python 3.12, asyncio throughout.
+- **Dependencies:** `mamamia` (in-process library), `aiosqlite`, `httpx`, and
+  `starlette`/`uvicorn` for the webhook endpoint. Pydantic comes in via mamamia. HMAC
+  verification needs no dependency.
+- **Packaging:** Docker image built for `linux/arm64`. Docker is what delivers portability —
+  the identical image runs on the Pi today and on a VPS later with no code change.
+- **Ingress reachability:** Cloudflare Tunnel. The Pi is behind residential NAT with no
   public address. The tunnel is outbound-only, so no ports are forwarded and no dynamic DNS
-  is needed, and it provides a stable HTTPS hostname for the GitHub webhook. Moving off the
-  Pi changes only where the tunnel daemon runs.
+  is needed, and it gives a stable HTTPS hostname for the GitHub webhook. Moving off the Pi
+  changes only where the tunnel daemon runs.
 - **Persistence:** SQLite file on a mounted volume, so container replacement does not lose
-  the WAL.
-- **Secrets:** environment variables — `GITHUB_WEBHOOK_SECRET`, `DISCORD_WEBHOOK_URL`.
-  Never committed.
+  the log.
+- **Secrets:** `GITHUB_WEBHOOK_SECRET` and later `DISCORD_WEBHOOK_URL`, supplied as
+  environment variables from a `.env` file on the Pi that is `chmod 600` and never
+  committed. Docker Compose reads it via `env_file`.
 
 ## Configuration
 
-Adapters and handlers are wired explicitly in TypeScript, not discovered from config. This
-is a deliberate rejection of a plugin system: with two adapters, explicit wiring is clearer,
+Adapters and handlers are wired explicitly in Python, not discovered from config — a
+deliberate rejection of a plugin system. With two adapters, explicit wiring is clearer,
 type-checked, and greppable.
 
-```ts
-const broker = new InMemoryBroker({ wal: './switchboard.db' })
-broker.attach(new DiscordEgress({
-  webhookUrl: env.DISCORD_WEBHOOK_URL,
-  filter: e => e.source === 'github',
-  handlers: [prToEng],
-}))
-await new GitHubIngress({ secret: env.GITHUB_WEBHOOK_SECRET }).start(broker.publish)
+```python
+broker = Broker(db_path="/data/switchboard.db")
+broker.attach(LoggerEgress(
+    filter=lambda e: e.source == "github",
+    handlers=[log_all],
+))
+await broker.start()
+await GitHubIngress(secret=env.GITHUB_WEBHOOK_SECRET).start(broker.publish)
 ```
 
 ## Error handling
 
 | Failure | Behavior |
 |---|---|
-| Invalid HMAC signature | 401, event never created, logged as a security event |
-| Malformed payload | 400, logged; no delivery rows created |
-| Unknown webhook event type | 200 with no-op — GitHub must not see failures for events we ignore |
-| Egress 5xx / network error | Delivery marked `failed`, retried with backoff |
-| Egress 429 (v1.1, Discord) | Respect `Retry-After`; egress-level rate limiter throttles all its handlers |
-| Handler throws | That delivery row marked `failed`; siblings unaffected |
-| Handler hangs | Dispatch times out (per-handler, default 30s), delivery marked `failed`, slot freed; other handlers unaffected |
-| Crash mid-dispatch | `processing` rows reset to `pending` on boot and redispatched |
-| 10 failed attempts | Delivery marked `dead`, retained for inspection |
-| Process crash | Pending deliveries replayed from WAL on boot |
+| Invalid HMAC signature | 401, no event appended, logged as a security event |
+| Malformed payload | 400, logged; nothing appended |
+| Unknown webhook event type | 200 no-op — GitHub must not see failures for events we ignore |
+| Egress 5xx / network error | Settled failed, retried with backoff |
+| Egress 429 (v1.1, Discord) | Respect `Retry-After`; egress-level rate limiter throttles its handlers |
+| Handler raises | Settled failed; other handlers unaffected |
+| Handler hangs | Timeout (per-handler, default 30s), settled failed; other handlers unaffected |
+| Crash mid-dispatch | Lease expires; message reacquired and redispatched |
+| Lease expired before settle | `settle` rejects on ownership mismatch; the new owner's result stands |
+| SQLite locked | Retry with backoff; WAL mode makes this rare for a single writer |
+
+## Observability
+
+- Structured JSON logs to stdout; Docker owns rotation.
+- A `/health` endpoint on the ingress server, for the tunnel and for a Pi-side watchdog.
+- Dead letters are inspected over SQLite directly. v1 ships a `switchboard dead-letters`
+  CLI subcommand listing the retained `DEAD` rows — "SSH in and write SQL" is not an
+  inspection story, and 500 retained rows are worthless without a way to read them.
 
 ## Testing
 
-- **Unit:** filter evaluation (egress∧handler conjunction, a failing egress gate short-
-  circuiting its handlers), backoff schedule, dedup.
+- **Unit:** filter evaluation, backoff schedule, dedup, kind mapping from webhook payloads.
+- **Backend conformance:** the SQLite backends are tested against the same suite as
+  mamamia's in-memory backends, since they must be behaviorally interchangeable.
 - **Integration:** recorded real GitHub webhook payloads → broker → fake egress, asserting
-  correct topics and delivery rows.
-- **Durability:** publish, kill the process mid-dispatch, restart, assert pending deliveries
-  replay exactly once against a fake egress that records calls.
-- **Claim exclusivity:** a handler that blocks across several poll intervals must be
-  dispatched exactly once, not once per elapsed tick. This is the core guarantee of the
-  `processing` state, so it is asserted directly rather than assumed.
-- **Slow handler does not stall others:** with one handler blocked, deliveries to other
-  handlers must continue dispatching. This is the property the `processing` state exists to
-  provide, and the regression that awaiting the whole batch would reintroduce.
-- **Hung handler:** a handler that never resolves times out, is marked `failed`, and frees
-  its concurrency slot.
-- **Crash recovery:** rows left `processing` are reset to `pending` on boot and dispatched
-  exactly once thereafter.
-- **Concurrency cap holds across ticks:** with `maxConcurrent = 5` and twenty due
-  deliveries, never more than five dispatches are in flight simultaneously.
-- **Contract:** a shared adapter test suite every future adapter must pass — the mechanism
-  that keeps adapters from drifting into core responsibilities.
+  correct kinds and terminal states.
+- **Durability:** publish, kill the process mid-dispatch, restart, assert the message is
+  redelivered exactly once against a fake egress that records calls.
+- **Lease exclusivity:** two consumers in the same group must never hold the same message.
+- **Slow handler isolation:** with one handler blocked, other handlers must keep delivering.
+- **Hung handler:** a handler that never resolves times out and is settled failed.
+- **Ownership:** a settle from an expired-lease owner must be rejected.
 
 Discord and GitHub are faked at the HTTP boundary. No live API calls in tests.
 
 ## Future work
 
-Deliberately designed for, not built:
-
+- **Contribute the SQLite backends upstream to mamamia**, which lists them as planned work.
+  Switchboard would then depend on a released mamamia rather than carrying them.
 - **Backfill after downtime:** GitHub exposes `GET /repos/{o}/{r}/hooks/{id}/deliveries`
-  (last 30 days) and a redeliver-attempt endpoint, so missed events are recoverable via the
-  API even though GitHub does not retry automatically. A boot-time reconcile would list
-  deliveries since `max(events.at)` and replay the unseen ones. Deliberately not built —
-  noted so the option stays open without redesign.
-- **Commands** (`intent: 'command'`): Discord → GitHub actions. Requires exactly-once
-  semantics rather than at-least-once — a duplicate notification is noise, a duplicate merge
-  is damage. `Delivery.replyTo` already reserves the correlation slot.
+  (last 30 days) and a redeliver endpoint, so missed events are recoverable via the API even
+  though GitHub does not retry automatically. A boot-time reconcile would list deliveries
+  since the newest stored event and replay the unseen ones.
+- **Commands:** Discord → GitHub actions. Requires exactly-once rather than at-least-once —
+  a duplicate notification is noise, a duplicate merge is damage — plus a correlation id to
+  route the result back to its originating channel.
 - **Discord ingress / GitHub egress:** each provider becomes a connector implementing both
-  halves. Additive; no refactor of the event type.
-- **NATS or Redis broker:** swap `InMemoryBroker` behind the existing interface when
-  multi-process fan-out is genuinely needed. Since filters are predicates rather than
-  subjects, a remote broker would subscribe coarsely (by `source`, using `kind` as the
-  subject) and keep predicate refinement in-process. Nothing about predicate filtering
-  blocks that migration.
+  halves. Additive; no change to the event type.
+- **Multi-process or distributed:** mamamia's leases already carry owner and expiry, so
+  running multiple dispatcher processes against a shared backend requires no design change —
+  only a backend that supports concurrent writers.
 - **Multi-channel routing:** additional handlers with narrower filters. No core change.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| Building a worse NATS feature-by-feature | Keep implementation minimal; swap out rather than grow |
+| mamamia is pre-1.0 and may change under us | Pin the version; the interfaces we depend on are the stable ABCs |
+| SQLite backends must match in-memory semantics exactly | Shared conformance suite is a v1 deliverable, not follow-up |
+| Lease duration mistuned → concurrent delivery of one message | Default `2 × timeout`; ownership check on settle as backstop |
 | Pi power loss corrupting the log | SQLite WAL mode; durability test in the suite |
-| Residential network unreliability | Retry with backoff; WAL survives disconnection |
-| GitHub does not auto-retry failed webhook deliveries | Receiver must ack fast (verify + write, then return 200) so events are captured before any downstream work |
+| Residential network unreliability | Retry with backoff; the log survives disconnection |
+| Pi has no RTC; clock is wrong until NTP syncs | Lease expiry uses monotonic time where possible; wall clock only for display |
+| GitHub does not retry failed webhook deliveries | Ack fast — verify and append, then return 200 before any dispatch work |
