@@ -79,8 +79,8 @@ would be to push down.
 The rule matters more than repository ownership. Shared ownership makes the boundary easier
 to erode, not harder, because every Switchboard need starts to look like a mamamia feature.
 
-Both repositories are private for now, to be sanitized and opened if and when that becomes
-useful. Privacy removes the external forcing function that would otherwise keep mamamia
+Both repositories live in the `yellowpages-ink` organization and are private for now, to be
+sanitized and opened if and when that becomes useful. Privacy removes the external forcing function that would otherwise keep mamamia
 honest, so the test above has to be applied deliberately at review time rather than assumed.
 
 Applying the test to the known gaps:
@@ -103,6 +103,39 @@ schedule.
 
 Four changes are prerequisites for v1. Each is independently justifiable as a delivery
 system feature and is upstreamed, not carried as a fork.
+
+They are preceded by an audit phase, because we are about to build on internals that have
+not been reviewed with persistence or a second consumer in mind.
+
+**0. Audit sweep — correctness and optimization.** A pass over mamamia before any feature
+work, on the grounds that extending unreviewed internals compounds whatever is already
+there. Candidate areas, from a first read and to be verified rather than assumed:
+
+- **Lock asymmetry in `InMemoryLeaseManager`.** `acquire`, `release`, and `get_lease*` take a
+  per-`(log, group)` lock, but `reap_expired` takes only the global lock. A reap can
+  therefore delete a lease concurrently with an acquire holding a different lock. This is the
+  most likely real bug in the file, and it matters more once a persistent backend makes
+  concurrent access routine.
+- **Unbounded lock dictionary.** `_get_lock` inserts into `self._locks` per `(log, group)`
+  and never removes, so the dict grows for the lifetime of the process.
+- **Double locking on every call.** Every lease operation acquires the global lock solely to
+  look up a per-key lock, serializing all groups through one mutex and negating the
+  per-group granularity.
+- **N+1 reads in `_slide_offset`.** It calls `get_message_state` one message at a time in a
+  loop, while `get_message_states` already exists for batch reads. Free with in-memory
+  dicts; a per-row round trip once the backend is SQLite.
+- **Rescan cost in `acquire_next`.** Each call re-scans from the group's base offset in
+  batches of 20 until it finds an eligible message. A group sitting behind a long run of
+  ineligible messages re-walks them on every poll.
+- **Lazy reap ignores retry count.** Resetting `IN_PROGRESS` → `PENDING` on a missing lease
+  does not increment attempts, so a handler that repeatedly crashes mid-processing retries
+  forever without approaching the dead-letter ceiling.
+- **Test coverage.** `tests/` currently holds an integration simulation. The behaviours we
+  are about to depend on — lease exclusivity, expiry, settle ownership — need direct unit
+  tests before backends multiply.
+
+Findings are fixed upstream and released before the feature work below begins. Anything the
+sweep finds that is *not* a general delivery-system concern is recorded and left alone.
 
 **1. Deferred redelivery (`retry_after`).** mamamia has no notion of *when* a failed message
 becomes eligible again — `acquire_next` returns anything in `PENDING` or `FAILED` without a
@@ -157,8 +190,8 @@ in-memory backends.
 
 **Not upstreamed:** deduplication. See *Deduplication* below.
 
-**Sequencing:** these land in mamamia first; Switchboard then builds against a pinned
-release. Switchboard never depends on an unreleased fork.
+**Sequencing:** audit sweep, then the four changes, then a release. Switchboard builds
+against a pinned tag and never depends on an unreleased branch.
 
 ### Already sufficient
 
