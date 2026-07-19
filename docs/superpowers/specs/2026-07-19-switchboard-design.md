@@ -19,7 +19,8 @@ any egress, topology as configuration.
 
 ## Goals
 
-- Relay GitHub repo activity into Discord without losing events across restarts or outages.
+- Relay GitHub repo activity into Discord, without losing events that have already been
+  received — including across process crashes and restarts.
 - Keep the core generic so new providers are new adapters, not core changes.
 - Run on a Raspberry Pi today, move to a hosted environment later with no code change.
 - Stay small. The abstraction is cheap; the implementation must stay embarrassingly small.
@@ -32,6 +33,10 @@ any egress, topology as configuration.
 - No external broker (Redis/NATS). In-memory implementation behind an interface.
 - No plugin loader, adapter registry, or config-driven adapter discovery. Adapters are
   wired explicitly in code.
+- **No backfill of events missed while offline.** If the process is down when a webhook
+  fires, GitHub's delivery fails and that event is lost. This is accepted: at current
+  volume the cost of a missed notification is near zero, and the Pi is a temporary home.
+  See *Future work* for the recovery path if this stops being acceptable.
 
 ## Architecture
 
@@ -118,6 +123,32 @@ Pi has no UPS, so power loss during a write is a realistic failure mode, not a h
 
 Single file. Migration to another host is a file copy.
 
+### Retention
+
+Unbounded growth on an SD card is not acceptable, so both tables are bounded:
+
+- **Deliveries** are pruned once terminal. `sent` rows are deleted immediately.
+  `dead` rows are retained (capped at the most recent 500) — pruning them on arrival would
+  destroy the only record of what failed, which is the entire point of dead-lettering.
+- **Events** are a bounded log: the oldest rows are deleted beyond a cap
+  (`WAL_MAX_EVENTS`, default 10,000). An event is never pruned while it still has
+  non-terminal deliveries.
+
+Consequence: `dedupeKey` uniqueness is only as durable as the event log. Once an event ages
+out, a redelivery of that same webhook would be processed as new. At current volume this
+window is months, so it is accepted rather than tracked separately.
+
+### Schema migrations
+
+`PRAGMA user_version` plus an ordered array of migration functions, applied in a transaction
+on boot. This is what `user_version` exists for; it is roughly thirty lines and adds no
+dependency.
+
+Alembic is SQLAlchemy-specific and Python-only, so it is not an option on this stack. The
+Node equivalents (Drizzle Kit, Umzug, Kysely's migrator) are all reasonable, but each brings
+a dependency and a CLI step to earn its keep — worth revisiting if the schema starts moving
+often, or if we adopt a query builder for other reasons.
+
 ## Kinds and filtering
 
 ### Kind naming
@@ -203,6 +234,75 @@ type DiscordCtx = {
 The egress owns the connection, auth, and rate limiter once. Attaching five handlers does
 not create five rate limiters competing against the same API quota.
 
+## Core interfaces
+
+### Broker
+
+```ts
+interface Broker {
+  /**
+   * Durably record an event and the deliveries it fans out to.
+   *
+   * Resolves once the event row and all delivery rows are committed to the WAL —
+   * NOT once handlers have run. Dispatch proceeds in the background.
+   * This guarantee is what lets any ingress acknowledge its transport quickly.
+   */
+  publish(input: EventInput): Promise<PublishResult>
+
+  /** Register an egress and index its handlers' effective filters. Idempotent by name. */
+  attach<Ctx>(egress: Egress<Ctx>): void
+
+  /** Start dispatch and retry loops, replaying pending deliveries from the WAL. */
+  start(): Promise<void>
+
+  /** Stop accepting work, drain in-flight dispatches, close the WAL. */
+  stop(): Promise<void>
+
+  /** Process-local observability. Not persisted, not replayed. */
+  on(hook: 'sent' | 'failed' | 'dead', fn: (d: Delivery, e: Event) => void): void
+}
+
+type EventInput = {
+  kind: string
+  source: string
+  payload: unknown
+  at?: string                        // defaults to receipt time
+  dedupeKey?: string
+  meta?: Record<string, string>
+}
+
+type PublishResult =
+  | { status: 'accepted'; eventId: string; deliveries: number }
+  | { status: 'duplicate'; eventId: string }   // dedupeKey already seen
+```
+
+`id` is absent from `EventInput` — the core assigns a ULID. Adapters supply facts; the
+core owns identity.
+
+`PublishResult` reports the fan-out count so an ingress can log "accepted, 2 deliveries"
+without querying the WAL.
+
+### Ingress
+
+```ts
+interface Ingress {
+  name: string
+  start(publish: Publish): Promise<void>
+  stop(): Promise<void>
+}
+
+type Publish = (input: EventInput) => Promise<PublishResult>
+```
+
+An ingress owns its own transport entirely — the core runs no HTTP server. `GitHubIngress`
+starts an HTTP listener, verifies the HMAC, calls `publish`, and responds `200` as soon as
+`publish` resolves. Because `publish` does not await dispatch, that response is fast
+regardless of how slow Discord is, which keeps GitHub's 10-second webhook timeout
+irrelevant to us.
+
+The ingress is handed only the `publish` function, not the broker — it has no way to
+attach egresses, inspect deliveries, or otherwise reach across the seam.
+
 ## Typed event kinds
 
 The core treats `payload` as `unknown`. Adapters need real types, so a registry at the
@@ -237,8 +337,12 @@ One file. Core stays generic; adapters get full type checking.
   automatically. Prevents a poison event from retrying forever.
 - **Isolation.** Each dispatch is independently caught. One throwing handler marks only its
   own delivery row and never blocks siblings.
-- **Ordering.** Parallel across handlers, sequential within a handler. Preserves per-channel
-  order (`pr.opened` before `pr.merged` in `#eng`) without one slow handler stalling the bus.
+- **No ordering guarantee.** Deliveries dispatch concurrently and independently. Strict
+  per-handler ordering is incompatible with per-delivery backoff — a failed `pr.opened`
+  retrying in 30s while `pr.merged` succeeds immediately reorders them regardless. The
+  alternative, head-of-line blocking, would stall a channel for the full retry budget on
+  one poison event. Out-of-order notifications are the cheaper failure; each message
+  carries its own timestamp and is independently meaningful.
 
 ## v1 scope
 
@@ -327,6 +431,11 @@ Discord and GitHub are faked at the HTTP boundary. No live API calls in tests.
 
 Deliberately designed for, not built:
 
+- **Backfill after downtime:** GitHub exposes `GET /repos/{o}/{r}/hooks/{id}/deliveries`
+  (last 30 days) and a redeliver-attempt endpoint, so missed events are recoverable via the
+  API even though GitHub does not retry automatically. A boot-time reconcile would list
+  deliveries since `max(events.at)` and replay the unseen ones. Deliberately not built —
+  noted so the option stays open without redesign.
 - **Commands** (`intent: 'command'`): Discord → GitHub actions. Requires exactly-once
   semantics rather than at-least-once — a duplicate notification is noise, a duplicate merge
   is damage. `Delivery.replyTo` already reserves the correlation slot.
