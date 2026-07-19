@@ -375,23 +375,35 @@ loop:
            OR (status = 'failed' AND nextRetryAt <= now)
         ORDER BY nextRetryAt
         LIMIT :batch
-  dispatch each (up to maxConcurrent), update status
-  sleep until woken, or 1s, whichever comes first
+  await dispatch of the entire batch (bounded by maxConcurrent), updating each status
+  sleep 1s
 ```
 
-**Wake-on-publish.** Polling alone would add up to a full second of latency to every
-notification. `publish` signals the loop after committing, so the common case dispatches
-immediately and the 1s poll degrades to a safety net for due retries and anything a missed
-signal dropped.
+**The loop is non-reentrant, and that is the whole trick.** It awaits the full batch before
+sleeping, so two iterations can never overlap and no delivery can be picked up twice.
 
-**In-flight guard.** A dispatch in progress still has `status='pending'` in the WAL, so the
-next tick would pick it up again. The loop keeps an in-memory set of in-flight delivery ids
-and skips them. Deliberately in-memory rather than a `dispatching` status: on crash the rows
-stay `pending` and replay on boot, which is exactly the at-least-once behavior we want. A
-persisted `dispatching` state would need crash-recovery logic to un-stick it.
+This is worth stating precisely, because the obvious alternative is subtly broken. If the
+loop fired dispatches and slept without awaiting them, a delivery whose POST had not yet
+returned would still read `status='pending'` on the next tick and be sent again — a double
+send, with no wake signal or concurrency involved. Polling does not avoid that hazard;
+non-reentrancy does. The consequence is that no in-flight set, `dispatching` status, or row
+locking is needed anywhere. Node's single thread does the rest: there is no preemption to
+guard against.
 
-**Concurrency cap.** `maxConcurrent` (default 5) bounds simultaneous dispatches so a burst
-of due deliveries cannot stampede a downstream API.
+**Per-dispatch timeout (30s).** The price of a non-reentrant loop is that one hung handler
+stalls all delivery. Every dispatch is raced against a timeout; exceeding it marks that
+delivery `failed` for normal retry. Without this the dispatcher can wedge permanently on a
+single stuck socket, which is a worse failure than the one non-reentrancy removed.
+
+**Concurrency cap.** `maxConcurrent` (default 5) bounds simultaneous dispatches within a
+batch so a burst cannot stampede a downstream API.
+
+**No wake-on-publish.** Dispatch latency is therefore up to one poll interval. This is a
+deliberate trade: ≤1s is imperceptible on a notification, and it keeps a moving part out of
+the loop. Note that wake would *not* have required locking — with a non-reentrant loop it is
+`Promise.race([sleep(1000), wake])`, and a signal arriving mid-batch merely skips the next
+sleep. It is omitted for simplicity, not safety, and can be added later without touching the
+delivery model.
 
 ## Delivery semantics
 
@@ -493,6 +505,7 @@ await new GitHubIngress({ secret: env.GITHUB_WEBHOOK_SECRET }).start(broker.publ
 | Egress 5xx / network error | Delivery marked `failed`, retried with backoff |
 | Egress 429 (v1.1, Discord) | Respect `Retry-After`; egress-level rate limiter throttles all its handlers |
 | Handler throws | That delivery row marked `failed`; siblings unaffected |
+| Handler hangs | Dispatch times out at 30s, delivery marked `failed`; the loop is not wedged |
 | 10 failed attempts | Delivery marked `dead`, retained for inspection |
 | Process crash | Pending deliveries replayed from WAL on boot |
 
@@ -504,6 +517,11 @@ await new GitHubIngress({ secret: env.GITHUB_WEBHOOK_SECRET }).start(broker.publ
   correct topics and delivery rows.
 - **Durability:** publish, kill the process mid-dispatch, restart, assert pending deliveries
   replay exactly once against a fake egress that records calls.
+- **Non-reentrancy:** a handler that blocks longer than the poll interval must be dispatched
+  exactly once, not once per elapsed tick. This is the property that replaces in-flight
+  tracking, so it is asserted directly rather than assumed.
+- **Hung handler:** a handler that never resolves must not wedge the loop — assert it times
+  out, is marked `failed`, and that subsequent deliveries still dispatch.
 - **Contract:** a shared adapter test suite every future adapter must pass — the mechanism
   that keeps adapters from drifting into core responsibilities.
 
