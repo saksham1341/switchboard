@@ -24,6 +24,8 @@ any egress, topology as configuration.
 - Keep the core generic so new providers are new adapters, not core changes.
 - Run on a Raspberry Pi today, move to a hosted environment later with no code change.
 - Stay small. The abstraction is cheap; the implementation must stay embarrassingly small.
+- Async-first throughout. Every interface boundary returns a promise; no interface in this
+  design returns a bare value.
 
 ## Non-goals (v1)
 
@@ -249,6 +251,19 @@ interface Broker {
    */
   publish(input: EventInput): Promise<PublishResult>
 
+  /**
+   * As `publish`, but additionally waits for every delivery's FIRST dispatch
+   * attempt to settle, and reports per-handler outcomes.
+   *
+   * Waits for the first attempt only — never for terminal state. Awaiting the full
+   * retry budget could block for the better part of ten minutes.
+   *
+   * Times out after `opts.timeoutMs` (default 30s). A timeout affects only the
+   * caller's view: the deliveries remain durable and continue retrying in the
+   * background.
+   */
+  publishAndWait(input: EventInput, opts?: { timeoutMs?: number }): Promise<SettledResult>
+
   /** Register an egress and index its handlers' effective filters. Idempotent by name. */
   attach<Ctx>(egress: Egress<Ctx>): void
 
@@ -274,7 +289,26 @@ type EventInput = {
 type PublishResult =
   | { status: 'accepted'; eventId: string; deliveries: number }
   | { status: 'duplicate'; eventId: string }   // dedupeKey already seen
+
+type SettledResult = PublishResult & {
+  outcomes: Array<{
+    handlerId: string
+    result: 'sent' | 'failed' | 'timeout'
+    error?: string
+  }>
+}
 ```
+
+Two methods rather than one method with a `wait` flag: the return types genuinely differ,
+and a boolean that changes a return shape needs overloads to type honestly. Separate names
+also make every blocking call site greppable.
+
+Both are `async`. The distinction is what they await, not whether they block a thread —
+the entire system is async-first, and no interface in this document returns a bare value.
+
+Waiters are held in memory, keyed by event id. A crash discards the waiter but not the
+work: deliveries are already durable and resume on boot. Nothing awaiting a `publishAndWait`
+survives a restart, which is correct — the caller didn't either.
 
 `id` is absent from `EventInput` — the core assigns a ULID. Adapters supply facts; the
 core owns identity.
@@ -326,6 +360,39 @@ publish<K extends keyof EventMap>(kind: K, payload: EventMap[K]): void
 
 One file. Core stays generic; adapters get full type checking.
 
+## The dispatcher
+
+One loop owns all outbound work. There is no separate "deliver now" path and "retry later"
+path — first attempts and retries are the same operation on the same rows, which removes an
+entire class of divergence between them.
+
+`publish` writes rows and returns. It never dispatches inline.
+
+```
+loop:
+  due = SELECT * FROM deliveries
+        WHERE status = 'pending'
+           OR (status = 'failed' AND nextRetryAt <= now)
+        ORDER BY nextRetryAt
+        LIMIT :batch
+  dispatch each (up to maxConcurrent), update status
+  sleep until woken, or 1s, whichever comes first
+```
+
+**Wake-on-publish.** Polling alone would add up to a full second of latency to every
+notification. `publish` signals the loop after committing, so the common case dispatches
+immediately and the 1s poll degrades to a safety net for due retries and anything a missed
+signal dropped.
+
+**In-flight guard.** A dispatch in progress still has `status='pending'` in the WAL, so the
+next tick would pick it up again. The loop keeps an in-memory set of in-flight delivery ids
+and skips them. Deliberately in-memory rather than a `dispatching` status: on crash the rows
+stay `pending` and replay on boot, which is exactly the at-least-once behavior we want. A
+persisted `dispatching` state would need crash-recovery logic to un-stick it.
+
+**Concurrency cap.** `maxConcurrent` (default 5) bounds simultaneous dispatches so a burst
+of due deliveries cannot stampede a downstream API.
+
 ## Delivery semantics
 
 - **At-least-once.** A crash between "delivered" and "marked sent" replays that delivery.
@@ -364,12 +431,27 @@ CI successes are never relayed. Failures only.
 **Broker:** `InMemoryBroker` — filter registry, SQLite-WAL persistence, retry loop,
 replay on boot.
 
-**Egress:** `DiscordEgress` — one handler, filter `e => e.source === 'github'`, posting to a single channel
-via a Discord channel webhook URL. No bot application, no gateway connection, no
-interactions endpoint.
+**Egress:** `LoggerEgress` — one handler, filter `e => e.source === 'github'`, writing each
+event to stdout as structured JSON.
 
-**Not in v1:** commands, Discord ingress, GitHub egress, multi-channel routing, slash
-commands, identity mapping.
+Discord is deliberately *not* the first egress. A logger closes the vertical slice —
+webhook → HMAC → event → WAL → delivery → dispatch → output — with no external
+dependency, no message formatting decisions, and no rate limits. Every durability and
+retry property can be exercised against it. `DiscordEgress` then becomes a pure
+translation problem against a system already proven to work, and message design is
+deferred to the point where we can see real events flowing.
+
+`LoggerEgress` also stays useful permanently: attached alongside Discord with filter
+`() => true`, it is the debug tap.
+
+**Not in v1:** Discord egress, commands, Discord ingress, GitHub egress, multi-channel
+routing, slash commands, identity mapping.
+
+### v1.1 — Discord egress
+
+`DiscordEgress` posting to a single channel via a channel webhook URL. No bot application,
+no gateway connection, no interactions endpoint. Message format is an open question to be
+settled against real captured events, not designed up front.
 
 ## Deployment
 
@@ -408,8 +490,8 @@ await new GitHubIngress({ secret: env.GITHUB_WEBHOOK_SECRET }).start(broker.publ
 | Invalid HMAC signature | 401, event never created, logged as a security event |
 | Malformed payload | 400, logged; no delivery rows created |
 | Unknown webhook event type | 200 with no-op — GitHub must not see failures for events we ignore |
-| Discord 5xx / network error | Delivery marked `failed`, retried with backoff |
-| Discord 429 | Respect `Retry-After`; egress-level rate limiter throttles all handlers |
+| Egress 5xx / network error | Delivery marked `failed`, retried with backoff |
+| Egress 429 (v1.1, Discord) | Respect `Retry-After`; egress-level rate limiter throttles all its handlers |
 | Handler throws | That delivery row marked `failed`; siblings unaffected |
 | 10 failed attempts | Delivery marked `dead`, retained for inspection |
 | Process crash | Pending deliveries replayed from WAL on boot |
