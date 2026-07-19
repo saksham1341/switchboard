@@ -95,10 +95,11 @@ type Delivery = {
   id: string
   eventId: string
   handlerId: string    // 'discord/pr-to-eng'
-  status: 'pending' | 'sent' | 'failed' | 'dead'
+  status: 'pending' | 'processing' | 'success' | 'failed' | 'dead'
   attempts: number
   lastError?: string
   nextRetryAt?: string
+  startedAt?: string   // set on transition to 'processing'
   replyTo?: string     // reserved for commands; unused in v1
 }
 ```
@@ -129,7 +130,7 @@ Single file. Migration to another host is a file copy.
 
 Unbounded growth on an SD card is not acceptable, so both tables are bounded:
 
-- **Deliveries** are pruned once terminal. `sent` rows are deleted immediately.
+- **Deliveries** are pruned once terminal. `success` rows are deleted immediately.
   `dead` rows are retained (capped at the most recent 500) — pruning them on arrival would
   destroy the only record of what failed, which is the entire point of dead-lettering.
 - **Events** are a bounded log: the oldest rows are deleted beyond a cap
@@ -182,6 +183,7 @@ interface Egress<Ctx> {
 interface Handler<Ctx> {
   name: string
   filter: Filter            // e => e.kind.includes('.pr.')
+  timeoutMs?: number        // per-dispatch cap; defaults to the broker's 30s
   handle(e: Event, ctx: Ctx): Promise<void>
 }
 ```
@@ -274,7 +276,7 @@ interface Broker {
   stop(): Promise<void>
 
   /** Process-local observability. Not persisted, not replayed. */
-  on(hook: 'sent' | 'failed' | 'dead', fn: (d: Delivery, e: Event) => void): void
+  on(hook: 'success' | 'failed' | 'dead', fn: (d: Delivery, e: Event) => void): void
 }
 
 type EventInput = {
@@ -293,7 +295,7 @@ type PublishResult =
 type SettledResult = PublishResult & {
   outcomes: Array<{
     handlerId: string
-    result: 'sent' | 'failed' | 'timeout'
+    result: 'success' | 'failed' | 'timeout'
     error?: string
   }>
 }
@@ -370,40 +372,63 @@ entire class of divergence between them.
 
 ```
 loop:
-  due = SELECT * FROM deliveries
-        WHERE status = 'pending'
-           OR (status = 'failed' AND nextRetryAt <= now)
-        ORDER BY nextRetryAt
-        LIMIT :batch
-  await dispatch of the entire batch (bounded by maxConcurrent), updating each status
+  free = maxConcurrent - inFlight
+  if free > 0:
+    claim = UPDATE deliveries SET status='processing', startedAt=now
+            WHERE id IN (
+              SELECT id FROM deliveries
+              WHERE status = 'pending'
+                 OR (status = 'failed' AND nextRetryAt <= now)
+              ORDER BY nextRetryAt
+              LIMIT :free
+            )
+            RETURNING *
+    for each claimed: dispatch WITHOUT awaiting the batch
+                      (on settle → 'success' | 'failed', decrement inFlight)
   sleep 1s
 ```
 
-**The loop is non-reentrant, and that is the whole trick.** It awaits the full batch before
-sleeping, so two iterations can never overlap and no delivery can be picked up twice.
+**The `processing` state is what makes the loop safe to leave.** Claiming rows before
+dispatch means the next tick cannot see them, so the loop never waits for a batch to finish.
+A slow handler occupies one concurrency slot and delays nothing else.
 
-This is worth stating precisely, because the obvious alternative is subtly broken. If the
-loop fired dispatches and slept without awaiting them, a delivery whose POST had not yet
-returned would still read `status='pending'` on the next tick and be sent again — a double
-send, with no wake signal or concurrency involved. Polling does not avoid that hazard;
-non-reentrancy does. The consequence is that no in-flight set, `dispatching` status, or row
-locking is needed anywhere. Node's single thread does the rest: there is no preemption to
-guard against.
+The alternative — awaiting the whole batch before sleeping — also prevents double dispatch,
+but converts any slow handler into a global stall. That is a worse failure than the one it
+prevents, and it is why the claim-then-release model is used instead.
 
-**Per-dispatch timeout (30s).** The price of a non-reentrant loop is that one hung handler
-stalls all delivery. Every dispatch is raced against a timeout; exceeding it marks that
-delivery `failed` for normal retry. Without this the dispatcher can wedge permanently on a
-single stuck socket, which is a worse failure than the one non-reentrancy removed.
+**The claim must be atomic** with respect to the read that selected the rows: a single
+`UPDATE ... WHERE id IN (SELECT ...)` statement, not a read followed by a separate write.
+SQLite executes it as one statement, so no row can be claimed twice.
 
-**Concurrency cap.** `maxConcurrent` (default 5) bounds simultaneous dispatches within a
-batch so a burst cannot stampede a downstream API.
+**Crash recovery.** Rows left `processing` by a crash are reset on boot:
 
-**No wake-on-publish.** Dispatch latency is therefore up to one poll interval. This is a
-deliberate trade: ≤1s is imperceptible on a notification, and it keeps a moving part out of
-the loop. Note that wake would *not* have required locking — with a non-reentrant loop it is
-`Promise.race([sleep(1000), wake])`, and a signal arriving mid-batch merely skips the next
-sleep. It is omitted for simplicity, not safety, and can be added later without touching the
-delivery model.
+```sql
+UPDATE deliveries SET status = 'pending' WHERE status = 'processing'
+```
+
+This is safe because Switchboard runs as a single dispatcher process — nothing can
+legitimately be `processing` at startup. Running two instances against one WAL would break
+this, and would require an owner/lease column instead. Single-process is an assumption of
+this design, not an accident.
+
+**Stale sweep.** Defense in depth for a `processing` row whose dispatch never settles inside
+a live process: rows with `startedAt < now - 2 × timeout` are returned to `pending`. The
+per-dispatch timeout should make this unreachable; it exists because "unreachable" states
+that own a row forever are expensive to diagnose.
+
+**Per-dispatch timeout.** Every dispatch is raced against a timeout; exceeding it marks that
+delivery `failed` for normal retry and frees its slot. Default 30s, overridable per handler
+(see `Handler.timeoutMs`) — a handler posting a webhook and one driving a slow API have
+genuinely different expectations, and a single global value would be wrong for one of them.
+
+**Concurrency cap.** `maxConcurrent` (default 5) bounds dispatches in flight *across* ticks,
+not within a batch. The loop claims only `maxConcurrent - inFlight` rows per tick, so work
+cannot accumulate unboundedly while earlier dispatches are still running.
+
+**No wake-on-publish.** Dispatch latency is therefore up to one poll interval. A deliberate
+trade: ≤1s is imperceptible on a notification, and it keeps a moving part out of the loop.
+With atomic claiming it would be safe to add — `Promise.race([sleep(1000), wake])` — so this
+is a simplicity choice, not a correctness one.
 
 ## Delivery semantics
 
@@ -505,7 +530,8 @@ await new GitHubIngress({ secret: env.GITHUB_WEBHOOK_SECRET }).start(broker.publ
 | Egress 5xx / network error | Delivery marked `failed`, retried with backoff |
 | Egress 429 (v1.1, Discord) | Respect `Retry-After`; egress-level rate limiter throttles all its handlers |
 | Handler throws | That delivery row marked `failed`; siblings unaffected |
-| Handler hangs | Dispatch times out at 30s, delivery marked `failed`; the loop is not wedged |
+| Handler hangs | Dispatch times out (per-handler, default 30s), delivery marked `failed`, slot freed; other handlers unaffected |
+| Crash mid-dispatch | `processing` rows reset to `pending` on boot and redispatched |
 | 10 failed attempts | Delivery marked `dead`, retained for inspection |
 | Process crash | Pending deliveries replayed from WAL on boot |
 
@@ -517,11 +543,18 @@ await new GitHubIngress({ secret: env.GITHUB_WEBHOOK_SECRET }).start(broker.publ
   correct topics and delivery rows.
 - **Durability:** publish, kill the process mid-dispatch, restart, assert pending deliveries
   replay exactly once against a fake egress that records calls.
-- **Non-reentrancy:** a handler that blocks longer than the poll interval must be dispatched
-  exactly once, not once per elapsed tick. This is the property that replaces in-flight
-  tracking, so it is asserted directly rather than assumed.
-- **Hung handler:** a handler that never resolves must not wedge the loop — assert it times
-  out, is marked `failed`, and that subsequent deliveries still dispatch.
+- **Claim exclusivity:** a handler that blocks across several poll intervals must be
+  dispatched exactly once, not once per elapsed tick. This is the core guarantee of the
+  `processing` state, so it is asserted directly rather than assumed.
+- **Slow handler does not stall others:** with one handler blocked, deliveries to other
+  handlers must continue dispatching. This is the property the `processing` state exists to
+  provide, and the regression that awaiting the whole batch would reintroduce.
+- **Hung handler:** a handler that never resolves times out, is marked `failed`, and frees
+  its concurrency slot.
+- **Crash recovery:** rows left `processing` are reset to `pending` on boot and dispatched
+  exactly once thereafter.
+- **Concurrency cap holds across ticks:** with `maxConcurrent = 5` and twenty due
+  deliveries, never more than five dispatches are in flight simultaneously.
 - **Contract:** a shared adapter test suite every future adapter must pass — the mechanism
   that keeps adapters from drifting into core responsibilities.
 
