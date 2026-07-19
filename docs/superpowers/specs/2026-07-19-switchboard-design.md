@@ -6,7 +6,9 @@
 
 ## Summary
 
-Switchboard is a general-purpose, event-driven relay engine. Ingress adapters publish
+**Switchboard turns things that happen in one system into actions in another.**
+
+It is a general-purpose, event-driven relay engine. Ingress adapters publish
 events; egress handlers consume and act on them. All domain knowledge lives in adapters;
 durability, leasing, retry, and dead-lettering are delegated to
 [mamamia](https://github.com/saksham1341/mamamia), an existing append-only log with
@@ -61,6 +63,89 @@ The one thing mamamia lacks is persistence — its storage, state, and lease bac
 in-memory. Its README lists a SQLite/WAL backend as future work. Switchboard's core
 deliverable is exactly that, which makes this reuse rather than adoption of a dependency
 that fits by accident.
+
+## Division of concerns
+
+mamamia is a message delivery system. Switchboard is an application built on it. The two
+are developed together and may share an owner, but the boundary is enforced by a test
+applied to every proposed upstream change:
+
+> **Would a message delivery system need this regardless of yellowpages?**
+
+If yes, it belongs in mamamia and must be designed generically — no GitHub, no Discord, no
+Switchboard vocabulary in its interfaces. If no, Switchboard owns it, however convenient it
+would be to push down.
+
+The rule matters more than repository ownership. Shared ownership makes the boundary easier
+to erode, not harder, because every Switchboard need starts to look like a mamamia feature.
+
+Applying the test to the known gaps:
+
+| Concern | Owner | Reasoning |
+|---|---|---|
+| Retry *mechanism* (when may this be redelivered) | mamamia | Every queue has visibility timeouts; already on its roadmap |
+| Retry *policy* (exponential, jitter, caps) | Switchboard | Policy is application judgement, not delivery machinery |
+| Lease ownership correctness | mamamia | A lease bug is a delivery-system bug |
+| Log retention / pruning | mamamia | Every log system has retention |
+| Persistent backends | mamamia | Its own roadmap item; generic to any deployment |
+| Ingress deduplication | Switchboard | The key, window, and "same event" definition are all application policy |
+| Filtering, routing, adapters | Switchboard | Meaningless to a delivery system |
+
+The retry split is the clearest illustration: mamamia gains a `retry_after` parameter and
+never learns what exponential backoff is, while Switchboard computes the delay and owns the
+schedule.
+
+## Upstream work in mamamia
+
+Three changes are prerequisites for v1. Each is independently justifiable as a delivery
+system feature and is upstreamed, not carried as a fork.
+
+**1. Deferred redelivery (`retry_after`).** mamamia has no notion of *when* a failed message
+becomes eligible again — `acquire_next` returns anything in `PENDING` or `FAILED` without a
+live lease, so a failing message is instantly reacquirable and would exhaust its retry
+ceiling in milliseconds. This is listed as "Retry Backoff" in mamamia's own future work.
+
+```python
+await orchestrator.settle(log_id, group_id, message_id, client_id,
+                          success=False, retry_after=30.0)
+```
+
+`IStateStore` gains an `available_at` per `(log_id, group_id, message_id)`; `acquire_next`
+skips messages whose `available_at` is in the future. The client supplies the delay, mirroring
+the existing `duration` parameter on `acquire_next`. mamamia enforces *when*; it never decides
+*how long*.
+
+This also removes head-of-line blocking on a poison message: while backing off, the message
+is ineligible, so `acquire_next` moves past it to newer events instead of re-picking it every
+cycle.
+
+**2. Strict settle.** `settle` currently permits settlement when `get_lease` returns `None`,
+intending to allow "lease expired but nobody else took it." It cannot distinguish that from
+"someone else took it and already finished," so a slow worker can overwrite the final state
+of a redelivery that already completed. Settle should require a live lease owned by the
+caller and reject otherwise. At-least-once already tolerates the resulting redelivery, so
+strictness costs nothing.
+
+**3. Persistent backends.** SQLite/WAL implementations of `IMessageStorage`, `IStateStore`,
+and `ILeaseManager`, with retention limits, tested against the same conformance suite as the
+in-memory backends.
+
+**Not upstreamed:** deduplication. See *Deduplication* below.
+
+**Sequencing:** these land in mamamia first; Switchboard then builds against a pinned
+release. Switchboard never depends on an unreleased fork.
+
+### Already sufficient
+
+`acquire_next(..., duration=...)` is already a client-supplied lease duration, so
+per-handler `lease_s` needs no upstream change.
+
+### Known mamamia limitation, not worked around
+
+`Orchestrator._slide_lock` is an `asyncio.Lock`, so offset sliding is safe only within one
+process. Multi-instance deployment is blocked by this regardless of backend, and is tracked
+on mamamia's roadmap ("Shared Backends... multi-worker deployments"). Switchboard runs as a
+single process and does not attempt to work around it.
 
 ## Architecture
 
@@ -163,17 +248,27 @@ place where a race would silently double-deliver.
 
 ### Retention
 
-Unbounded growth on an SD card is not acceptable, so both tables are bounded:
+Retention is a property of the backends and therefore lives in mamamia, configured by
+Switchboard. Unbounded growth on an SD card is not acceptable, so both are bounded:
 
 - **State rows** are pruned once terminal. `PROCESSED` rows are deleted behind the group's
   base offset. `DEAD` rows are retained (capped at the most recent 500) — pruning them would
   destroy the only record of what failed, which is the point of dead-lettering.
-- **Messages** are a bounded log: oldest rows deleted beyond `WAL_MAX_EVENTS` (default
+- **Messages** are a bounded log: oldest rows deleted beyond a configured cap (default
   10,000), never below the lowest base offset across groups.
 
-Consequence: `dedupe_key` uniqueness is only as durable as the log. Once a message ages out,
-a redelivery of that webhook is processed as new. At current volume that window is months,
-so it is accepted rather than tracked separately.
+### Deduplication
+
+Owned by Switchboard, not mamamia. The dedup key, the window, and what counts as "the same
+event" are application policy — mamamia's log stays a pure append-only log with no opinion
+about whether two appends mean the same thing.
+
+Switchboard keeps a `seen` table in its own database mapping the provider's idempotency key
+(GitHub's `X-GitHub-Delivery` UUID) to the event id it produced, and checks it before
+appending. Entries are pruned on the same schedule as the log.
+
+Consequence: dedup is only as durable as that table. Once an entry ages out, a redelivery of
+that webhook is processed as new. At current volume the window is months, so it is accepted.
 
 ### Schema migrations
 
@@ -355,7 +450,10 @@ async def consume(handler, ctx, orchestrator):
                 await handler.handle(event, ctx)
             await orchestrator.settle(..., success=True)
         except Exception:
-            await orchestrator.settle(..., success=False)
+            attempts = await state.get_retry_count(...)
+            await orchestrator.settle(
+                ..., success=False, retry_after=backoff(attempts),
+            )
 ```
 
 **A slow handler blocks only itself.** Each handler is its own task and its own consumer
@@ -387,10 +485,11 @@ mechanism out of the loop.
 - **At-least-once.** A crash between handler success and `settle` replays that message once
   the lease expires. For notifications a duplicate is noise, which is the right trade
   against loss.
-- **Deduplication** on `dedupe_key` — GitHub's `X-GitHub-Delivery` UUID. Rejected duplicates
-  are logged, not errored.
-- **Retry** is mamamia's `FAILED` state with an incrementing count; Switchboard applies
-  exponential backoff with jitter (1s, 2s, 4s … capped at 5 minutes) by deferring reacquire.
+- **Deduplication** on `dedupe_key` — see *Deduplication* below. Rejected duplicates are
+  logged, not errored.
+- **Retry** is mamamia's `FAILED` state with an incrementing count. Switchboard computes the
+  delay — exponential with jitter, 1s, 2s, 4s … capped at 5 minutes — and passes it as
+  `retry_after` on settle. mamamia enforces the deferral; the schedule is Switchboard's.
 - **Dead-letter** after 10 attempts: state `DEAD`, retained for inspection, never retried
   automatically.
 - **Isolation.** A handler's failure affects only its own consumer group.
@@ -514,8 +613,8 @@ Discord and GitHub are faked at the HTTP boundary. No live API calls in tests.
 
 ## Future work
 
-- **Contribute the SQLite backends upstream to mamamia**, which lists them as planned work.
-  Switchboard would then depend on a released mamamia rather than carrying them.
+- **Multiplexed / higher-throughput backends** in mamamia (Redis, Postgres) if event volume
+  ever justifies it. No Switchboard change — that is the point of the backend interfaces.
 - **Backfill after downtime:** GitHub exposes `GET /repos/{o}/{r}/hooks/{id}/deliveries`
   (last 30 days) and a redeliver endpoint, so missed events are recoverable via the API even
   though GitHub does not retry automatically. A boot-time reconcile would list deliveries
@@ -525,16 +624,19 @@ Discord and GitHub are faked at the HTTP boundary. No live API calls in tests.
   route the result back to its originating channel.
 - **Discord ingress / GitHub egress:** each provider becomes a connector implementing both
   halves. Additive; no change to the event type.
-- **Multi-process or distributed:** mamamia's leases already carry owner and expiry, so
-  running multiple dispatcher processes against a shared backend requires no design change —
-  only a backend that supports concurrent writers.
+- **Multi-process or distributed:** leases already carry owner and expiry, so the *locking*
+  is multi-process-safe. Offset sliding is not — `Orchestrator._slide_lock` is an in-process
+  `asyncio.Lock`. This is a mamamia roadmap item, not a Switchboard one, and until it lands
+  Switchboard runs as a single process.
 - **Multi-channel routing:** additional handlers with narrower filters. No core change.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
-| mamamia is pre-1.0 and may change under us | Pin the version; the interfaces we depend on are the stable ABCs |
+| mamamia is pre-1.0 and may change under us | Pin the version; build only against released tags, never an unreleased branch |
+| Shared ownership erodes the mamamia/Switchboard boundary | Every upstream change must pass the *Division of concerns* test; mamamia stays public and independently useful |
+| v1 now spans two repos, so mamamia work gates Switchboard work | Upstream changes are small and independently valuable; land and release them before Switchboard starts |
 | SQLite backends must match in-memory semantics exactly | Shared conformance suite is a v1 deliverable, not follow-up |
 | Lease duration mistuned → concurrent delivery of one message | Default `2 × timeout`; ownership check on settle as backstop |
 | Pi power loss corrupting the log | SQLite WAL mode; durability test in the suite |
