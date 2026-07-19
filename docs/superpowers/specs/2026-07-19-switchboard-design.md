@@ -79,6 +79,10 @@ would be to push down.
 The rule matters more than repository ownership. Shared ownership makes the boundary easier
 to erode, not harder, because every Switchboard need starts to look like a mamamia feature.
 
+Both repositories are private for now, to be sanitized and opened if and when that becomes
+useful. Privacy removes the external forcing function that would otherwise keep mamamia
+honest, so the test above has to be applied deliberately at review time rather than assumed.
+
 Applying the test to the known gaps:
 
 | Concern | Owner | Reasoning |
@@ -97,7 +101,7 @@ schedule.
 
 ## Upstream work in mamamia
 
-Three changes are prerequisites for v1. Each is independently justifiable as a delivery
+Four changes are prerequisites for v1. Each is independently justifiable as a delivery
 system feature and is upstreamed, not carried as a fork.
 
 **1. Deferred redelivery (`retry_after`).** mamamia has no notion of *when* a failed message
@@ -105,28 +109,49 @@ becomes eligible again — `acquire_next` returns anything in `PENDING` or `FAIL
 live lease, so a failing message is instantly reacquirable and would exhaust its retry
 ceiling in milliseconds. This is listed as "Retry Backoff" in mamamia's own future work.
 
-```python
-await orchestrator.settle(log_id, group_id, message_id, client_id,
-                          success=False, retry_after=30.0)
-```
-
 `IStateStore` gains an `available_at` per `(log_id, group_id, message_id)`; `acquire_next`
 skips messages whose `available_at` is in the future. The client supplies the delay, mirroring
 the existing `duration` parameter on `acquire_next`. mamamia enforces *when*; it never decides
 *how long*.
 
+**2. Explicit terminal outcomes.** A consumer that knows a message is permanently
+unprocessable — malformed payload, unroutable target, rejected by a business rule — should
+not spend the whole retry ceiling proving it. This is standard in delivery systems
+(RabbitMQ `basic.reject` with `requeue=false`, Celery's `Reject`, Kafka dead-letter topics).
+
+`settle` takes an explicit outcome rather than a boolean plus modifiers:
+
+```python
+await orchestrator.settle(..., outcome='success')
+await orchestrator.settle(..., outcome='retry', retry_after=30.0)   # deferred
+await orchestrator.settle(..., outcome='retry', retry_after=0)      # immediate
+await orchestrator.settle(..., outcome='dead')                      # kill, ignores retry count
+```
+
+There are three real outcomes, so the parameter names three. The rejected alternative was
+overloading `retry_after`, with `None` meaning kill — that makes `settle(success=False)`,
+the most natural call anyone writes, silently dead-letter instead of retry. The destructive
+path should never be the default path.
+
+`retry_after` is meaningful only for `outcome='retry'`, so no value of it can destroy a
+message. `outcome='dead'` bypasses the retry count entirely.
+
+Switchboard's counterpart: handlers raise `PermanentError` for failures that cannot succeed
+on retry, which the consumer loop maps to `outcome='dead'`. mamamia supplies the mechanism;
+Switchboard decides what counts as permanent.
+
 This also removes head-of-line blocking on a poison message: while backing off, the message
 is ineligible, so `acquire_next` moves past it to newer events instead of re-picking it every
 cycle.
 
-**2. Strict settle.** `settle` currently permits settlement when `get_lease` returns `None`,
+**3. Strict settle.** `settle` currently permits settlement when `get_lease` returns `None`,
 intending to allow "lease expired but nobody else took it." It cannot distinguish that from
 "someone else took it and already finished," so a slow worker can overwrite the final state
 of a redelivery that already completed. Settle should require a live lease owned by the
 caller and reject otherwise. At-least-once already tolerates the resulting redelivery, so
 strictness costs nothing.
 
-**3. Persistent backends.** SQLite/WAL implementations of `IMessageStorage`, `IStateStore`,
+**4. Persistent backends.** SQLite/WAL implementations of `IMessageStorage`, `IStateStore`,
 and `ILeaseManager`, with retention limits, tested against the same conformance suite as the
 in-memory backends.
 
@@ -448,11 +473,13 @@ async def consume(handler, ctx, orchestrator):
         try:
             async with asyncio.timeout(handler.timeout_s):
                 await handler.handle(event, ctx)
-            await orchestrator.settle(..., success=True)
+            await orchestrator.settle(..., outcome='success')
+        except PermanentError:
+            await orchestrator.settle(..., outcome='dead')
         except Exception:
             attempts = await state.get_retry_count(...)
             await orchestrator.settle(
-                ..., success=False, retry_after=backoff(attempts),
+                ..., outcome='retry', retry_after=backoff(attempts),
             )
 ```
 
@@ -492,6 +519,11 @@ mechanism out of the loop.
   `retry_after` on settle. mamamia enforces the deferral; the schedule is Switchboard's.
 - **Dead-letter** after 10 attempts: state `DEAD`, retained for inspection, never retried
   automatically.
+- **Permanent failure short-circuits retries.** A handler raising `PermanentError` — a
+  malformed payload, an unroutable target, a 4xx that will never become a 2xx — settles as
+  `dead` immediately rather than retrying nine more times to reach the same conclusion.
+  Distinguishing permanent from transient is the handler's judgement; only it has the
+  context to know.
 - **Isolation.** A handler's failure affects only its own consumer group.
 - **No ordering guarantee.** A failed message retried after backoff will land after messages
   that succeeded immediately. Strict ordering is incompatible with per-message retry, and
@@ -635,7 +667,7 @@ Discord and GitHub are faked at the HTTP boundary. No live API calls in tests.
 | Risk | Mitigation |
 |---|---|
 | mamamia is pre-1.0 and may change under us | Pin the version; build only against released tags, never an unreleased branch |
-| Shared ownership erodes the mamamia/Switchboard boundary | Every upstream change must pass the *Division of concerns* test; mamamia stays public and independently useful |
+| Shared ownership erodes the mamamia/Switchboard boundary | Every upstream change must pass the *Division of concerns* test, applied at review time |
 | v1 now spans two repos, so mamamia work gates Switchboard work | Upstream changes are small and independently valuable; land and release them before Switchboard starts |
 | SQLite backends must match in-memory semantics exactly | Shared conformance suite is a v1 deliverable, not follow-up |
 | Lease duration mistuned → concurrent delivery of one message | Default `2 × timeout`; ownership check on settle as backstop |
