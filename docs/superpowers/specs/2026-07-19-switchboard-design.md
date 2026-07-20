@@ -435,14 +435,58 @@ class Egress(Protocol):
 The egress owns the connection, auth, and rate limiter once. Attaching five handlers does
 not create five rate limiters competing for the same API quota.
 
-Handler context is typed per egress, so a Discord handler gets Discord capabilities without
-holding its own credentials:
+Handler context has two halves. The broker supplies capabilities every handler has; the
+egress supplies its own, typed to itself. A Discord handler therefore gets Discord
+capabilities without holding its own credentials, and gets `publish` without the Discord
+egress knowing what publishing is.
 
 ```python
+@dataclass
+class Ctx(Generic[E]):
+    publish: Publish     # from the broker — same signature an ingress gets
+    egress: E            # from egress.context()
+
 class DiscordCtx(Protocol):
     async def send(self, channel: str, msg: DiscordMessage) -> MessageRef: ...
     async def edit(self, ref: MessageRef, msg: DiscordMessage) -> None: ...
 ```
+
+A handler then reads `ctx.publish(...)` and `ctx.egress.send(...)`.
+
+### Handlers that publish
+
+`ctx.publish` is deliberately the same callable an ingress receives. A handler is therefore
+also an event source, which makes pipelines fall out of the existing machinery rather than
+needing a workflow engine:
+
+```
+github.home.pr.merged → handler → deploy.requested → handler → deploy.completed → notify
+```
+
+Each stage is an independent consumer group with its own offset, retry budget, and
+dead-letter queue. A stage that fails retries without re-running the stages before it.
+
+**Duplicates are possible and accepted.** A handler that publishes and then crashes before
+settling will be redelivered and will publish again. This is the at-least-once contract
+applied one level up, and it is why every published event should carry a `dedupe_key`
+derived from its cause rather than from wall-clock time — `f"{event.id}:{handler.name}"` is
+usually right, since it is stable across redeliveries of the same input.
+
+The stronger guarantee — appending a handler's output and settling its input in one
+transaction — is a transactional outbox, and would require a new primitive in mamamia
+(`settle` and `append` committing together). Deliberately deferred: at-least-once with
+dedupe keys is sufficient until real pipelines exist and show that duplicates actually hurt.
+
+**Cycle safety.** A handler whose published event matches its own filter loops forever, and
+the durable log means it loops forever *across restarts*. Two guards, both cheap:
+
+- Every published event carries `meta["caused_by"]` (the id of the event being handled) and
+  `meta["depth"]` (the cause's depth plus one). Origin events from an ingress have depth 0.
+- The broker rejects a publish whose depth exceeds `MAX_CHAIN_DEPTH` (default 16), raising
+  rather than silently dropping, so a runaway pipeline fails loudly at its source.
+
+`caused_by` also makes a chain reconstructable from the log after the fact — given any
+event, its full causal ancestry is a walk back through `meta`.
 
 ### Filtering
 
