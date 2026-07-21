@@ -1,0 +1,16 @@
+services:
+  switchboard:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+
+  # Cloudflare Tunnel — outbound-only ingress for the GitHub webhook.
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    env_file: .env        # TUNNEL_TOKEN=...
