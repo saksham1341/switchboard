@@ -14,3 +14,19 @@ async def broker(tmp_path):
     await b.start()
     yield b
     await b.stop()
+
+
+@pytest.fixture
+def make_broker(tmp_path):
+    created = []
+
+    def _make(**kw):
+        b = Broker(
+            mamamia_db_path=str(tmp_path / "events.db"),
+            switchboard_db_path=str(tmp_path / "sb.db"),
+            wait_ms=50, reaper_interval=3600.0, **kw,
+        )
+        created.append(b)
+        return b
+
+    yield _make

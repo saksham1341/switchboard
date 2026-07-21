@@ -1,3 +1,6 @@
+import asyncio
+import sqlite3
+
 import pytest
 from switchboard.event import EventInput
 from switchboard.errors import ChainTooDeep
@@ -31,3 +34,21 @@ async def test_publish_rejects_over_max_depth(broker):
     ev = EventInput(kind="k", source="github", payload={}, meta={"depth": "17"})
     with pytest.raises(ChainTooDeep):
         await broker.publish(ev)
+
+
+async def test_stop_is_robust_to_a_failed_consumer_task(make_broker):
+    """A consumer task that ended by raising (not by cancellation) must not
+    prevent stop() from closing the db handles."""
+    b = make_broker()
+    await b.start()
+
+    async def _boom():
+        raise RuntimeError("consumer blew up")
+
+    b._tasks.append(asyncio.create_task(_boom()))
+    await asyncio.sleep(0.01)          # let it fail
+    await b.stop()                     # must NOT raise
+
+    # the mamamia connection is closed: using it now raises
+    with pytest.raises(sqlite3.ProgrammingError):
+        b._conn.execute("SELECT 1")

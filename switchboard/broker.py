@@ -88,16 +88,17 @@ class Broker:
         self._running = False
         for t in self._tasks:
             t.cancel()
-        for t in self._tasks:
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
+        if self._tasks:
+            # return_exceptions=True so a task that ended by raising (not just by
+            # cancellation) cannot abort cleanup and leak the db handles.
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
-        if self._seen is not None:
-            self._seen.close()
-        if self._conn is not None:
-            self._conn.close()
+        try:
+            if self._seen is not None:
+                self._seen.close()
+        finally:
+            if self._conn is not None:
+                self._conn.close()
 
     async def publish(self, ev: EventInput) -> PublishResult:
         depth = int(ev.meta.get("depth", "0"))
