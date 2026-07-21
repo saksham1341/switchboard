@@ -42,7 +42,7 @@ class LoggerEgress:
     def __init__(self, filter: Filter | None = None, stream=None):
         self.filter = filter or (lambda e: e.source == "github")
         self._stream = stream or sys.stdout
-        self.handlers = [Handler(name="log-all", filter=self.filter, handle=self._log)]
+        self.handlers = [Handler(name="log-all", filter=lambda e: True, handle=self._log)]
 
     def context(self) -> Any:
         return None

@@ -16,9 +16,11 @@ def test_logger_egress_shape():
     eg = LoggerEgress()
     assert eg.name == "logger"
     assert len(eg.handlers) == 1
-    h = eg.handlers[0]
-    assert h.filter(_event()) is True
-    assert h.filter(_event(source="discord")) is False
+    # the source gate is the egress's coarse filter
+    assert eg.filter(_event()) is True
+    assert eg.filter(_event(source="discord")) is False
+    # the log-all handler logs everything the egress passes through
+    assert eg.handlers[0].filter(_event(source="discord")) is True
 
 
 def test_logger_handler_writes_json():
