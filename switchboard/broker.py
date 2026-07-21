@@ -4,7 +4,7 @@ import uuid
 from dataclasses import asdict
 from typing import Callable, Literal
 
-from mamamia.core.models import Outcome
+from mamamia.core.models import MessageState, Outcome
 from mamamia.server.db import connect
 from mamamia.server.storage.sqlite import SQLiteStorage
 from mamamia.server.state.sqlite import SQLiteStateStore
@@ -177,14 +177,14 @@ class Broker:
                     attempts = await orch.state_store.get_retry_count(LOG_ID, group_id, msg.id)
                     await self._settle(orch, group_id, msg.id, Outcome.RETRY,
                                        retry_after=backoff(attempts))
-                    # orch.settle() dead-letters internally once the retry ceiling
-                    # is crossed (mamamia's Orchestrator._settle); attempts is the
-                    # pre-increment count, so attempts + 1 is what settle just
-                    # compared against max_retries. Fire the matching hook.
-                    if attempts + 1 >= self._max_retries:
-                        self._fire("dead", event, group_id)
-                    else:
-                        self._fire("failed", event, group_id)
+                    # mamamia's settle dead-letters internally once the retry
+                    # ceiling is crossed. Read the resulting state instead of
+                    # re-deriving mamamia's comparison, so the hook stays correct
+                    # regardless of mamamia's internal ceiling logic.
+                    state = await orch.state_store.get_message_state(
+                        LOG_ID, group_id, msg.id)
+                    self._fire("dead" if state == MessageState.DEAD else "failed",
+                               event, group_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
