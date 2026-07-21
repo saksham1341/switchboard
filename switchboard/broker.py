@@ -123,4 +123,49 @@ class Broker:
         return PublishResult(status="accepted", event_id=event.id)
 
     async def _consume(self, egress: Egress, handler) -> None:
-        raise NotImplementedError  # Task 7
+        group_id = f"{egress.name}/{handler.name}"
+        orch = self._registry.get_orchestrator(LOG_ID)
+        ctx = Ctx(publish=self.publish, egress=egress.context())
+        timeout_s = handler.timeout_s or self._default_timeout_s
+        lease_s = handler.lease_s or timeout_s * 2
+
+        def passes(event: Event) -> bool:
+            if egress.filter is not None and not egress.filter(event):
+                return False
+            return handler.filter(event)
+
+        while self._running:
+            try:
+                msg = await self._registry.acquire_blocking(
+                    LOG_ID, group_id, self._instance_id,
+                    duration=lease_s, wait_ms=self._wait_ms,
+                )
+            except asyncio.CancelledError:
+                raise
+            if msg is None:
+                continue
+
+            event = Event(**msg.payload)
+            if not passes(event):
+                await orch.settle(LOG_ID, group_id, msg.id, self._instance_id,
+                                  outcome=Outcome.SUCCESS)
+                continue
+
+            try:
+                async with asyncio.timeout(timeout_s):
+                    await handler.handle(event, ctx)
+                await orch.settle(LOG_ID, group_id, msg.id, self._instance_id,
+                                  outcome=Outcome.SUCCESS)
+                self._fire("success", event, group_id)
+            except asyncio.CancelledError:
+                raise
+            except PermanentError:
+                await orch.settle(LOG_ID, group_id, msg.id, self._instance_id,
+                                  outcome=Outcome.DEAD)
+                self._fire("dead", event, group_id)
+            except Exception:
+                attempts = await orch.state_store.get_retry_count(
+                    LOG_ID, group_id, msg.id)
+                await orch.settle(LOG_ID, group_id, msg.id, self._instance_id,
+                                  outcome=Outcome.RETRY, retry_after=backoff(attempts))
+                self._fire("failed", event, group_id)
