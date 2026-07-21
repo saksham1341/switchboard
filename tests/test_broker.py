@@ -150,6 +150,52 @@ async def test_hung_handler_times_out_and_isolates(make_broker):
         await b.stop()
 
 
+async def test_dead_letter_ceiling_is_ten(make_broker, monkeypatch):
+    # make retries immediate so 10 attempts run fast
+    monkeypatch.setattr("switchboard.broker.backoff", lambda *a, **k: 0.0)
+    b = make_broker()
+    eg = RecordingEgress(fail_times=999)   # always raises -> RETRY each time
+    dead = []
+    b.attach(eg)
+    b.on("dead", lambda e, g: dead.append(e.id))
+    await b.start()
+    try:
+        await b.publish(EventInput(kind="k", source="github", payload={}))
+        await _wait_for(lambda: len(dead) >= 1, timeout=10)
+        # 10 attempts (all "fail") before the message dead-letters; not 3
+        assert len(eg.seen) == 10, f"expected 10 attempts before dead-letter, got {len(eg.seen)}"
+    finally:
+        await b.stop()
+
+
+async def test_consumer_survives_settle_permission_error(make_broker):
+    b = make_broker()
+    eg = RecordingEgress()               # handler succeeds
+    success = []
+    b.attach(eg)
+    b.on("success", lambda e, g: success.append(e.id))
+    await b.start()
+    try:
+        orch = b._registry.get_orchestrator("events")
+        real_settle = orch.settle
+        calls = {"n": 0}
+
+        async def flaky_settle(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError("lease expired before settle")
+            return await real_settle(*a, **k)
+
+        orch.settle = flaky_settle
+        await b.publish(EventInput(kind="k", source="github", payload={}))
+        # first settle raises PermissionError; the loop must survive, the message
+        # is redelivered after its lease lapses, and a later settle succeeds.
+        await _wait_for(lambda: len(success) >= 1, timeout=10)
+        assert not b._tasks[0].done(), "consumer task died after a settle PermissionError"
+    finally:
+        await b.stop()
+
+
 async def test_durability_redelivers_after_crash_midflight(tmp_path):
     # True crash recovery: a handler takes the message (lease written, durable)
     # and is cancelled MID-DISPATCH without settling. On restart, the held lease

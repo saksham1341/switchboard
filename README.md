@@ -26,6 +26,11 @@ python -m pytest -q
 4. Point the GitHub webhook at the tunnel hostname's `/webhook`, content-type
    `application/json`, with the same secret.
 
+The `switchboard` app port (8080) is internal-only and is not published to the
+host. In the Cloudflare Zero Trust dashboard, configure the tunnel's public
+hostname to route to the origin `http://switchboard:8080` (the compose service
+name/port); GitHub's webhook then points at that public hostname's `/webhook`.
+
 ## Inspect dead letters
 ```bash
 python -m switchboard.cli dead-letters --db ./data/events.db

@@ -1,6 +1,6 @@
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
 from switchboard.event import Event

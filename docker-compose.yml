@@ -2,15 +2,19 @@ services:
   switchboard:
     build: .
     restart: unless-stopped
-    env_file: .env
-    ports:
-      - "8080:8080"
+    environment:
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?set GITHUB_WEBHOOK_SECRET in .env}
+      SB_MAX_LOG_MESSAGES: ${SB_MAX_LOG_MESSAGES:-10000}
+      SB_PORT: ${SB_PORT:-8080}
+    expose:
+      - "8080"
     volumes:
       - ./data:/data
 
   # Cloudflare Tunnel — outbound-only ingress for the GitHub webhook.
   tunnel:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2024.12.2   # pinned; bump deliberately, never :latest
     restart: unless-stopped
     command: tunnel run
-    env_file: .env        # TUNNEL_TOKEN=...
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
