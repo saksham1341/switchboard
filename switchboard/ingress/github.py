@@ -46,3 +46,62 @@ def map_event(gh_event: str, payload: dict) -> EventInput | None:
 
 def _event(kind: str, payload: dict) -> EventInput:
     return EventInput(kind=kind, source="github", payload=payload)
+
+
+import json as _json
+
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.routing import Route
+
+
+class GitHubIngress:
+    name = "github"
+
+    def __init__(self, secret: str, *, host: str = "0.0.0.0", port: int = 8080):
+        self._secret = secret
+        self._host = host
+        self._port = port
+        self._publish = None
+        self._server = None
+        self.app = Starlette(routes=[
+            Route("/webhook", self._webhook, methods=["POST"]),
+            Route("/health", lambda request: PlainTextResponse("ok"), methods=["GET"]),
+        ])
+
+    def bind(self, publish) -> None:
+        """Inject the broker's publish callable. Called by start(); exposed so
+        tests can drive `app` without binding a port."""
+        self._publish = publish
+
+    async def _webhook(self, request):
+        body = await request.body()
+        sig = request.headers.get("X-Hub-Signature-256")
+        if not verify_signature(self._secret, body, sig):
+            return JSONResponse({"error": "invalid signature"}, status_code=401)
+        try:
+            payload = _json.loads(body)
+        except ValueError:
+            return JSONResponse({"error": "malformed json"}, status_code=400)
+
+        gh_event = request.headers.get("X-GitHub-Event", "")
+        ei = map_event(gh_event, payload)
+        if ei is None:
+            return JSONResponse({"status": "ignored"}, status_code=200)
+
+        ei.dedupe_key = request.headers.get("X-GitHub-Delivery")
+        ei.meta = {"delivery": ei.dedupe_key or "", "depth": "0"}
+        result = await self._publish(ei)
+        return JSONResponse({"status": result.status, "event_id": result.event_id},
+                            status_code=200)
+
+    async def start(self, publish) -> None:
+        import uvicorn
+        self.bind(publish)
+        config = uvicorn.Config(self.app, host=self._host, port=self._port, log_level="info")
+        self._server = uvicorn.Server(config)
+        await self._server.serve()
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            self._server.should_exit = True
