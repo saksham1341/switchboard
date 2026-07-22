@@ -40,3 +40,37 @@ def test_configured_commands_include_parameterized_echo():
     assert isinstance(echo, Command)
     assert [o.name for o in echo.options] == ["message"]
     assert echo.options[0].type is str and echo.options[0].required is True
+
+
+def test_build_tolerates_missing_application_id(tmp_path):
+    # token present but the application_id key omitted entirely -> no KeyError
+    cfg = _base(tmp_path) | {"discord_bot_token": "bot-tok"}
+    broker, ingresses = build(cfg)
+    assert "discord" in broker._egresses
+    assert any(isinstance(i, DiscordIngress) for i in ingresses)
+
+
+async def test_teardown_is_best_effort():
+    from switchboard.app import _teardown
+
+    stopped = []
+
+    class _Ing:
+        def __init__(self, name, boom=False):
+            self.name = name
+            self._boom = boom
+        async def stop(self):
+            stopped.append(self.name)
+            if self._boom:
+                raise RuntimeError("stop failed")
+
+    class _Broker:
+        def __init__(self):
+            self.stopped = False
+        async def stop(self):
+            self.stopped = True
+
+    b = _Broker()
+    await _teardown([_Ing("a", boom=True), _Ing("b")], b)
+    assert stopped == ["a", "b"]      # a raising did not skip b
+    assert b.stopped is True          # broker still stopped

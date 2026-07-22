@@ -32,7 +32,7 @@ def build(config: dict) -> tuple[Broker, list]:
 
     if config.get("discord_bot_token"):
         broker.attach(DiscordEgress(
-            config["discord_bot_token"], config["discord_application_id"],
+            config["discord_bot_token"], config.get("discord_application_id"),
         ))
         ingresses.append(DiscordIngress(
             config["discord_bot_token"],
@@ -40,6 +40,18 @@ def build(config: dict) -> tuple[Broker, list]:
         ))
 
     return broker, ingresses
+
+
+async def _teardown(ingresses: list, broker: Broker) -> None:
+    """Best-effort shutdown: one ingress failing to stop must not skip the
+    others or the broker (which owns the durable-log consumer tasks + sqlite
+    connections). Stop every ingress, swallowing errors, then stop the broker."""
+    for ing in ingresses:
+        try:
+            await ing.stop()
+        except Exception:
+            pass
+    await broker.stop()
 
 
 async def run() -> None:
@@ -60,9 +72,7 @@ async def run() -> None:
         # each ingress owns its transport and serves until cancelled
         await asyncio.gather(*(ing.start(broker.publish) for ing in ingresses))
     finally:
-        for ing in ingresses:
-            await ing.stop()
-        await broker.stop()
+        await _teardown(ingresses, broker)
 
 
 if __name__ == "__main__":
