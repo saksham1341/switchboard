@@ -3,3 +3,11 @@ node_modules/
 *.db-wal
 *.db-shm
 .env
+venv/
+__pycache__/
+*.egg-info/
+vendor/
+data/
+
+# SDD controller scratch (briefs, reports, ledger)
+.superpowers/
