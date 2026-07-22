@@ -271,6 +271,11 @@ regardless of yellowpages?"*:
 - **Message-event ingress** (`on_message`) if a use case appears — needs the
   privileged message-content intent.
 - **Richer messages** — embeds, edits, components — the sender can grow to these.
+- **Interaction-token indirection** — instead of storing the raw
+  `interaction_token` in the event `meta`, keep it in a side table keyed by an
+  opaque reference that the event carries; the egress resolves the reference to
+  the token at send time. Removes the short-lived secret from the durable log.
+  Considered and deferred — the token-in-`meta` approach is sufficient for now.
 
 ## Risks
 
