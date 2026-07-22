@@ -51,7 +51,6 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 from switchboard.dedup import SeenStore
-from switchboard.event import ulid
 
 
 class GitHubSensor:
@@ -100,11 +99,10 @@ class GitHubSensor:
         if delivery_id and self._seen.get(delivery_id) is not None:
             return JSONResponse({"status": "duplicate"}, status_code=200)
 
-        event_id = ulid()
+        observation_id = await self._emit(name, payload)
         if delivery_id:
-            self._seen.record(delivery_id, event_id)
-        await self._emit(name, payload)
-        return JSONResponse({"status": "ok", "event_id": event_id}, status_code=200)
+            self._seen.record(delivery_id, str(observation_id))
+        return JSONResponse({"status": "ok", "event_id": observation_id}, status_code=200)
 
     async def start(self, emit) -> None:
         import uvicorn
