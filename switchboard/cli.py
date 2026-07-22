@@ -6,33 +6,28 @@ import sys
 from mamamia.core.models import MessageState
 from mamamia.server.db import connect
 
-LOG_ID = "events"
-
 
 async def list_dead_letters(mamamia_db_path: str) -> list[dict]:
-    """Return retained DEAD deliveries joined to their stored event. Reads the
-    mamamia database directly (read-only) — mamamia has no query API for this,
-    and the schema is stable within a pinned version."""
+    """Return retained DEAD deliveries across all logs, joined to each message's
+    stored `name` (from mamamia metadata). Reads the mamamia database directly
+    (read-only) — mamamia has no query API for this; the schema is stable within
+    a pinned version."""
     conn = await connect(mamamia_db_path)
     try:
         dead = conn.execute(
-            "SELECT group_id, message_id FROM message_state WHERE state = ? "
+            "SELECT log_id, group_id, message_id FROM message_state WHERE state = ? "
             "ORDER BY message_id DESC",
             (MessageState.DEAD.value,),
         ).fetchall()
         rows = []
-        for group_id, message_id in dead:
-            payload = conn.execute(
-                "SELECT payload FROM messages WHERE log_id = ? AND id = ?",
-                (LOG_ID, message_id),
+        for log_id, group_id, message_id in dead:
+            row = conn.execute(
+                "SELECT metadata FROM messages WHERE log_id = ? AND id = ?",
+                (log_id, message_id),
             ).fetchone()
-            event = _decode(payload[0]) if payload else {}
-            rows.append({
-                "group_id": group_id,
-                "message_id": message_id,
-                "event_id": event.get("id"),
-                "kind": event.get("kind"),
-            })
+            meta = _decode(row[0]) if row and row[0] else {}
+            rows.append({"log_id": log_id, "group_id": group_id,
+                         "message_id": message_id, "name": meta.get("name")})
         return rows
     finally:
         conn.close()

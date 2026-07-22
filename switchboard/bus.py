@@ -11,6 +11,7 @@ from mamamia.server.transaction import SQLiteTransaction
 from mamamia.server.registry import LogRegistry
 
 from switchboard.backoff import backoff
+from switchboard.errors import PermanentError
 from switchboard.message import (
     OBS_LOG, CMD_LOG, Observation, Command, DecideCtx, ActCtx,
 )
@@ -125,6 +126,8 @@ class Bus:
                     await settle(msg.id, Outcome.SUCCESS)
                 except asyncio.CancelledError:
                     raise
+                except PermanentError:
+                    await settle(msg.id, Outcome.DEAD)
                 except Exception:
                     attempts = await orch.state_store.get_retry_count(log, group_id, msg.id)
                     await settle(msg.id, Outcome.RETRY, retry_after=backoff(attempts))
