@@ -616,13 +616,18 @@ class DiscordIngress:
                 await self._tree.sync()                    # global (~1h propagation)
 
     def _make_command(self, name: str, description: str) -> app_commands.Command:
-        async def callback(interaction: discord.Interaction, _name=name):
+        # The callback MUST take only `interaction` — discord.py inspects the
+        # signature and treats any further parameter as a user-facing slash
+        # option (requiring a type annotation). `name` is captured from this
+        # method's scope, which is a fresh binding per command, so no closure
+        # late-binding bug and no need for a default-arg trick.
+        async def callback(interaction: discord.Interaction):
             await interaction.response.defer()             # ack within 3s
             options = {}
             for opt in (interaction.data or {}).get("options", []):
                 options[opt.get("name")] = opt.get("value")
             await self._publish(build_command_event(
-                command=_name,
+                command=name,
                 interaction_id=interaction.id,
                 token=interaction.token,
                 channel_id=interaction.channel_id,
