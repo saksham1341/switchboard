@@ -1095,7 +1095,7 @@ Keep `_decode` and `main` as-is (they still print each row as JSON).
 **Files:**
 - Delete: `switchboard/broker.py`, `switchboard/event.py`, `switchboard/ingress/` (whole dir), `switchboard/egress/` (whole dir). **KEEP `switchboard/dedup.py`** (now the GitHub sensor's `SeenStore` dependency) and **KEEP `switchboard/errors.py`** (now `PermanentError` only, used by `bus.py`).
 - Delete tests: `tests/test_broker.py`, `tests/test_event.py`, `tests/test_egress.py`, `tests/test_discord_events.py`, `tests/test_discord_egress.py`, `tests/test_discord_ingress.py`, `tests/test_discord_sender.py`, `tests/test_discord_integration.py`, `tests/test_github_map.py`, `tests/test_github_endpoint.py`, `tests/test_github_relay_integration.py`. **KEEP `tests/test_dedup.py`** (SeenStore still exists) and **KEEP `tests/test_cli.py`** (rewritten in Task 9).
-- Fix: `tests/conftest.py` (remove the `broker`/`make_broker` fixtures — they import the deleted `Broker` and are used only by now-deleted tests); `switchboard/sensors/discord.py` (drop the dead `from switchboard.event import EventInput` import left from the Task 4 move).
+- Fix: `tests/conftest.py` (remove the `broker`/`make_broker` fixtures — they import the deleted `Broker` and are used only by now-deleted tests); `switchboard/sensors/discord.py` (drop the dead `from switchboard.event import EventInput` import left from the Task 4 move); `switchboard/errors.py` (now that `broker.py`/`test_broker.py` are deleted this same task, delete the `ChainTooDeep` class — keep only `PermanentError`).
 
 - [ ] **Step 1: Delete old modules + their tests**
 ```bash
