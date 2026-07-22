@@ -539,7 +539,7 @@ git commit -m "feat(discord): DiscordEgress + /ping handler (replies via interac
 
 **Interfaces:**
 - Consumes: `build_command_event` (Task 3, same module); `discord.py`.
-- Produces: `class DiscordIngress(bot_token, application_id, *, commands: list[tuple[str, str]], guild_id: str | None = None)` — `name = "discord"`; `async start(publish)`, `async stop()`; commands registered in the tree at construction.
+- Produces: `class DiscordIngress(bot_token, *, commands: list[tuple[str, str]], guild_id: str | None = None)` — `name = "discord"`; `async start(publish)`, `async stop()`; commands registered in the tree at construction. (No `application_id` — discord.py derives the app identity from the bot token.)
 
 - [ ] **Step 1: Add `discord.py` to `pyproject.toml`**
 
@@ -557,7 +557,7 @@ from switchboard.ingress.discord import DiscordIngress
 
 def test_ingress_registers_configured_commands_without_network():
     ing = DiscordIngress(
-        "bot-tok", "app-123",
+        "bot-tok",
         commands=[("ping", "Ping Switchboard"), ("status", "Show status")],
         guild_id="456",
     )
@@ -591,10 +591,9 @@ class DiscordIngress:
 
     name = "discord"
 
-    def __init__(self, bot_token: str, application_id: str, *,
+    def __init__(self, bot_token: str, *,
                  commands: list[tuple[str, str]], guild_id: str | None = None):
         self._token = bot_token
-        self._application_id = application_id
         self._guild_id = guild_id
         self._publish = None
         self._synced = False
@@ -831,7 +830,7 @@ def build(config: dict) -> tuple[Broker, list]:
             config["discord_bot_token"], config["discord_application_id"],
         ))
         ingresses.append(DiscordIngress(
-            config["discord_bot_token"], config["discord_application_id"],
+            config["discord_bot_token"],
             commands=DISCORD_COMMANDS, guild_id=config.get("discord_guild_id"),
         ))
 
