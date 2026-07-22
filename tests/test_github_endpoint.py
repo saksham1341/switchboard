@@ -61,10 +61,10 @@ def test_bad_signature_401_no_publish(client_and_spy):
 
 def test_ignored_event_200_no_publish(client_and_spy):
     client, spy = client_and_spy
-    body = (FIX / "check_run.success.json").read_bytes()
+    body = json.dumps({"repository": {"name": "home"}}).encode()
     r = client.post("/webhook", content=body, headers={
         "X-Hub-Signature-256": _sign(body),
-        "X-GitHub-Event": "check_run",
+        "X-GitHub-Event": "star",
         "X-GitHub-Delivery": "d-2",
     })
     assert r.status_code == 200

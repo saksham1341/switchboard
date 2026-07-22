@@ -37,8 +37,11 @@ def map_event(gh_event: str, payload: dict) -> EventInput | None:
         return _event(f"github.{repo}.issue.{payload['action']}", payload)
 
     if gh_event == "check_run" and payload.get("action") == "completed":
-        if payload.get("check_run", {}).get("conclusion") == "failure":
+        conclusion = payload.get("check_run", {}).get("conclusion")
+        if conclusion == "failure":
             return _event(f"github.{repo}.check_run.failed", payload)
+        if conclusion == "success":
+            return _event(f"github.{repo}.check_run.succeeded", payload)
         return None
 
     return None

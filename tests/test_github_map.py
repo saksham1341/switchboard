@@ -44,8 +44,10 @@ def test_map_check_run_failed():
     assert ei.kind == "github.home.check_run.failed"
 
 
-def test_map_check_run_success_is_ignored():
-    assert map_event("check_run", _load("check_run.success.json")) is None
+def test_map_check_run_success_is_succeeded():
+    ei = map_event("check_run", _load("check_run.success.json"))
+    assert ei.kind == "github.home.check_run.succeeded"
+    assert ei.source == "github"
 
 
 def test_map_unknown_event_is_ignored():
