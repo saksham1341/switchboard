@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a Discord connector to Switchboard — a `discord.py` bot ingress that turns slash commands into durable events, and an `httpx` egress with two send paths (interaction followup + channel message) — proven end-to-end with a `/ping` demo.
+**Goal:** Add a Discord connector to Switchboard — a `discord.py` bot ingress that turns slash commands (with declared, typed parameters) into durable events, and an `httpx` egress with two send paths (interaction followup + channel message) — proven end-to-end with a `/ping` demo and a parameterized `/echo message:<text>` demo.
 
 **Architecture:** One connector, two halves sharing config not a socket. The ingress receives over the Gateway (WebSocket) and, per interaction, `defer()`s then `publish`es a thin command event carrying the reply address in `meta`; a downstream Switchboard handler does the work and replies via the egress. The egress is pure HTTP (`httpx`): `reply()` (interaction followup, ≤15 min, token-only) and `send()` (channel message, bot-auth, anytime). `discord.py` is transport + parsing only; durability/retry/dead-letter stay in mamamia.
 
@@ -13,6 +13,7 @@
 - **Python 3.12**, asyncio throughout; every interface boundary is a coroutine.
 - **Symmetric package layout:** provider adapters live at `ingress/<provider>.py` and `egress/<provider>.py`. This plan converts the flat `egress.py` into an `egress/` package first.
 - **`discord.py` is transport + parsing ONLY.** No scheduling, retry, or queueing in the adapter. Command handlers are thin: `defer()` → `publish()` → return. Real work is a downstream Switchboard handler.
+- **Commands declare typed parameters.** The ingress config is a data-driven list of `Command(name, description, options=(Option(name, description, type, required), ...))`. Each command's options are declared to Discord (so its UI prompts for and validates them) by building the discord.py callback's typed signature dynamically from the spec (`callback.__signature__` / `__annotations__` + `app_commands.describe(...)`), not by hand-writing a function per command. discord.py 2.7.1 reads that signature to emit the option JSON and, at invoke time, passes each validated value as a keyword arg — the callback captures them with `**kwargs` and forwards them as the event's `options`. Supported option types: `str`, `int`, `bool`, `float` (Discord STRING/INTEGER/BOOLEAN/NUMBER). Verified end-to-end against the installed discord.py 2.7.1 before this revision.
 - **The egress is pure HTTP (`httpx`)** — no gateway session required to send. Two paths: interaction followup (`POST /webhooks/{application_id}/{interaction_token}`, no auth, 15-min window) and channel message (`POST /channels/{channel_id}/messages`, header `Authorization: Bot <token>`).
 - **Discord API base:** `https://discord.com/api/v10`.
 - **Dedupe key is `str(interaction.id)`** — distinct invocations are distinct events; the same interaction redelivered is deduped by the existing `SeenStore`.
@@ -41,17 +42,17 @@ switchboard/
 ├── egress/                    # was egress.py — converted to a package (Task 1)
 │   ├── __init__.py            # Filter, Handler, Egress, Ctx protocols + LoggerEgress re-export
 │   ├── logger.py              # LoggerEgress (moved)
-│   └── discord.py             # DiscordSender + DiscordEgress + /ping handler (Tasks 2, 4)
+│   └── discord.py             # DiscordSender + DiscordEgress + /ping + /echo handlers (Tasks 2, 4, 7)
 ├── ingress/
 │   ├── github.py              # (unchanged)
-│   └── discord.py             # build_command_event() + DiscordIngress (Tasks 3, 5)
-└── app.py                     # MODIFY: wire the connector; run ingresses concurrently (Task 7)
+│   └── discord.py             # build_command_event() + Command/Option specs + DiscordIngress (Tasks 3, 5, 6)
+└── app.py                     # MODIFY: wire the connector; run ingresses concurrently (Task 9)
 tests/
 ├── test_discord_sender.py     # DiscordSender HTTP paths
 ├── test_discord_events.py     # build_command_event mapping
-├── test_discord_egress.py     # DiscordEgress shape + /ping handler
-├── test_discord_ingress.py    # DiscordIngress construction + command registration (no network)
-├── test_discord_integration.py# Broker + DiscordEgress: publish a command event -> handler -> followup
+├── test_discord_egress.py     # DiscordEgress shape + /ping + /echo handlers
+├── test_discord_ingress.py    # DiscordIngress construction + typed-option command registration (no network)
+├── test_discord_integration.py# Broker + DiscordEgress: publish command events -> handlers -> followup (ping + echo option round-trip)
 └── test_app.py                # MODIFY: build() wires discord when env present
 pyproject.toml                 # MODIFY: add discord.py dependency (Task 5)
 ```
@@ -532,6 +533,11 @@ git commit -m "feat(discord): DiscordEgress + /ping handler (replies via interac
 
 ## Task 5: DiscordIngress — the gateway bot
 
+> **DONE (commit `d036ed6`) but SUPERSEDED by Task 6.** This task shipped a
+> parameterless ingress (`commands: list[tuple[str, str]]`, callback takes only
+> `interaction`). Task 6 revises it to declared typed parameters. The code below
+> is the historical record; implement Task 6, not this, for the ingress.
+
 **Files:**
 - Modify: `switchboard/ingress/discord.py` (add `DiscordIngress`)
 - Modify: `pyproject.toml` (add `discord.py`)
@@ -667,7 +673,302 @@ git commit -m "feat(discord): DiscordIngress gateway bot — slash commands defe
 
 ---
 
-## Task 6: End-to-end integration (publish → handler → followup)
+## Task 6: Declared command parameters — `Command`/`Option` specs + typed-option ingress
+
+Revise `DiscordIngress` (shipped parameterless in Task 5, commit `d036ed6`) so commands declare typed parameters that Discord validates. Introduce a data-driven spec (`Command`/`Option`) and build each command's discord.py callback signature dynamically from the spec — no hand-written function per command. `build_command_event` is unchanged (it already takes `options`).
+
+**Files:**
+- Modify: `switchboard/ingress/discord.py` (add `Option`/`Command` dataclasses; replace `DiscordIngress` + `_make_command`; keep `build_command_event`)
+- Modify: `tests/test_discord_ingress.py` (replace with typed-option assertions)
+
+**Interfaces:**
+- Consumes: `build_command_event` (Task 3, same module); `discord.py`; stdlib `inspect`, `dataclasses`.
+- Produces:
+  - `@dataclass(frozen=True) class Option: name: str; description: str; type: type = str; required: bool = True` (type ∈ {`str`,`int`,`bool`,`float`})
+  - `@dataclass(frozen=True) class Command: name: str; description: str; options: tuple[Option, ...] = ()`
+  - `class DiscordIngress(bot_token, *, commands: list[Command], guild_id: str | None = None)` — `name = "discord"`; `async start(publish)`, `async stop()`; each command registered in the tree at construction with its options declared. (No `application_id`.)
+
+- [ ] **Step 1: Replace the ingress test**
+
+Overwrite `tests/test_discord_ingress.py`:
+```python
+import inspect
+import discord
+from switchboard.ingress.discord import DiscordIngress, Command, Option
+
+
+def _ingress():
+    return DiscordIngress(
+        "bot-tok",
+        commands=[
+            Command("ping", "Ping Switchboard"),
+            Command("echo", "Echo a message back",
+                    options=(Option("message", "Text to echo back", type=str, required=True),
+                             Option("times", "How many times", type=int, required=False))),
+        ],
+        guild_id="456",
+    )
+
+
+def test_ingress_registers_configured_commands_without_network():
+    ing = _ingress()
+    assert ing.name == "discord"
+    registered = {c.name for c in ing._tree.get_commands()}
+    assert {"ping", "status"} & registered == {"ping"}   # sanity: ping present
+    assert {"ping", "echo"} <= registered
+    assert inspect.iscoroutinefunction(ing.start)
+    assert inspect.iscoroutinefunction(ing.stop)
+
+
+def test_ping_declares_no_options():
+    ing = _ingress()
+    ping = next(c for c in ing._tree.get_commands() if c.name == "ping")
+    assert list(ping.parameters) == []
+
+
+def test_echo_declares_typed_options_with_descriptions_and_requiredness():
+    ing = _ingress()
+    echo = next(c for c in ing._tree.get_commands() if c.name == "echo")
+    params = {p.name: p for p in echo.parameters}
+    assert set(params) == {"message", "times"}
+    assert params["message"].type is discord.AppCommandOptionType.string
+    assert params["message"].required is True
+    assert params["message"].description == "Text to echo back"
+    assert params["times"].type is discord.AppCommandOptionType.integer
+    assert params["times"].required is False
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `. venv/bin/activate && python -m pytest tests/test_discord_ingress.py -v`
+Expected: FAIL, `ImportError: cannot import name 'Command'` (specs not defined yet).
+
+- [ ] **Step 3: Replace the ingress in `switchboard/ingress/discord.py`**
+
+Keep `build_command_event` and the `from switchboard.event import EventInput` import at the top. Replace the old `import discord` / `from discord import app_commands` block and the old `DiscordIngress` class with:
+```python
+import inspect
+from dataclasses import dataclass
+
+import discord
+from discord import app_commands
+
+
+@dataclass(frozen=True)
+class Option:
+    """A declared slash-command parameter. `type` is a plain Python type
+    (str -> STRING, int -> INTEGER, bool -> BOOLEAN, float -> NUMBER); Discord
+    validates the value before the interaction ever reaches us."""
+    name: str
+    description: str
+    type: type = str
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class Command:
+    name: str
+    description: str
+    options: tuple[Option, ...] = ()
+
+
+class DiscordIngress:
+    """Ingress half of the Discord connector: a discord.py bot on the Gateway.
+    Registers the configured slash commands (with their declared, typed options);
+    each interaction is deferred (acked within Discord's 3s window) and published
+    as a thin command event. The real work is a downstream Switchboard handler.
+    discord.py is transport + parsing only — no application logic lives here.
+    """
+
+    name = "discord"
+
+    def __init__(self, bot_token: str, *,
+                 commands: list[Command], guild_id: str | None = None):
+        self._token = bot_token
+        self._guild_id = guild_id
+        self._publish = None
+        self._synced = False
+
+        self._client = discord.Client(intents=discord.Intents.none())
+        self._tree = app_commands.CommandTree(self._client)
+        for spec in commands:
+            self._tree.add_command(self._make_command(spec))
+
+        @self._client.event
+        async def on_ready():
+            if self._synced:                              # on_ready can refire on reconnect
+                return
+            self._synced = True
+            if self._guild_id:
+                guild = discord.Object(id=int(self._guild_id))
+                self._tree.copy_global_to(guild=guild)    # instant per-guild in dev
+                await self._tree.sync(guild=guild)
+            else:
+                await self._tree.sync()                    # global (~1h propagation)
+
+    def _make_command(self, spec: Command) -> app_commands.Command:
+        # discord.py derives a command's options from its callback's *typed
+        # signature*. To keep commands data-driven (a list of specs, not a
+        # hand-written function each), we build that signature dynamically from
+        # `spec.options` and stamp it onto a generic `**kwargs` callback:
+        #   - __signature__ declares (interaction, <opt>: <type> [= default]) so
+        #     discord.py emits the correct option JSON on sync and validates input;
+        #   - at invoke time discord.py passes each validated option as a keyword
+        #     arg, which `**kwargs` captures and we forward verbatim as `options`.
+        # The callback stays thin: defer -> publish -> return.
+        async def callback(interaction: discord.Interaction, **kwargs):
+            await interaction.response.defer()             # ack within 3s
+            await self._publish(build_command_event(
+                command=spec.name,
+                interaction_id=interaction.id,
+                token=interaction.token,
+                channel_id=interaction.channel_id,
+                guild_id=interaction.guild_id,
+                user_id=interaction.user.id,
+                user_name=str(interaction.user),
+                options=dict(kwargs),                      # only the options Discord sent
+            ))
+            # return — no work here; a downstream handler processes and replies
+
+        params = [inspect.Parameter("interaction",
+                                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                    annotation=discord.Interaction)]
+        annotations = {"interaction": discord.Interaction}
+        for opt in spec.options:
+            default = inspect.Parameter.empty if opt.required else None
+            params.append(inspect.Parameter(
+                opt.name, inspect.Parameter.KEYWORD_ONLY,
+                annotation=opt.type, default=default))
+            annotations[opt.name] = opt.type
+        callback.__signature__ = inspect.Signature(params)
+        callback.__annotations__ = annotations
+        if spec.options:
+            app_commands.describe(**{o.name: o.description for o in spec.options})(callback)
+
+        return app_commands.Command(
+            name=spec.name, description=spec.description, callback=callback)
+
+    async def start(self, publish) -> None:
+        self._publish = publish
+        await self._client.start(self._token)             # runs the gateway loop
+
+    async def stop(self) -> None:
+        await self._client.close()
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `python -m pytest tests/test_discord_ingress.py -v`
+Expected: 3 passed (ping declares no options; echo declares typed `message`/`times` with descriptions + requiredness).
+
+- [ ] **Step 5: Full suite**
+
+Run: `python -m pytest -q`
+Expected: all pass.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add switchboard/ingress/discord.py tests/test_discord_ingress.py
+git commit -m "feat(discord): declared typed slash-command parameters (Command/Option specs)"
+```
+
+---
+
+## Task 7: `/echo` egress handler — prove an option round-trips
+
+Add an `echo` handler to `DiscordEgress` (alongside `/ping`) that replies with the `message` option carried on the event. This is the egress side of the parameter round-trip.
+
+**Files:**
+- Modify: `switchboard/egress/discord.py` (add the `echo` handler to `DiscordEgress`)
+- Modify: `tests/test_discord_egress.py` (add echo-handler assertions)
+
+**Interfaces:**
+- Consumes: existing `DiscordEgress`, `DiscordSender`, `Handler`.
+- Produces: `DiscordEgress.handlers` gains `Handler("echo", filter=command==echo, handle=self._echo)`; `_echo` replies `event.payload["options"]["message"]` via `ctx.egress.reply(...)` (model A).
+
+- [ ] **Step 1: Add the failing test**
+
+Append to `tests/test_discord_egress.py`:
+```python
+def _echo_event(message="hi there", token="int-tok"):
+    return Event(
+        id="E2", kind="discord.9.command.echo", source="discord", at=now_iso(),
+        payload={"command": "echo", "options": {"message": message},
+                 "user": {"id": "1", "name": "u"}, "channel_id": "7", "guild_id": "9"},
+        meta={"interaction_token": token, "channel_id": "7"},
+    )
+
+
+def test_echo_handler_filters_to_echo_only():
+    eg = DiscordEgress("bot", "app")
+    echo = next(h for h in eg.handlers if h.name == "echo")
+    assert echo.filter(_echo_event()) is True
+    assert echo.filter(_cmd_event(command="ping")) is False
+
+
+def test_echo_handler_replies_with_the_message_option():
+    eg = DiscordEgress("bot", "app")
+    echo = next(h for h in eg.handlers if h.name == "echo")
+    sender = _RecordingSender()
+    ctx = Ctx(publish=None, egress=sender)
+    asyncio.run(echo.handle(_echo_event(message="pong-back", token="tok-2"), ctx))
+    assert sender.replies == [("tok-2", "pong-back")]
+    assert sender.sends == []
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `python -m pytest tests/test_discord_egress.py -v`
+Expected: FAIL, `StopIteration`/no handler named `echo`.
+
+- [ ] **Step 3: Add the `echo` handler in `switchboard/egress/discord.py`**
+
+In `DiscordEgress.__init__`, extend `self.handlers` with the echo handler, and add the `_echo` method:
+```python
+        self.handlers = [
+            Handler(
+                name="ping",
+                filter=lambda e: e.payload.get("command") == "ping",
+                handle=self._ping,
+            ),
+            Handler(
+                name="echo",
+                filter=lambda e: e.payload.get("command") == "echo",
+                handle=self._echo,
+            ),
+        ]
+```
+```python
+    async def _echo(self, event, ctx) -> None:
+        # model A: reply to the interaction with the declared `message` option,
+        # proving a typed parameter round-trips ingress -> event -> egress.
+        message = event.payload.get("options", {}).get("message", "")
+        await ctx.egress.reply(event.meta["interaction_token"], message)
+```
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `python -m pytest tests/test_discord_egress.py -v`
+Expected: all pass (ping unchanged + 2 new echo tests).
+
+- [ ] **Step 5: Full suite**
+
+Run: `python -m pytest -q`
+Expected: all pass.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add switchboard/egress/discord.py tests/test_discord_egress.py
+git commit -m "feat(discord): /echo egress handler — replies the message option"
+```
+
+---
+
+## Task 8: End-to-end integration (publish → handler → followup)
+
+Two end-to-end paths through the durable log: `/ping` (no options) and `/echo` (a typed option round-trips into the followup body).
 
 **Files:**
 - Test: `tests/test_discord_integration.py`
@@ -687,11 +988,19 @@ from switchboard.egress.discord import DiscordEgress
 from switchboard.event import EventInput
 
 
-async def _wait_for(predicate, timeout=5.0):
+async def _wait_for(predicate, timeout=8.0):
     async def loop():
         while not predicate():
             await asyncio.sleep(0.01)
     await asyncio.wait_for(loop(), timeout)
+
+
+def _broker(tmp_path):
+    return Broker(
+        mamamia_db_path=str(tmp_path / "events.db"),
+        switchboard_db_path=str(tmp_path / "sb.db"),
+        wait_ms=50, reaper_interval=3600.0,
+    )
 
 
 async def test_ping_command_reaches_followup_end_to_end(tmp_path):
@@ -703,13 +1012,8 @@ async def test_ping_command_reaches_followup_end_to_end(tmp_path):
         return httpx.Response(200, json={})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    b = Broker(
-        mamamia_db_path=str(tmp_path / "events.db"),
-        switchboard_db_path=str(tmp_path / "sb.db"),
-        wait_ms=50, reaper_interval=3600.0,
-    )
-    eg = DiscordEgress("bot-tok", "app-123", client=client)
-    b.attach(eg)
+    b = _broker(tmp_path)
+    b.attach(DiscordEgress("bot-tok", "app-123", client=client))
     await b.start()
     try:
         await b.publish(EventInput(
@@ -719,9 +1023,37 @@ async def test_ping_command_reaches_followup_end_to_end(tmp_path):
             dedupe_key="interaction-1",
             meta={"interaction_token": "tok-1", "channel_id": "7"},
         ))
-        await _wait_for(lambda: "url" in seen, timeout=8)
+        await _wait_for(lambda: "url" in seen)
         assert seen["url"] == "https://discord.com/api/v10/webhooks/app-123/tok-1"
         assert seen["body"] == {"content": "pong (via the durable path)"}
+    finally:
+        await b.stop()
+        await client.aclose()
+
+
+async def test_echo_option_round_trips_into_the_followup(tmp_path):
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    b = _broker(tmp_path)
+    b.attach(DiscordEgress("bot-tok", "app-123", client=client))
+    await b.start()
+    try:
+        await b.publish(EventInput(
+            kind="discord.9.command.echo", source="discord",
+            payload={"command": "echo", "options": {"message": "round-trip!"},
+                     "user": {"id": "1", "name": "u"}, "channel_id": "7", "guild_id": "9"},
+            dedupe_key="interaction-2",
+            meta={"interaction_token": "tok-2", "channel_id": "7"},
+        ))
+        await _wait_for(lambda: "url" in seen)
+        assert seen["url"] == "https://discord.com/api/v10/webhooks/app-123/tok-2"
+        assert seen["body"] == {"content": "round-trip!"}   # the declared option, echoed
     finally:
         await b.stop()
         await client.aclose()
@@ -730,7 +1062,7 @@ async def test_ping_command_reaches_followup_end_to_end(tmp_path):
 - [ ] **Step 2: Run to verify it passes**
 
 Run: `python -m pytest tests/test_discord_integration.py -v`
-Expected: 1 passed. (Proves publish → durable log → lease → /ping handler → interaction-followup HTTP, no live gateway.)
+Expected: 2 passed. (Proves publish → durable log → lease → handler → interaction-followup HTTP, no live gateway; echo proves the option survives the round-trip.)
 
 - [ ] **Step 3: Full suite**
 
@@ -741,27 +1073,27 @@ Expected: all pass.
 
 ```bash
 git add tests/test_discord_integration.py
-git commit -m "test(discord): /ping command end-to-end through the durable path to a followup"
+git commit -m "test(discord): /ping and /echo end-to-end through the durable path to a followup"
 ```
 
 ---
 
-## Task 7: App wiring — run GitHub and Discord together
+## Task 9: App wiring — run GitHub and Discord together
 
 **Files:**
 - Modify: `switchboard/app.py`
 - Modify: `tests/test_app.py`
 
 **Interfaces:**
-- Produces: `build(config) -> tuple[Broker, list]` (broker + a list of ingresses); `run()` starts the broker, runs all ingresses concurrently, and stops all + the broker on teardown. Discord is wired only when `config["discord_bot_token"]` is set.
+- Produces: `build(config) -> tuple[Broker, list]` (broker + a list of ingresses); `run()` starts the broker, runs all ingresses concurrently, and stops all + the broker on teardown. Discord is wired only when `config["discord_bot_token"]` is set. Discord commands are declared as `Command`/`Option` specs (incl. the parameterized `/echo`).
 
 - [ ] **Step 1: Write the failing test**
 
 Replace `tests/test_app.py` with:
 ```python
-from switchboard.app import build
+from switchboard.app import build, DISCORD_COMMANDS
 from switchboard.ingress.github import GitHubIngress
-from switchboard.ingress.discord import DiscordIngress
+from switchboard.ingress.discord import DiscordIngress, Command, Option
 
 
 def _base(tmp_path):
@@ -792,12 +1124,21 @@ def test_build_wires_discord_when_configured(tmp_path):
     assert "discord" in broker._egresses
     assert any(isinstance(i, DiscordIngress) for i in ingresses)
     assert any(isinstance(i, GitHubIngress) for i in ingresses)
+
+
+def test_configured_commands_include_parameterized_echo():
+    names = {c.name for c in DISCORD_COMMANDS}
+    assert {"ping", "echo"} <= names
+    echo = next(c for c in DISCORD_COMMANDS if c.name == "echo")
+    assert isinstance(echo, Command)
+    assert [o.name for o in echo.options] == ["message"]
+    assert echo.options[0].type is str and echo.options[0].required is True
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `python -m pytest tests/test_app.py -v`
-Expected: FAIL (`build` returns a single ingress / no discord wiring).
+Expected: FAIL (`build` returns a single ingress / no discord wiring / `DISCORD_COMMANDS` still tuples).
 
 - [ ] **Step 3: Rewrite `switchboard/app.py`**
 
@@ -809,9 +1150,13 @@ from switchboard.broker import Broker
 from switchboard.egress import LoggerEgress
 from switchboard.egress.discord import DiscordEgress
 from switchboard.ingress.github import GitHubIngress
-from switchboard.ingress.discord import DiscordIngress
+from switchboard.ingress.discord import DiscordIngress, Command, Option
 
-DISCORD_COMMANDS = [("ping", "Ping Switchboard")]
+DISCORD_COMMANDS = [
+    Command("ping", "Ping Switchboard"),
+    Command("echo", "Echo a message back",
+            options=(Option("message", "Text to echo back", type=str, required=True),)),
+]
 
 
 def build(config: dict) -> tuple[Broker, list]:
@@ -872,7 +1217,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `python -m pytest tests/test_app.py -v`
-Expected: 2 passed.
+Expected: 3 passed.
 
 - [ ] **Step 5: Full suite**
 
@@ -895,13 +1240,14 @@ git commit -m "feat(app): wire the Discord connector; run GitHub + Discord ingre
 Run: `. venv/bin/activate && python -m pytest -q`
 Expected: all pass.
 
-- [ ] **Manual live check (optional, needs a real bot)** — create a Discord application + bot, invite it to a test guild with the `applications.commands` scope, set `DISCORD_BOT_TOKEN`/`DISCORD_APPLICATION_ID`/`DISCORD_GUILD_ID`, run `python -m switchboard.app`, and run `/ping` in the guild — expect "pong (via the durable path)" plus a `discord.<guild>.command.ping` line from the LoggerEgress and a `processed` row in the log.
+- [ ] **Manual live check (optional, needs a real bot)** — create a Discord application + bot, invite it to a test guild with the `applications.commands` scope, set `DISCORD_BOT_TOKEN`/`DISCORD_APPLICATION_ID`/`DISCORD_GUILD_ID`, run `python -m switchboard.app`, then: (a) `/ping` → expect "pong (via the durable path)"; (b) `/echo message:hello world` → Discord's UI should prompt for the required `message` option and reject an empty one, and the bot should reply "hello world". Both also emit a `discord.<guild>.command.<cmd>` line from the LoggerEgress and a `processed` row in the log.
 
 ---
 
 ## Notes for the executor
 
-- **Thin handlers.** The discord.py command callback must only `defer()` → `publish()` → return. No work inline — that would bypass mamamia's durability. The `/ping` *result* comes from the downstream `discord/ping` handler.
+- **Thin handlers.** The discord.py command callback must only `defer()` → `publish()` → return. No work inline — that would bypass mamamia's durability. The `/ping`/`/echo` *results* come from the downstream `discord/ping` and `discord/echo` handlers.
+- **Typed options are declared, not hand-parsed.** `_make_command` builds the callback's signature from the `Command`/`Option` spec so discord.py emits the option JSON and validates input; the callback captures the validated values via `**kwargs` and forwards them as the event's `options`. Do NOT read `interaction.data` manually and do NOT write a bespoke `async def` per command — that reintroduces the coupling this design removes. Supported option types: `str`/`int`/`bool`/`float`.
 - **Stringify all Discord ids** before they enter an event (snowflakes are 64-bit; payloads round-trip through msgpack). `build_command_event` does this — don't bypass it.
 - **The egress is HTTP, not the gateway.** `DiscordEgress`/`DiscordSender` never touch the bot/client; sends are `httpx`. Followups need no auth (token only); channel sends need `Authorization: Bot <token>`.
 - **`Intents.none()`** — interactions arrive without privileged intents; don't request any.
