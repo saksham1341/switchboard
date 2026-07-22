@@ -78,15 +78,23 @@ class DiscordIngress:
 
         @self._client.event
         async def on_ready():
-            if self._synced:                              # on_ready can refire on reconnect
-                return
-            self._synced = True
-            if self._guild_id:
-                guild = discord.Object(id=int(self._guild_id))
-                self._tree.copy_global_to(guild=guild)    # instant per-guild in dev
-                await self._tree.sync(guild=guild)
-            else:
-                await self._tree.sync()                    # global (~1h propagation)
+            await self._sync_commands()
+
+    async def _sync_commands(self) -> None:
+        # on_ready can refire on every (re)connect, so sync only once. The guard
+        # is set AFTER a successful sync, not before: a transient failure (e.g.
+        # the app not yet authorized in the guild -> 403 Missing Access) must be
+        # retried on the next reconnect rather than latched off for the life of
+        # the process.
+        if self._synced:
+            return
+        if self._guild_id:
+            guild = discord.Object(id=int(self._guild_id))
+            self._tree.copy_global_to(guild=guild)        # instant per-guild in dev
+            await self._tree.sync(guild=guild)
+        else:
+            await self._tree.sync()                        # global (~1h propagation)
+        self._synced = True
 
     def _make_command(self, spec: Command) -> app_commands.Command:
         # discord.py derives a command's options from its callback's *typed
