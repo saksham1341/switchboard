@@ -42,12 +42,14 @@ def test_configured_commands_include_parameterized_echo():
     assert echo.options[0].type is str and echo.options[0].required is True
 
 
-def test_build_tolerates_missing_application_id(tmp_path):
-    # token present but the application_id key omitted entirely -> no KeyError
+def test_build_fails_fast_when_token_set_without_application_id(tmp_path):
+    # token present but application_id omitted -> clear ValueError at build time,
+    # not a cryptic KeyError and not a silent /webhooks/None/... at send time.
+    import pytest
+
     cfg = _base(tmp_path) | {"discord_bot_token": "bot-tok"}
-    broker, ingresses = build(cfg)
-    assert "discord" in broker._egresses
-    assert any(isinstance(i, DiscordIngress) for i in ingresses)
+    with pytest.raises(ValueError, match="discord_application_id is required"):
+        build(cfg)
 
 
 async def test_teardown_is_best_effort():

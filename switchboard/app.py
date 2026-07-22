@@ -31,9 +31,15 @@ def build(config: dict) -> tuple[Broker, list]:
     ]
 
     if config.get("discord_bot_token"):
-        broker.attach(DiscordEgress(
-            config["discord_bot_token"], config.get("discord_application_id"),
-        ))
+        # application_id is required for the egress's interaction-followup URL
+        # (POST /webhooks/{application_id}/{token}); fail fast with a clear
+        # message rather than silently posting to /webhooks/None/... at send time.
+        app_id = config.get("discord_application_id")
+        if not app_id:
+            raise ValueError(
+                "discord_application_id is required when discord_bot_token is set"
+            )
+        broker.attach(DiscordEgress(config["discord_bot_token"], app_id))
         ingresses.append(DiscordIngress(
             config["discord_bot_token"],
             commands=DISCORD_COMMANDS, guild_id=config.get("discord_guild_id"),
