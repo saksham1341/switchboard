@@ -16,7 +16,7 @@
 - **The egress is pure HTTP (`httpx`)** — no gateway session required to send. Two paths: interaction followup (`POST /webhooks/{application_id}/{interaction_token}`, no auth, 15-min window) and channel message (`POST /channels/{channel_id}/messages`, header `Authorization: Bot <token>`).
 - **Discord API base:** `https://discord.com/api/v10`.
 - **Dedupe key is `str(interaction.id)`** — distinct invocations are distinct events; the same interaction redelivered is deduped by the existing `SeenStore`.
-- **Command event shape:** `kind = f"discord.{guild_id}.command.{command}"`, `source = "discord"`, `payload = {command, options, user:{id,name}, channel_id, guild_id}`, `dedupe_key = str(interaction_id)`, `meta = {application_id, interaction_token, channel_id}` (all strings).
+- **Command event shape:** `kind = f"discord.{guild_id}.command.{command}"`, `source = "discord"`, `payload = {command, options, user:{id,name}, channel_id, guild_id}`, `dedupe_key = str(interaction_id)`, `meta = {interaction_token, channel_id}` (all strings). The bot's application id is deployment config (held by the egress sender), NOT per-event — it is not in `meta`.
 - **No privileged intents** — construct the client with `discord.Intents.none()`; interactions arrive regardless.
 - **msgpack-serializable payloads/meta** (strings, lists, string-keyed dicts) — mamamia round-trips them; stringify all Discord snowflake ids.
 - **Secrets from env:** `DISCORD_BOT_TOKEN`, `DISCORD_APPLICATION_ID`, `DISCORD_GUILD_ID` (dev). Discord is wired only when `DISCORD_BOT_TOKEN` is set; GitHub-only deployments are unchanged.
@@ -311,7 +311,7 @@ git commit -m "feat(discord): DiscordSender — interaction-followup and channel
 - Test: `tests/test_discord_events.py`
 
 **Interfaces:**
-- Produces: `build_command_event(*, command, interaction_id, application_id, token, channel_id, guild_id, user_id, user_name, options) -> EventInput` — pure, all primitives.
+- Produces: `build_command_event(*, command, interaction_id, token, channel_id, guild_id, user_id, user_name, options) -> EventInput` — pure, all primitives.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -324,7 +324,6 @@ def test_build_command_event_shape():
     ei = build_command_event(
         command="ping",
         interaction_id=42,
-        application_id=100,
         token="int-tok",
         channel_id=7,
         guild_id=9,
@@ -343,7 +342,6 @@ def test_build_command_event_shape():
         "guild_id": "9",
     }
     assert ei.meta == {
-        "application_id": "100",
         "interaction_token": "int-tok",
         "channel_id": "7",
     }
@@ -351,7 +349,7 @@ def test_build_command_event_shape():
 
 def test_build_command_event_stringifies_ids_for_msgpack():
     ei = build_command_event(
-        command="deploy", interaction_id=1, application_id=2, token="t",
+        command="deploy", interaction_id=1, token="t",
         channel_id=3, guild_id=4, user_id=5, user_name="u", options={},
     )
     assert all(isinstance(v, str) for v in ei.meta.values())
@@ -369,14 +367,15 @@ Expected: FAIL, module not found.
 from switchboard.event import EventInput
 
 
-def build_command_event(*, command, interaction_id, application_id, token,
+def build_command_event(*, command, interaction_id, token,
                         channel_id, guild_id, user_id, user_name, options) -> EventInput:
     """Translate a Discord slash-command interaction into a Switchboard event.
 
     Ids are stringified because mamamia round-trips payloads through msgpack and
     Discord ids are 64-bit snowflakes. `meta` carries the reply address
-    (application id + interaction token + channel) so a downstream handler can
-    reply via the egress, even after a restart, within Discord's 15-min window.
+    (interaction token + channel) so a downstream handler can reply via the
+    egress, even after a restart, within Discord's 15-min window. The bot's
+    application id is deployment config on the egress sender, not per-event.
     """
     return EventInput(
         kind=f"discord.{guild_id}.command.{command}",
@@ -390,7 +389,6 @@ def build_command_event(*, command, interaction_id, application_id, token,
         },
         dedupe_key=str(interaction_id),
         meta={
-            "application_id": str(application_id),
             "interaction_token": token,
             "channel_id": str(channel_id),
         },
@@ -436,7 +434,7 @@ def _cmd_event(command="ping", token="int-tok"):
         id="E1", kind=f"discord.9.command.{command}", source="discord", at=now_iso(),
         payload={"command": command, "options": {}, "user": {"id": "1", "name": "u"},
                  "channel_id": "7", "guild_id": "9"},
-        meta={"application_id": "100", "interaction_token": token, "channel_id": "7"},
+        meta={"interaction_token": token, "channel_id": "7"},
     )
 
 
@@ -627,7 +625,6 @@ class DiscordIngress:
             await self._publish(build_command_event(
                 command=_name,
                 interaction_id=interaction.id,
-                application_id=interaction.application_id,
                 token=interaction.token,
                 channel_id=interaction.channel_id,
                 guild_id=interaction.guild_id,
@@ -716,7 +713,7 @@ async def test_ping_command_reaches_followup_end_to_end(tmp_path):
             payload={"command": "ping", "options": {}, "user": {"id": "1", "name": "u"},
                      "channel_id": "7", "guild_id": "9"},
             dedupe_key="interaction-1",
-            meta={"application_id": "app-123", "interaction_token": "tok-1", "channel_id": "7"},
+            meta={"interaction_token": "tok-1", "channel_id": "7"},
         ))
         await _wait_for(lambda: "url" in seen, timeout=8)
         assert seen["url"] == "https://discord.com/api/v10/webhooks/app-123/tok-1"
