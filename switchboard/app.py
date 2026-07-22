@@ -12,7 +12,7 @@ def build(config: dict) -> tuple[Broker, GitHubIngress]:
         switchboard_db_path=config["switchboard_db_path"],
         max_log_messages=config.get("max_log_messages", 10_000),
     )
-    broker.attach(LoggerEgress(filter=lambda e: e.source == "github"))
+    broker.attach(LoggerEgress())  # truly log-all: every event, any source
     ingress = GitHubIngress(
         secret=config["github_secret"],
         host=config.get("host", "0.0.0.0"),

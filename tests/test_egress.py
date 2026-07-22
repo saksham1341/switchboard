@@ -16,10 +16,10 @@ def test_logger_egress_shape():
     eg = LoggerEgress()
     assert eg.name == "logger"
     assert len(eg.handlers) == 1
-    # the source gate is the egress's coarse filter
+    # LoggerEgress is truly log-all: the egress filter accepts every event,
+    # any source, and the log-all handler passes everything through.
     assert eg.filter(_event()) is True
-    assert eg.filter(_event(source="discord")) is False
-    # the log-all handler logs everything the egress passes through
+    assert eg.filter(_event(source="discord")) is True
     assert eg.handlers[0].filter(_event(source="discord")) is True
 
 
