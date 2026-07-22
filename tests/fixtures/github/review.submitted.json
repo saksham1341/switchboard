@@ -1,0 +1,5 @@
+{"action": "submitted",
+ "repository": {"name": "home", "full_name": "yp/home", "html_url": "https://github.com/yp/home"},
+ "pull_request": {"number": 7, "title": "Add retry backoff", "html_url": "https://github.com/yp/home/pull/7"},
+ "review": {"state": "approved", "html_url": "https://github.com/yp/home/pull/7#pullrequestreview-11"},
+ "sender": {"login": "alice"}}

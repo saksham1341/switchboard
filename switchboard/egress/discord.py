@@ -27,11 +27,20 @@ class DiscordSender:
         resp.raise_for_status()
         return resp
 
-    async def send(self, channel_id: str, content: str) -> httpx.Response:
+    async def send(self, channel_id: str, content: str | None = None, *,
+                   embed: dict | None = None,
+                   components: list | None = None) -> httpx.Response:
+        payload: dict = {}
+        if content is not None:
+            payload["content"] = content
+        if embed is not None:
+            payload["embeds"] = [embed]
+        if components is not None:
+            payload["components"] = components
         resp = await self._client.post(
             f"{DISCORD_API}/channels/{channel_id}/messages",
             headers={"Authorization": f"Bot {self._bot_token}"},
-            json={"content": content},
+            json=payload,
         )
         resp.raise_for_status()
         return resp
@@ -41,44 +50,57 @@ class DiscordSender:
 
 
 from switchboard.egress import Handler
+from switchboard.egress.github_notify import build_message
 
 
 class DiscordEgress:
-    """Egress half of the Discord connector. Its `context()` hands handlers a
-    DiscordSender (the two HTTP send paths); this egress also hosts the /ping
-    demo handler. Real command handlers are added the same way as scope grows."""
+    """The Discord output sink. `context()` hands handlers the one DiscordSender
+    (reply + channel send). Handlers are routes into Discord, each with its own
+    input filter: `ping`/`echo` react to Discord slash-command events; `notify-
+    github` relays GitHub events as channel messages. The egress has no coarse
+    filter — a sink serves multiple input sources, so selection is per-handler.
+    """
 
     name = "discord"
 
     def __init__(self, bot_token: str, application_id: str, *,
+                 notify_channel_id: str | None = None,
                  client: httpx.AsyncClient | None = None):
         self._sender = DiscordSender(bot_token, application_id, client=client)
-        self.filter = lambda e: e.source == "discord"      # coarse gate
+        self._notify_channel_id = notify_channel_id
+        self.filter = None                                  # sink: no coarse gate
         self.handlers = [
-            Handler(
-                name="ping",
-                filter=lambda e: e.payload.get("command") == "ping",
-                handle=self._ping,
-            ),
-            Handler(
-                name="echo",
-                filter=lambda e: e.payload.get("command") == "echo",
-                handle=self._echo,
-            ),
+            Handler(name="ping",
+                    filter=lambda e: e.source == "discord" and e.payload.get("command") == "ping",
+                    handle=self._ping),
+            Handler(name="echo",
+                    filter=lambda e: e.source == "discord" and e.payload.get("command") == "echo",
+                    handle=self._echo),
         ]
+        if notify_channel_id:
+            self.handlers.append(Handler(
+                name="notify-github",
+                filter=lambda e: e.source == "github",
+                handle=self._notify,
+            ))
 
     def context(self) -> DiscordSender:
         return self._sender
 
     async def _ping(self, event, ctx) -> None:
-        # model A: reply to the interaction via its stored token
         await ctx.egress.reply(event.meta["interaction_token"], "pong (via the durable path)")
 
     async def _echo(self, event, ctx) -> None:
-        # model A: reply to the interaction with the declared `message` option,
-        # proving a typed parameter round-trips ingress -> event -> egress.
         message = event.payload.get("options", {}).get("message", "")
         await ctx.egress.reply(event.meta["interaction_token"], message)
+
+    async def _notify(self, event, ctx) -> None:
+        # relay a GitHub event to the notify channel as an embed + link buttons
+        msg = build_message(event.kind, event.payload)
+        if msg is None:
+            return                                          # unrecognized kind: ack, no post
+        await ctx.egress.send(self._notify_channel_id,
+                              embed=msg["embed"], components=msg["components"])
 
     async def close(self) -> None:
         await self._sender.close()

@@ -54,3 +54,36 @@ async def test_reply_raises_on_error_status():
     with pytest.raises(httpx.HTTPStatusError):
         await s.reply("expired-tok", "too late")
     await s.close()
+
+
+async def test_send_posts_embed_and_components():
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    s = DiscordSender("bot-tok", "app-123", client=_client(handler))
+    embed = {"title": "hi", "color": 1}
+    comps = [{"type": 1, "components": [{"type": 2, "style": 5, "label": "X", "url": "https://x"}]}]
+    await s.send("chan-9", embed=embed, components=comps)
+    await s.close()
+
+    assert seen["url"] == f"{DISCORD_API}/channels/chan-9/messages"
+    assert seen["auth"] == "Bot bot-tok"
+    assert seen["body"] == {"embeds": [embed], "components": comps}   # no "content" key
+
+
+async def test_send_plain_text_still_works():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    s = DiscordSender("bot-tok", "app-123", client=_client(handler))
+    await s.send("chan-9", "hello channel")
+    await s.close()
+    assert seen["body"] == {"content": "hello channel"}               # only content

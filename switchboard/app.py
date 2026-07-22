@@ -39,7 +39,10 @@ def build(config: dict) -> tuple[Broker, list]:
             raise ValueError(
                 "discord_application_id is required when discord_bot_token is set"
             )
-        broker.attach(DiscordEgress(config["discord_bot_token"], app_id))
+        broker.attach(DiscordEgress(
+            config["discord_bot_token"], app_id,
+            notify_channel_id=config.get("discord_notify_channel_id"),
+        ))
         ingresses.append(DiscordIngress(
             config["discord_bot_token"],
             commands=DISCORD_COMMANDS, guild_id=config.get("discord_guild_id"),
@@ -71,6 +74,7 @@ async def run() -> None:
         "discord_bot_token": os.environ.get("DISCORD_BOT_TOKEN"),
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
+        "discord_notify_channel_id": os.environ.get("DISCORD_NOTIFY_CHANNEL_ID"),
     }
     broker, ingresses = build(config)
     await broker.start()

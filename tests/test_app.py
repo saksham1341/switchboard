@@ -76,3 +76,24 @@ async def test_teardown_is_best_effort():
     await _teardown([_Ing("a", boom=True), _Ing("b")], b)
     assert stopped == ["a", "b"]      # a raising did not skip b
     assert b.stopped is True          # broker still stopped
+
+
+def test_relay_handler_present_when_notify_channel_set(tmp_path):
+    cfg = _base(tmp_path) | {
+        "discord_bot_token": "bot-tok",
+        "discord_application_id": "app-123",
+        "discord_notify_channel_id": "chan-9",
+    }
+    broker, _ = build(cfg)
+    discord = broker._egresses["discord"]
+    assert "notify-github" in [h.name for h in discord.handlers]
+
+
+def test_relay_handler_absent_without_notify_channel(tmp_path):
+    cfg = _base(tmp_path) | {
+        "discord_bot_token": "bot-tok",
+        "discord_application_id": "app-123",
+    }
+    broker, _ = build(cfg)
+    discord = broker._egresses["discord"]
+    assert "notify-github" not in [h.name for h in discord.handlers]
