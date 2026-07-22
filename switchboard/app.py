@@ -1,66 +1,47 @@
 import asyncio
 import os
 
-from switchboard.broker import Broker
-from switchboard.egress import LoggerEgress
-from switchboard.egress.discord import DiscordEgress
-from switchboard.ingress.github import GitHubIngress
-from switchboard.ingress.discord import DiscordIngress, Command, Option
+from switchboard.bus import Bus
+from switchboard.sensors.github import GitHubSensor
+from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
+from switchboard.deciders.github_notify import GitHubNotifyDecider
+from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
+from switchboard.actuators.discord import DiscordPost, DiscordReply
+from switchboard.taps.logger import LoggerTap
 
 DISCORD_COMMANDS = [
-    Command("ping", "Ping Switchboard"),
-    Command("echo", "Echo a message back",
-            options=(Option("message", "Text to echo back", type=str, required=True),)),
+    CommandSpec("ping", "Ping Switchboard"),
+    CommandSpec("echo", "Echo a message back",
+                options=(Option("message", "Text to echo back", type=str, required=True),)),
 ]
 
 
-def build(config: dict) -> tuple[Broker, list]:
-    broker = Broker(
-        mamamia_db_path=config["mamamia_db_path"],
-        switchboard_db_path=config["switchboard_db_path"],
-        max_log_messages=config.get("max_log_messages", 10_000),
-    )
-    broker.attach(LoggerEgress())  # truly log-all
+def build(config: dict):
+    bus = Bus(config["mamamia_db_path"])
+    bus.add_tap(LoggerTap())
 
-    ingresses: list = [
-        GitHubIngress(
-            secret=config["github_secret"],
-            host=config.get("host", "0.0.0.0"),
-            port=int(config.get("port", 8080)),
-        )
-    ]
+    sensors = [GitHubSensor(secret=config["github_secret"],
+                            host=config.get("host", "0.0.0.0"),
+                            port=int(config.get("port", 8080)),
+                            seen_db=config.get("switchboard_db_path", ":memory:"))]
+    for s in sensors:
+        bus.add_sensor(s)
 
     if config.get("discord_bot_token"):
-        # application_id is required for the egress's interaction-followup URL
-        # (POST /webhooks/{application_id}/{token}); fail fast with a clear
-        # message rather than silently posting to /webhooks/None/... at send time.
+        token = config["discord_bot_token"]
         app_id = config.get("discord_application_id")
         if not app_id:
-            raise ValueError(
-                "discord_application_id is required when discord_bot_token is set"
-            )
-        broker.attach(DiscordEgress(
-            config["discord_bot_token"], app_id,
-            notify_channel_id=config.get("discord_notify_channel_id"),
-        ))
-        ingresses.append(DiscordIngress(
-            config["discord_bot_token"],
-            commands=DISCORD_COMMANDS, guild_id=config.get("discord_guild_id"),
-        ))
+            raise ValueError("discord_application_id is required when discord_bot_token is set")
+        discord_sensor = DiscordSensor(token, commands=DISCORD_COMMANDS,
+                                       guild_id=config.get("discord_guild_id"))
+        bus.add_sensor(discord_sensor); sensors.append(discord_sensor)
+        bus.add_decider(PingDecider()); bus.add_decider(EchoDecider())
+        bus.add_actuator(DiscordReply(token, app_id))
+        if config.get("discord_notify_channel_id"):
+            bus.add_decider(GitHubNotifyDecider(channel_id=config["discord_notify_channel_id"]))
+            bus.add_actuator(DiscordPost(token, app_id))
 
-    return broker, ingresses
-
-
-async def _teardown(ingresses: list, broker: Broker) -> None:
-    """Best-effort shutdown: one ingress failing to stop must not skip the
-    others or the broker (which owns the durable-log consumer tasks + sqlite
-    connections). Stop every ingress, swallowing errors, then stop the broker."""
-    for ing in ingresses:
-        try:
-            await ing.stop()
-        except Exception:
-            pass
-    await broker.stop()
+    return bus, sensors
 
 
 async def run() -> None:
@@ -69,20 +50,19 @@ async def run() -> None:
         "mamamia_db_path": os.path.join(data_dir, "events.db"),
         "switchboard_db_path": os.path.join(data_dir, "switchboard.db"),
         "github_secret": os.environ["GITHUB_WEBHOOK_SECRET"],
-        "max_log_messages": int(os.environ.get("SB_MAX_LOG_MESSAGES", "10000")),
         "port": int(os.environ.get("SB_PORT", "8080")),
         "discord_bot_token": os.environ.get("DISCORD_BOT_TOKEN"),
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
         "discord_notify_channel_id": os.environ.get("DISCORD_NOTIFY_CHANNEL_ID"),
     }
-    broker, ingresses = build(config)
-    await broker.start()
+    bus, _ = build(config)
+    await bus.start()
     try:
-        # each ingress owns its transport and serves until cancelled
-        await asyncio.gather(*(ing.start(broker.publish) for ing in ingresses))
+        while True:
+            await asyncio.sleep(3600)
     finally:
-        await _teardown(ingresses, broker)
+        await bus.stop()
 
 
 if __name__ == "__main__":
