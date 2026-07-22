@@ -52,3 +52,15 @@ def test_map_check_run_success_is_succeeded():
 
 def test_map_unknown_event_is_ignored():
     assert map_event("star", {"repository": {"name": "home"}}) is None
+
+
+def test_map_pull_request_review_submitted():
+    ei = map_event("pull_request_review", _load("review.submitted.json"))
+    assert ei.kind == "github.home.review.approved"
+    assert ei.source == "github"
+
+
+def test_map_pull_request_review_non_submitted_ignored():
+    assert map_event("pull_request_review",
+                     {"action": "edited", "repository": {"name": "home"},
+                      "review": {"state": "approved"}}) is None

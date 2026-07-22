@@ -92,3 +92,54 @@ def test_malformed_payload_degrades_to_no_buttons_not_raise():
     assert msg is not None
     assert msg["components"] == []            # both buttons omitted (no url)
     assert msg["embed"]["author"] == {"name": "yp/home"}   # no sender -> repo only
+
+
+def test_pr_closed_is_grey():
+    msg = build_message("github.home.pr.closed", _pr_payload())
+    assert msg["embed"]["title"] == "🚫 PR #7 closed"
+    assert msg["embed"]["color"] == 0x6B7280
+    assert _buttons(msg) == [
+        ("View PR", "https://github.com/yp/home/pull/7", 5),
+        ("View diff", "https://github.com/yp/home/pull/7/files", 5),
+    ]
+
+
+def test_review_requested_is_yellow_view_pr_only():
+    msg = build_message("github.home.review.requested", _pr_payload())
+    assert msg["embed"]["title"] == "👀 Review requested · PR #7"
+    assert msg["embed"]["color"] == 0xEAB308
+    assert _buttons(msg) == [("View PR", "https://github.com/yp/home/pull/7", 5)]
+
+
+def test_review_changes_requested_is_red():
+    payload = _pr_payload()
+    payload["review"] = {"html_url": "https://github.com/yp/home/pull/7#r2"}
+    msg = build_message("github.home.review.changes_requested", payload)
+    assert msg["embed"]["title"] == "🔴 Review changes requested · PR #7"
+    assert msg["embed"]["color"] == 0xEF4444
+    assert _buttons(msg) == [
+        ("View review", "https://github.com/yp/home/pull/7#r2", 5),
+        ("View PR", "https://github.com/yp/home/pull/7", 5),
+    ]
+
+
+def test_review_commented_is_grey():
+    payload = _pr_payload()
+    payload["review"] = {"html_url": "https://github.com/yp/home/pull/7#r3"}
+    msg = build_message("github.home.review.commented", payload)
+    assert msg["embed"]["title"] == "💬 Review commented · PR #7"
+    assert msg["embed"]["color"] == 0x6B7280
+
+
+def test_issue_closed_is_grey():
+    payload = {"repository": _REPO, "sender": _SENDER,
+               "issue": {"number": 12, "title": "Bug", "html_url": "https://github.com/yp/home/issues/12"}}
+    msg = build_message("github.home.issue.closed", payload)
+    assert msg["embed"]["title"] == "📕 Issue #12 closed"
+    assert msg["embed"]["color"] == 0x6B7280
+    assert _buttons(msg) == [("View issue", "https://github.com/yp/home/issues/12", 5)]
+
+
+def test_dotted_repo_name_parses_correctly():
+    msg = build_message("github.my.repo.pr.opened", _pr_payload())
+    assert msg["embed"]["title"] == "🔀 PR #7 opened"   # rsplit(".", 2) handles dotted repo names
