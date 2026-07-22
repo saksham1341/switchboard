@@ -2,7 +2,7 @@ import asyncio
 import logging
 import uuid
 
-from mamamia.core.models import MessageState, Outcome
+from mamamia.core.models import Outcome
 from mamamia.server.db import connect
 from mamamia.server.storage.sqlite import SQLiteStorage
 from mamamia.server.state.sqlite import SQLiteStateStore

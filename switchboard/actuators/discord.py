@@ -4,7 +4,7 @@ DISCORD_API = "https://discord.com/api/v10"
 
 
 class DiscordSender:
-    """The Discord egress's two send paths, both plain HTTP (no gateway):
+    """The Discord connector's two send paths, both plain HTTP (no gateway):
 
     - reply(): an interaction *followup* — POST to the interaction webhook, which
       needs only the application id + interaction token (no bot auth) and is valid

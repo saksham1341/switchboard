@@ -18,3 +18,25 @@ def test_sensor_registers_typed_commands_without_network():
     params = {p.name: p for p in echo.parameters}
     assert params["message"].type is discord.AppCommandOptionType.string
     assert inspect.iscoroutinefunction(s.start) and inspect.iscoroutinefunction(s.stop)
+
+
+class _FakeUser:
+    id = 123
+    def __str__(self): return "alice#0001"
+
+
+class _FakeInteraction:
+    token = "int-tok"
+    channel_id = 7
+    guild_id = 9
+    user = _FakeUser()
+
+
+def test_command_observation_shaping():
+    from switchboard.sensors.discord import _command_observation
+    name, payload = _command_observation("echo", _FakeInteraction(), {"message": "hi"})
+    assert name == "discord.command.echo"
+    assert payload == {
+        "interaction_token": "int-tok", "channel_id": "7", "guild_id": "9",
+        "user_id": "123", "user_name": "alice#0001", "options": {"message": "hi"},
+    }

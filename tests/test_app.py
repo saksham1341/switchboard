@@ -32,3 +32,21 @@ def test_relay_decider_absent_without_notify_channel(tmp_path):
     assert "ping" in dnames and "github-notify" not in dnames
     assert "discord.reply" in {a.name for a in bus._actuators}
     assert "discord.post" not in {a.name for a in bus._actuators}
+
+
+def test_build_fails_fast_without_application_id(tmp_path):
+    import pytest
+    cfg = _base(tmp_path) | {"discord_bot_token": "bot"}
+    with pytest.raises(ValueError, match="discord_application_id is required"):
+        build(cfg)
+
+
+def test_discord_commands_shape():
+    from switchboard.app import DISCORD_COMMANDS
+    from switchboard.sensors.discord import CommandSpec
+    names = {c.name for c in DISCORD_COMMANDS}
+    assert {"ping", "echo"} <= names
+    echo = next(c for c in DISCORD_COMMANDS if c.name == "echo")
+    assert isinstance(echo, CommandSpec)
+    assert [o.name for o in echo.options] == ["message"]
+    assert echo.options[0].type is str and echo.options[0].required is True

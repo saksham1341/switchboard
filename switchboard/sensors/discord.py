@@ -5,6 +5,20 @@ import discord
 from discord import app_commands
 
 
+def _command_observation(command: str, interaction, options: dict) -> tuple[str, dict]:
+    """Shape a slash-command interaction into a (name, payload) observation.
+    Snowflake ids are stringified (msgpack round-trip); the interaction token +
+    channel are the reply address a downstream decider/actuator uses."""
+    return (f"discord.command.{command}", {
+        "interaction_token": interaction.token,
+        "channel_id": str(interaction.channel_id),
+        "guild_id": str(interaction.guild_id),
+        "user_id": str(interaction.user.id),
+        "user_name": str(interaction.user),
+        "options": dict(options),
+    })
+
+
 @dataclass(frozen=True)
 class Option:
     """A declared slash-command parameter. `type` is a plain Python type
@@ -77,14 +91,8 @@ class DiscordSensor:
         # The callback stays thin: defer -> emit -> return.
         async def callback(interaction: discord.Interaction, **kwargs):
             await interaction.response.defer()             # ack within 3s
-            await self._emit(f"discord.command.{spec.name}", {
-                "interaction_token": interaction.token,
-                "channel_id": str(interaction.channel_id),
-                "guild_id": str(interaction.guild_id),
-                "user_id": str(interaction.user.id),
-                "user_name": str(interaction.user),
-                "options": dict(kwargs),
-            })
+            name, payload = _command_observation(spec.name, interaction, kwargs)
+            await self._emit(name, payload)
             # return — no work here; a downstream handler processes and replies
 
         params = [inspect.Parameter("interaction",
