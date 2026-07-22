@@ -991,31 +991,134 @@ if __name__ == "__main__":
 
 ---
 
-## Task 9: Delete the old stack; green suite on new only
+## Task 9: Preserve the dead-letter path — Bus `PermanentError` + migrate `cli.py`
+
+The old `Broker` immediately DEAD-lettered on `PermanentError` and the `switchboard dead-letters` CLI listed retained DEAD deliveries. Both are current behavior to preserve. The `Bus` (Task 2) dropped `PermanentError` handling, and `cli.py` still assumes the old single log `"events"` + the old Event payload shape (`payload.id`/`payload.kind`). Fix both.
 
 **Files:**
-- Delete: `switchboard/broker.py`, `switchboard/event.py`, `switchboard/dedup.py`, `switchboard/errors.py`, `switchboard/ingress/` (whole dir), `switchboard/egress/` (whole dir)
-- Delete tests: `tests/test_broker.py`, `tests/test_dedup.py`, `tests/test_event.py`, `tests/test_egress.py`, `tests/test_discord_events.py`, `tests/test_discord_egress.py`, `tests/test_discord_ingress.py`, `tests/test_discord_sender.py`, `tests/test_discord_integration.py`, `tests/test_github_map.py`, `tests/test_github_endpoint.py`, `tests/test_github_relay_integration.py`
-- Check: `tests/test_backoff.py`, `tests/test_smoke.py`, `tests/test_cli.py`, `tests/conftest.py` — keep `backoff.py`; fix/trim any of these that import deleted modules.
+- Modify: `switchboard/bus.py` (add `PermanentError` → DEAD in `_consume`)
+- Modify: `switchboard/cli.py` (two-log query, read `metadata.name`)
+- Modify: `switchboard/errors.py` (keep `PermanentError`; drop the now-unused `ChainTooDeep`)
+- Rewrite: `tests/test_cli.py`
 
-- [ ] **Step 1: Delete the old modules and their tests** (the behavior they covered is now covered by `test_sensor_*`, `test_deciders`, `test_actuators_discord`, `test_relay_e2e`).
+**Interfaces:** `list_dead_letters(mamamia_db_path) -> list[dict]` returns `{"log_id","group_id","message_id","name"}` per retained DEAD delivery across BOTH logs.
+
+- [ ] **Step 1: Rewrite `tests/test_cli.py`** (drive the new Bus; a decider that raises `PermanentError` DEAD-letters immediately):
+```python
+import asyncio
+from switchboard.bus import Bus
+from switchboard.cli import list_dead_letters
+from switchboard.errors import PermanentError
+
+
+class _Boom:
+    name = "boom"
+    def subscribes(self, obs): return True
+    async def decide(self, obs, ctx): raise PermanentError("nope")
+
+
+async def test_dead_letters_lists_dead(tmp_path):
+    mm = str(tmp_path / "e.db")
+    b = Bus(mm, wait_ms=50, reaper_interval=3600.0)
+    b.add_decider(_Boom())
+    await b.start()
+    try:
+        await b.emit_observation("github.home.pr.opened", {"n": 1})
+        rows = []
+        for _ in range(500):
+            rows = await list_dead_letters(mm)
+            if rows:
+                break
+            await asyncio.sleep(0.02)
+        assert rows, "never dead-lettered"
+    finally:
+        await b.stop()
+    rows = await list_dead_letters(mm)
+    assert any(r["group_id"] == "decider/boom" and r["name"] == "github.home.pr.opened"
+               for r in rows)
+```
+
+- [ ] **Step 2: Run to verify it fails** — `python -m pytest tests/test_cli.py -v`. Expected FAIL: `PermanentError` isn't DEAD-lettered by the Bus yet (times out / no rows) and/or `list_dead_letters` returns the wrong shape.
+
+- [ ] **Step 3: Add `PermanentError` → DEAD in `switchboard/bus.py`**
+
+Add the import `from switchboard.errors import PermanentError` (near the `backoff` import), and in `_consume`'s inner try/except (currently `except asyncio.CancelledError: raise` then `except Exception:` → RETRY) insert a `PermanentError` branch BEFORE the generic `except Exception`:
+```python
+                except asyncio.CancelledError:
+                    raise
+                except PermanentError:
+                    await settle(msg.id, Outcome.DEAD)
+                except Exception:
+                    attempts = await orch.state_store.get_retry_count(log, group_id, msg.id)
+                    await settle(msg.id, Outcome.RETRY, retry_after=backoff(attempts))
+```
+
+- [ ] **Step 4: Migrate `switchboard/cli.py`** — replace `list_dead_letters` and drop the `LOG_ID = "events"` constant:
+```python
+async def list_dead_letters(mamamia_db_path: str) -> list[dict]:
+    """Return retained DEAD deliveries across all logs, joined to each message's
+    stored `name` (from mamamia metadata). Reads the mamamia database directly
+    (read-only) — mamamia has no query API for this; the schema is stable within
+    a pinned version."""
+    conn = await connect(mamamia_db_path)
+    try:
+        dead = conn.execute(
+            "SELECT log_id, group_id, message_id FROM message_state WHERE state = ? "
+            "ORDER BY message_id DESC",
+            (MessageState.DEAD.value,),
+        ).fetchall()
+        rows = []
+        for log_id, group_id, message_id in dead:
+            row = conn.execute(
+                "SELECT metadata FROM messages WHERE log_id = ? AND id = ?",
+                (log_id, message_id),
+            ).fetchone()
+            meta = _decode(row[0]) if row and row[0] else {}
+            rows.append({"log_id": log_id, "group_id": group_id,
+                         "message_id": message_id, "name": meta.get("name")})
+        return rows
+    finally:
+        conn.close()
+```
+Keep `_decode` and `main` as-is (they still print each row as JSON).
+
+- [ ] **Step 5: Trim `switchboard/errors.py`** — keep `PermanentError`; delete the `ChainTooDeep` class (nothing uses it once the depth cap is gone; verify with `grep -rn ChainTooDeep switchboard/ tests/` → only `errors.py`).
+
+- [ ] **Step 6: Run to verify it passes** — `python -m pytest tests/test_cli.py -v` → 1 passed. Then full suite `python -m pytest -q` → still green (old stack untouched).
+
+- [ ] **Step 7: Commit** — `git add switchboard/bus.py switchboard/cli.py switchboard/errors.py tests/test_cli.py && git commit -m "feat(bus): PermanentError->DEAD; migrate dead-letter CLI to two-log schema"`
+
+---
+
+## Task 10: Delete the old stack; green suite on new only
+
+**Files:**
+- Delete: `switchboard/broker.py`, `switchboard/event.py`, `switchboard/ingress/` (whole dir), `switchboard/egress/` (whole dir). **KEEP `switchboard/dedup.py`** (now the GitHub sensor's `SeenStore` dependency) and **KEEP `switchboard/errors.py`** (now `PermanentError` only, used by `bus.py`).
+- Delete tests: `tests/test_broker.py`, `tests/test_event.py`, `tests/test_egress.py`, `tests/test_discord_events.py`, `tests/test_discord_egress.py`, `tests/test_discord_ingress.py`, `tests/test_discord_sender.py`, `tests/test_discord_integration.py`, `tests/test_github_map.py`, `tests/test_github_endpoint.py`, `tests/test_github_relay_integration.py`. **KEEP `tests/test_dedup.py`** (SeenStore still exists) and **KEEP `tests/test_cli.py`** (rewritten in Task 9).
+- Fix: `tests/conftest.py` (remove the `broker`/`make_broker` fixtures — they import the deleted `Broker` and are used only by now-deleted tests); `switchboard/sensors/discord.py` (drop the dead `from switchboard.event import EventInput` import left from the Task 4 move).
+
+- [ ] **Step 1: Delete old modules + their tests**
 ```bash
-git rm switchboard/broker.py switchboard/event.py switchboard/dedup.py switchboard/errors.py
+git rm switchboard/broker.py switchboard/event.py
 git rm -r switchboard/ingress switchboard/egress
-git rm tests/test_broker.py tests/test_dedup.py tests/test_event.py tests/test_egress.py \
+git rm tests/test_broker.py tests/test_event.py tests/test_egress.py \
        tests/test_discord_events.py tests/test_discord_egress.py tests/test_discord_ingress.py \
        tests/test_discord_sender.py tests/test_discord_integration.py tests/test_github_map.py \
        tests/test_github_endpoint.py tests/test_github_relay_integration.py
 ```
 
-- [ ] **Step 2: Sweep for stale imports**
+- [ ] **Step 2: Fix `conftest.py` and the dead import**
 
-Run: `grep -rn "switchboard.broker\|switchboard.event\|switchboard.ingress\|switchboard.egress\|switchboard.dedup\|switchboard.errors\|import Broker\|EventInput" switchboard/ tests/`
-Expected: no hits in kept files. Fix any straggler (e.g. `conftest.py`, `test_smoke.py`, `test_cli.py`) to use the new stack or drop the dead reference. `backoff.py` stays (used by `bus.py`).
+In `tests/conftest.py` remove the `broker` and `make_broker` fixtures and the `from switchboard.broker import Broker` import (confirm no kept test uses those fixtures: `grep -rn "make_broker\|def test.*broker\b" tests/` — the new tests build `Bus` directly). In `switchboard/sensors/discord.py` delete the unused `from switchboard.event import EventInput` line (and freshen the class docstring's "published" wording to "emitted" while there).
 
-- [ ] **Step 3: Full suite** — `python -m pytest -q` → all green on the new four-role stack only.
+- [ ] **Step 3: Sweep for stale imports**
 
-- [ ] **Step 4: Commit** — `git add -A && git commit -m "refactor: remove the pre-restructure Ingress/Egress/Broker stack"`
+Run: `grep -rn "switchboard.broker\|switchboard.event\|switchboard.ingress\|switchboard.egress\|import Broker\|EventInput\|ChainTooDeep" switchboard/ tests/`
+Expected: NO hits (dedup.py/errors.py references are fine — those modules are kept). Fix any straggler.
+
+- [ ] **Step 4: Full suite** — `python -m pytest -q` → all green on the four-role stack only.
+
+- [ ] **Step 5: Commit** — `git add -A && git commit -m "refactor: remove the pre-restructure Broker/Ingress/Egress stack"`
 
 ---
 
