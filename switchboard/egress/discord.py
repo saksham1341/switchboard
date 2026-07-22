@@ -27,11 +27,20 @@ class DiscordSender:
         resp.raise_for_status()
         return resp
 
-    async def send(self, channel_id: str, content: str) -> httpx.Response:
+    async def send(self, channel_id: str, content: str | None = None, *,
+                   embed: dict | None = None,
+                   components: list | None = None) -> httpx.Response:
+        payload: dict = {}
+        if content is not None:
+            payload["content"] = content
+        if embed is not None:
+            payload["embeds"] = [embed]
+        if components is not None:
+            payload["components"] = components
         resp = await self._client.post(
             f"{DISCORD_API}/channels/{channel_id}/messages",
             headers={"Authorization": f"Bot {self._bot_token}"},
-            json={"content": content},
+            json=payload,
         )
         resp.raise_for_status()
         return resp
