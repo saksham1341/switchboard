@@ -1,6 +1,3 @@
-from switchboard.event import EventInput
-
-
 import inspect
 from dataclasses import dataclass
 
@@ -29,8 +26,8 @@ class CommandSpec:
 class DiscordSensor:
     """Sensor half of the Discord connector: a discord.py bot on the Gateway.
     Registers the configured slash commands (with their declared, typed options);
-    each interaction is deferred (acked within Discord's 3s window) and published
-    as a thin command event. The real work is a downstream Switchboard handler.
+    each interaction is deferred (acked within Discord's 3s window) and emitted
+    as a thin command observation. The real work is a downstream Switchboard handler.
     discord.py is transport + parsing only — no application logic lives here.
     """
 

@@ -1,4 +1,4 @@
-from switchboard.egress.github_notify import build_message
+from switchboard.deciders.github_notify import build_message
 
 _REPO = {"full_name": "yp/home", "html_url": "https://github.com/yp/home"}
 _SENDER = {"login": "alice"}
