@@ -47,3 +47,29 @@ def test_ping_handler_replies_via_followup():
     asyncio.run(ping.handle(_cmd_event(token="tok-9"), ctx))
     assert sender.replies == [("tok-9", "pong (via the durable path)")]
     assert sender.sends == []
+
+
+def _echo_event(message="hi there", token="int-tok"):
+    return Event(
+        id="E2", kind="discord.9.command.echo", source="discord", at=now_iso(),
+        payload={"command": "echo", "options": {"message": message},
+                 "user": {"id": "1", "name": "u"}, "channel_id": "7", "guild_id": "9"},
+        meta={"interaction_token": token, "channel_id": "7"},
+    )
+
+
+def test_echo_handler_filters_to_echo_only():
+    eg = DiscordEgress("bot", "app")
+    echo = next(h for h in eg.handlers if h.name == "echo")
+    assert echo.filter(_echo_event()) is True
+    assert echo.filter(_cmd_event(command="ping")) is False
+
+
+def test_echo_handler_replies_with_the_message_option():
+    eg = DiscordEgress("bot", "app")
+    echo = next(h for h in eg.handlers if h.name == "echo")
+    sender = _RecordingSender()
+    ctx = Ctx(publish=None, egress=sender)
+    asyncio.run(echo.handle(_echo_event(message="pong-back", token="tok-2"), ctx))
+    assert sender.replies == [("tok-2", "pong-back")]
+    assert sender.sends == []

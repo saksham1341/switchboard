@@ -60,6 +60,11 @@ class DiscordEgress:
                 filter=lambda e: e.payload.get("command") == "ping",
                 handle=self._ping,
             ),
+            Handler(
+                name="echo",
+                filter=lambda e: e.payload.get("command") == "echo",
+                handle=self._echo,
+            ),
         ]
 
     def context(self) -> DiscordSender:
@@ -68,6 +73,12 @@ class DiscordEgress:
     async def _ping(self, event, ctx) -> None:
         # model A: reply to the interaction via its stored token
         await ctx.egress.reply(event.meta["interaction_token"], "pong (via the durable path)")
+
+    async def _echo(self, event, ctx) -> None:
+        # model A: reply to the interaction with the declared `message` option,
+        # proving a typed parameter round-trips ingress -> event -> egress.
+        message = event.payload.get("options", {}).get("message", "")
+        await ctx.egress.reply(event.meta["interaction_token"], message)
 
     async def close(self) -> None:
         await self._sender.close()
