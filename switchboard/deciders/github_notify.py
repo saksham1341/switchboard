@@ -5,6 +5,7 @@ None. No I/O; reads payload fields defensively so a shape surprise degrades to a
 button-less embed (or None for an unknown kind) rather than raising. Link buttons
 are Discord components type 2 / style 5 (URL only, no interaction).
 """
+from switchboard.message import DecideCtx, Observation
 
 _BLUE, _PURPLE, _GREY = 0x3B82F6, 0x8B5CF6, 0x6B7280
 _GREEN, _RED, _YELLOW = 0x22C55E, 0xEF4444, 0xEAB308
@@ -113,3 +114,23 @@ def build_message(kind: str, payload: dict) -> dict | None:
         }
 
     return None
+
+
+class GitHubNotifyDecider:
+    name = "github-notify"
+
+    def __init__(self, channel_id: str):
+        self.channel_id = channel_id
+
+    def subscribes(self, obs: Observation) -> bool:
+        return obs.name.startswith("github.")
+
+    async def decide(self, obs: Observation, ctx: DecideCtx) -> None:
+        msg = build_message(obs.name, obs.payload)
+        if msg is None:
+            return
+        await ctx.command("discord.post", {
+            "channel_id": self.channel_id,
+            "embed": msg["embed"],
+            "components": msg["components"],
+        })

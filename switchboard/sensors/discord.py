@@ -1,39 +1,22 @@
-from switchboard.event import EventInput
-
-
-def build_command_event(*, command, interaction_id, token,
-                        channel_id, guild_id, user_id, user_name, options) -> EventInput:
-    """Translate a Discord slash-command interaction into a Switchboard event.
-
-    Ids are stringified because mamamia round-trips payloads through msgpack and
-    Discord ids are 64-bit snowflakes. `meta` carries the reply address
-    (interaction token + channel) so a downstream handler can reply via the
-    egress, even after a restart, within Discord's 15-min window. The bot's
-    application id is deployment config on the egress sender, not per-event.
-    """
-    return EventInput(
-        kind=f"discord.{guild_id}.command.{command}",
-        source="discord",
-        payload={
-            "command": command,
-            "options": options,
-            "user": {"id": str(user_id), "name": user_name},
-            "channel_id": str(channel_id),
-            "guild_id": str(guild_id),
-        },
-        dedupe_key=str(interaction_id),
-        meta={
-            "interaction_token": token,
-            "channel_id": str(channel_id),
-        },
-    )
-
-
 import inspect
 from dataclasses import dataclass
 
 import discord
 from discord import app_commands
+
+
+def _command_observation(command: str, interaction, options: dict) -> tuple[str, dict]:
+    """Shape a slash-command interaction into a (name, payload) observation.
+    Snowflake ids are stringified (msgpack round-trip); the interaction token +
+    channel are the reply address a downstream decider/actuator uses."""
+    return (f"discord.command.{command}", {
+        "interaction_token": interaction.token,
+        "channel_id": str(interaction.channel_id),
+        "guild_id": str(interaction.guild_id),
+        "user_id": str(interaction.user.id),
+        "user_name": str(interaction.user),
+        "options": dict(options),
+    })
 
 
 @dataclass(frozen=True)
@@ -48,27 +31,27 @@ class Option:
 
 
 @dataclass(frozen=True)
-class Command:
+class CommandSpec:
     name: str
     description: str
     options: tuple[Option, ...] = ()
 
 
-class DiscordIngress:
-    """Ingress half of the Discord connector: a discord.py bot on the Gateway.
+class DiscordSensor:
+    """Sensor half of the Discord connector: a discord.py bot on the Gateway.
     Registers the configured slash commands (with their declared, typed options);
-    each interaction is deferred (acked within Discord's 3s window) and published
-    as a thin command event. The real work is a downstream Switchboard handler.
+    each interaction is deferred (acked within Discord's 3s window) and emitted
+    as a thin command observation. The real work is a downstream Switchboard handler.
     discord.py is transport + parsing only — no application logic lives here.
     """
 
     name = "discord"
 
     def __init__(self, bot_token: str, *,
-                 commands: list[Command], guild_id: str | None = None):
+                 commands: list[CommandSpec], guild_id: str | None = None):
         self._token = bot_token
         self._guild_id = guild_id
-        self._publish = None
+        self._emit = None
         self._synced = False
 
         self._client = discord.Client(intents=discord.Intents.none())
@@ -96,7 +79,7 @@ class DiscordIngress:
             await self._tree.sync()                        # global (~1h propagation)
         self._synced = True
 
-    def _make_command(self, spec: Command) -> app_commands.Command:
+    def _make_command(self, spec: CommandSpec) -> app_commands.Command:
         # discord.py derives a command's options from its callback's *typed
         # signature*. To keep commands data-driven (a list of specs, not a
         # hand-written function each), we build that signature dynamically from
@@ -105,19 +88,11 @@ class DiscordIngress:
         #     discord.py emits the correct option JSON on sync and validates input;
         #   - at invoke time discord.py passes each validated option as a keyword
         #     arg, which `**kwargs` captures and we forward verbatim as `options`.
-        # The callback stays thin: defer -> publish -> return.
+        # The callback stays thin: defer -> emit -> return.
         async def callback(interaction: discord.Interaction, **kwargs):
             await interaction.response.defer()             # ack within 3s
-            await self._publish(build_command_event(
-                command=spec.name,
-                interaction_id=interaction.id,
-                token=interaction.token,
-                channel_id=interaction.channel_id,
-                guild_id=interaction.guild_id,
-                user_id=interaction.user.id,
-                user_name=str(interaction.user),
-                options=dict(kwargs),                      # only the options Discord sent
-            ))
+            name, payload = _command_observation(spec.name, interaction, kwargs)
+            await self._emit(name, payload)
             # return — no work here; a downstream handler processes and replies
 
         params = [inspect.Parameter("interaction",
@@ -138,8 +113,8 @@ class DiscordIngress:
         return app_commands.Command(
             name=spec.name, description=spec.description, callback=callback)
 
-    async def start(self, publish) -> None:
-        self._publish = publish
+    async def start(self, emit) -> None:
+        self._emit = emit
         await self._client.start(self._token)             # runs the gateway loop
 
     async def stop(self) -> None:
