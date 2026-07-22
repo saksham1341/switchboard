@@ -38,3 +38,36 @@ class DiscordSender:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+
+from switchboard.egress import Handler
+
+
+class DiscordEgress:
+    """Egress half of the Discord connector. Its `context()` hands handlers a
+    DiscordSender (the two HTTP send paths); this egress also hosts the /ping
+    demo handler. Real command handlers are added the same way as scope grows."""
+
+    name = "discord"
+
+    def __init__(self, bot_token: str, application_id: str, *,
+                 client: httpx.AsyncClient | None = None):
+        self._sender = DiscordSender(bot_token, application_id, client=client)
+        self.filter = lambda e: e.source == "discord"      # coarse gate
+        self.handlers = [
+            Handler(
+                name="ping",
+                filter=lambda e: e.payload.get("command") == "ping",
+                handle=self._ping,
+            ),
+        ]
+
+    def context(self) -> DiscordSender:
+        return self._sender
+
+    async def _ping(self, event, ctx) -> None:
+        # model A: reply to the interaction via its stored token
+        await ctx.egress.reply(event.meta["interaction_token"], "pong (via the durable path)")
+
+    async def close(self) -> None:
+        await self._sender.close()
