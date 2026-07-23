@@ -145,10 +145,10 @@ class Bus:
                             Observation.from_message, d.subscribes, handle)
 
     async def _run_actuator(self, a):
-        ctx_obj = a.context()
         async def handle(cmd):
-            ctx = ActCtx(cmd=cmd, context=ctx_obj,
-                         _emit_result=lambda name, payload, cid: self.emit_observation(name, payload, command_id=cid))
+            ctx = ActCtx(cmd=cmd,
+                         _emit_result=lambda name, payload, cid:
+                             self.emit_observation(name, payload, command_id=cid))
             await a.act(cmd, ctx)
         await self._consume(CMD_LOG, f"actuator/{a.name}",
                             Command.from_message, lambda c: c.name == a.name, handle)

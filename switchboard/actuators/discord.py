@@ -54,20 +54,24 @@ class DiscordPost:
     name = "discord.post"
 
     def __init__(self, bot_token, application_id, *, channel_id=None, client=None):
-        self._sender = DiscordSender(bot_token, application_id, client=client)
+        self._token, self._app_id = bot_token, application_id
         self._default_channel = channel_id
+        self._client = client
+        self._sender = None
 
-    def context(self):
-        return self._sender
+    def bind(self, ctx):
+        self.ctx = ctx
+        self._sender = DiscordSender(self._token, self._app_id, client=self._client)
 
     async def act(self, cmd, ctx):
         channel = cmd.args.get("channel_id") or self._default_channel
-        await ctx.context.send(channel, embed=cmd.args.get("embed"),
-                               components=cmd.args.get("components"))
+        await self._sender.send(channel, embed=cmd.args.get("embed"),
+                                components=cmd.args.get("components"))
         await ctx.result("ok", {"channel_id": channel})
 
     async def close(self):
-        await self._sender.close()
+        if self._sender is not None:
+            await self._sender.close()
 
 
 class DiscordReply:
@@ -75,14 +79,18 @@ class DiscordReply:
     name = "discord.reply"
 
     def __init__(self, bot_token, application_id, *, client=None):
-        self._sender = DiscordSender(bot_token, application_id, client=client)
+        self._token, self._app_id = bot_token, application_id
+        self._client = client
+        self._sender = None
 
-    def context(self):
-        return self._sender
+    def bind(self, ctx):
+        self.ctx = ctx
+        self._sender = DiscordSender(self._token, self._app_id, client=self._client)
 
     async def act(self, cmd, ctx):
-        await ctx.context.reply(cmd.args["interaction_token"], cmd.args["content"])
+        await self._sender.reply(cmd.args["interaction_token"], cmd.args["content"])
         await ctx.result("ok")
 
     async def close(self):
-        await self._sender.close()
+        if self._sender is not None:
+            await self._sender.close()
