@@ -250,6 +250,26 @@ The cross-role case people reach for does not need it. An actuator posts to Disc
 
 Scoping by `kind/name` rather than by class also gives two properties for free: state survives restarts because names are stable (they are already the consumer-group ids), and two instances of the same class must already have distinct names, so two GitHub orgs get separate keyspaces without special handling.
 
+### What belongs in a store
+
+Scoping is per handler, not per role kind — two deciders cannot share either. The rule that makes that principled rather than merely tidy:
+
+> **A store holds only what its owner can derive from what it has seen.**
+
+Sensors project the world into the log; deciders and actuators project the log into memory. Each store is a private read model over the stream its owner consumes. Two consumers of the same stream keeping their own projections is the normal shape, not duplication to be optimised away — the obs log is broadcast, so every decider that needs a fact sees the observation carrying it and builds its own copy.
+
+The smell test when two handlers appear to want the same state: **either they are one handler with two branches, or the state belongs to a third role that owns the resource.** Both beat a shared key.
+
+Worked through the cases that look like exceptions:
+
+| looks like it wants sharing | where it actually belongs |
+|---|---|
+| Two deciders needing the same PR→message-id map | Each projects it from the same result observation. A handful of duplicated keys. |
+| A global rate limit on Discord posts | The `discord.post` actuator — one owner of the channel, one counter. Not spread across the deciders feeding it. |
+| The repos we care about, the channel id | Config, not state. Injected at construction. |
+
+One consequence to know: a decider consumes `obs` only, so it cannot react to another decider's *command*. Influence between deciders flows A → command → actuator → result observation → B, which means it only flows through things that actually happened, never through intentions. A decision that never becomes an action is invisible to everyone, by design.
+
 ### Two implementations, one test suite
 
 `MemoryStore` is written to the *stricter* contract, not the one a dict gives naturally: it implements expiry-on-read and the same type checks explicitly. Otherwise tests pass in memory and behavior diverges in production, which is worse than shipping only one implementation. One parametrized suite runs against both.
