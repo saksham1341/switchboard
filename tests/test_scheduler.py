@@ -116,3 +116,53 @@ async def test_owners_are_independent():
     await _wait(lambda: len(b_calls) > seen_a + 1)
     assert len(a_calls) == seen_a       # a stayed stopped while b kept ticking
     await s.stop("b")
+
+
+async def test_start_is_idempotent():
+    s = Scheduler()
+    calls = []
+    s.for_owner("a").every(0.02, lambda: _noop(calls), first_after=0.0)
+    s.start("a")
+    s.start("a")                      # must not launch a second loop
+    try:
+        await _wait(lambda: len(calls) >= 4)
+        # One loop at 0.02s cannot have produced more than ~2x the elapsed ticks;
+        # two loops would roughly double the count. Assert the task count directly.
+        assert len(s._tasks["a"]) == 1
+    finally:
+        await s.stop("a")
+
+
+async def test_stop_clears_declarations_so_a_restart_does_not_double_up():
+    s = Scheduler()
+    calls = []
+    own = s.for_owner("a")
+    own.every(0.02, lambda: _noop(calls), first_after=0.0)
+    s.start("a")
+    await _wait(lambda: calls)
+    await s.stop("a")
+
+    # A role re-declares in bind() on the next startup.
+    own = s.for_owner("a")
+    own.every(0.02, lambda: _noop(calls), first_after=0.0)
+    s.start("a")
+    try:
+        assert len(s._tasks["a"]) == 1        # not 2
+    finally:
+        await s.stop("a")
+
+
+async def test_stopped_owner_with_no_redeclaration_launches_nothing():
+    s = Scheduler()
+    calls = []
+    s.for_owner("a").every(0.01, lambda: _noop(calls), first_after=0.0)
+    s.start("a")
+    await _wait(lambda: calls)
+    await s.stop("a")
+    seen = len(calls)
+    s.start("a")                      # nothing declared since the stop
+    try:
+        await asyncio.sleep(0.1)
+        assert len(calls) == seen
+    finally:
+        await s.stop("a")

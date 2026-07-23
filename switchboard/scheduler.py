@@ -42,12 +42,21 @@ class Scheduler:
         return OwnerSchedule(owner, self)
 
     def start(self, owner: str) -> None:
+        # Idempotent: a second start() for a running owner must not launch a
+        # second loop per timer. Declarations arriving while it runs are
+        # launched by _declare, not by another start().
+        if owner in self._running:
+            return
         self._running.add(owner)
         for t in self._declared.get(owner, ()):
             self._launch(owner, t)
 
     async def stop(self, owner: str) -> None:
         self._running.discard(owner)
+        # Declarations are per-run. Roles declare their timers in bind(), which
+        # runs again on the next startup, so keeping them here would double
+        # every timer across a stop/start cycle.
+        self._declared.pop(owner, None)
         tasks = self._tasks.pop(owner, [])
         for t in tasks:
             t.cancel()
