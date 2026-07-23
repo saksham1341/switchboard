@@ -37,8 +37,9 @@ def build(config: dict):
         bus.add_sensor(discord_sensor); sensors.append(discord_sensor)
         bus.add_decider(PingDecider()); bus.add_decider(EchoDecider())
         bus.add_actuator(DiscordReply(token, app_id))
-        if config.get("discord_notify_channel_id"):
-            bus.add_decider(GitHubNotifyDecider(channel_id=config["discord_notify_channel_id"]))
+        if config.get("discord_github_notify_channel_id"):
+            bus.add_decider(GitHubNotifyDecider(
+                channel_id=config["discord_github_notify_channel_id"]))
             bus.add_actuator(DiscordPost(token, app_id))
 
     return bus, sensors
@@ -54,7 +55,7 @@ async def run() -> None:
         "discord_bot_token": os.environ.get("DISCORD_BOT_TOKEN"),
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
-        "discord_notify_channel_id": os.environ.get("DISCORD_NOTIFY_CHANNEL_ID"),
+        "discord_github_notify_channel_id": os.environ.get("DISCORD_GITHUB_NOTIFY_CHANNEL_ID"),
     }
     bus, _ = build(config)
     await bus.start()

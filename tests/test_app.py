@@ -18,7 +18,7 @@ def test_build_github_only(tmp_path):
 
 def test_build_wires_discord_and_relay(tmp_path):
     cfg = _base(tmp_path) | {"discord_bot_token": "bot", "discord_application_id": "app",
-                             "discord_notify_channel_id": "chan-9"}
+                             "discord_github_notify_channel_id": "chan-9"}
     bus, sensors = build(cfg)
     assert any(isinstance(s, DiscordSensor) for s in sensors)
     assert {"discord.post", "discord.reply"} <= {a.name for a in bus._actuators}
