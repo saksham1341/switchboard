@@ -41,7 +41,7 @@ can't collide with a deployment.
    `GITHUB_WEBHOOK_SECRET` is required; the Discord block is optional — see below.
 3. `./scripts/deploy.sh` — checks prerequisites, validates `.env`, builds,
    starts, and waits for `/health` before reporting success.
-4. Point the GitHub webhook at your hostname's `/webhook`, content-type
+4. Point the GitHub webhook at your hostname's `/webhook/github`, content-type
    `application/json`, same secret, events `pull_request`,
    `pull_request_review`, `issues`, `check_run`.
 
@@ -60,7 +60,7 @@ Point whatever you already run — cloudflared, nginx, caddy — at:
 http://localhost:8080
 ```
 
-GitHub's webhook then targets that public hostname's `/webhook`. Nothing in this
+GitHub's webhook then targets that public hostname's `/webhook/github`. Nothing in this
 repo needs tunnel credentials.
 
 ## Discord (optional)

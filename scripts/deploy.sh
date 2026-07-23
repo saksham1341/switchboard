@@ -83,7 +83,7 @@ The app listens on 127.0.0.1:$PORT (loopback only — not the LAN).
 
 Remaining wiring, both outside this repo:
   1. Point your ingress (cloudflared, nginx, caddy) at  http://localhost:$PORT
-  2. Point the GitHub webhook at  https://<your-hostname>/webhook
+  2. Point the GitHub webhook at  https://<your-hostname>/webhook/github
      content-type application/json, secret = GITHUB_WEBHOOK_SECRET from .env,
      events: pull_request, pull_request_review, issues, check_run
 

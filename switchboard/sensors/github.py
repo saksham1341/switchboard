@@ -70,7 +70,9 @@ class GitHubSensor:
         self._server = None
         self._seen = SeenStore(seen_db)
         self.app = Starlette(routes=[
-            Route("/webhook", self._webhook, methods=["POST"]),
+            # Provider-scoped path: one hostname serves every webhook sensor,
+            # each on its own path (/webhook/linear, /webhook/stripe, ...).
+            Route("/webhook/github", self._webhook, methods=["POST"]),
             Route("/health", lambda request: PlainTextResponse("ok"), methods=["GET"]),
         ])
 
