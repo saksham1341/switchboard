@@ -81,7 +81,20 @@ fi
 
 docker compose ps --format '{{.Name}}  {{.State}}  {{.Status}}' 2>/dev/null || docker compose ps
 
-# --- 5. surface dead letters (silent failures otherwise) -----------------
+# --- 5. cap the build cache ----------------------------------------------
+# Every run rebuilds, so buildkit's cache grows without bound — it reached
+# 405MB on the Pi before the first sweep. Capping rather than wiping keeps the
+# most recent layers, so the next build still hits cache. Runs only after the
+# health gate: a failed deploy should keep every layer available for a retry.
+#
+# --max-used-space replaced --keep-storage in Docker 28; older daemons need the
+# old flag, so fall back rather than failing an otherwise-successful deploy.
+CACHE_CAP="${SB_BUILD_CACHE_CAP:-200MB}"
+docker builder prune -f --max-used-space "$CACHE_CAP" >/dev/null 2>&1 \
+  || docker builder prune -f --keep-storage "$CACHE_CAP" >/dev/null 2>&1 \
+  || echo "note: could not cap the build cache (unrecognised prune flags)"
+
+# --- 6. surface dead letters (silent failures otherwise) -----------------
 DEAD="$(docker compose exec -T switchboard python -m switchboard.cli dead-letters --db /data/events.db 2>/dev/null | wc -l || echo 0)"
 if [ "$DEAD" -gt 0 ]; then
   printf '\n\033[33mnote: %s dead-lettered deliver%s — inspect with:\033[0m\n' "$DEAD" "$([ "$DEAD" = 1 ] && echo y || echo ies)"
