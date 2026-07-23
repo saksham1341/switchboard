@@ -121,9 +121,19 @@
   #rail button{background:transparent;border:1px solid #3d3222;color:#c9b98d;
                border-radius:4px;padding:3px 9px;font:inherit;font-size:11px;cursor:pointer}
   #rail button:hover{border-color:var(--brass);color:#f0e3b8}
-  .pilot{display:inline-block;width:7px;height:7px;border-radius:50%;
-         background:var(--live);box-shadow:0 0 8px var(--live);animation:brr 3.5s infinite}
-  @keyframes brr{0%,100%{opacity:.3}50%{opacity:1}}
+  /* connection pill: green connected, amber reconnecting, red disconnected */
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:999px;
+        font-size:10px;letter-spacing:.5px;text-transform:uppercase;
+        border:1px solid #33291c;color:var(--dim);transition:color .2s,border-color .2s}
+  .pill .dot{width:7px;height:7px;border-radius:50%;background:#555;transition:background .2s,box-shadow .2s}
+  .pill.up   {color:#a6e3b0;border-color:#22432b}
+  .pill.up   .dot{background:var(--live);box-shadow:0 0 8px var(--live);animation:brr 3.5s infinite}
+  .pill.wait {color:#e6c98a;border-color:#4a3a17}
+  .pill.wait .dot{background:var(--lamp);box-shadow:0 0 8px var(--lamp);animation:blink .8s infinite}
+  .pill.down {color:#e8a39d;border-color:#4a1f1f}
+  .pill.down .dot{background:var(--red);box-shadow:0 0 8px var(--red)}
+  @keyframes brr{0%,100%{opacity:.35}50%{opacity:1}}
+  @keyframes blink{0%,100%{opacity:.25}50%{opacity:1}}
 
   #feed{height:0;overflow:hidden;transition:height .3s cubic-bezier(.2,.7,.3,1);
         background:#0b0907;border-top:1px solid transparent}
@@ -150,7 +160,8 @@
 
 <div id="rail">
   <div class="grp">
-    <span><span class="pilot"></span> &nbsp;SWITCHBOARD</span>
+    <span class="pill down" id="pill"><span class="dot"></span><span id="pillText">connecting</span></span>
+    <span>&nbsp;SWITCHBOARD</span>
     <span>calls <b id="rCalls">0</b></span>
     <span>live <b id="rLive">0</b></span>
     <span>faults <b id="rFault">0</b></span>
@@ -263,40 +274,41 @@ function layout(){
   const field = (x, id, label) => {
     const el = document.createElement("div");
     el.className = "field";
-    const cap = document.createElement("div");
-    cap.className = "fieldcap"; cap.textContent = label;
-    cap.style.left = x + "px"; cap.style.top = (top - 36) + "px";
-    deck.appendChild(cap);
-
     const n = Math.max(6, Math.min(14, Math.floor((bot - top) / 34)));
     el.innerHTML = Array.from({length: n}, () => '<div class="hole"></div>').join("");
     // Centred on the same axis as the banks, not hung from the top rail.
     el.style.left = x + "px"; el.style.top = ((top + bot) / 2) + "px";
     deck.appendChild(el);
+
+    // Cap and register belong TO the field: anchored to its measured box, above
+    // and below it, not pinned to the panel edges where they orphan themselves.
+    const fb = el.getBoundingClientRect();
+    const cx = fb.left - origin.left + fb.width / 2;
+    const fTop = fb.top - origin.top, fBot = fb.bottom - origin.top;
+
+    const cap = document.createElement("div");
+    cap.className = "fieldcap"; cap.textContent = label;
+    cap.style.left = cx + "px"; cap.style.top = (fTop - 20) + "px";
+    deck.appendChild(cap);
+
+    const reg = document.createElement("div");
+    reg.className = "reg";
+    reg.style.left = cx + "px"; reg.style.top = (fBot + 10) + "px";
+    reg.innerHTML = '<div class="digits"></div>';
+    deck.appendChild(reg);
+
     const holes = [...el.querySelectorAll(".hole")].map(h => {
       const b = h.getBoundingClientRect();
       return { el: h, x: b.left - origin.left + b.width / 2,
                       y: b.top - origin.top + b.height / 2 };
     });
     FIELD[id] = { el, holes, n };
+    const prev = REG[id] && REG[id].value;
+    REG[id] = { el: reg, digits: reg.querySelector(".digits"), value: prev || 0 };
+    setReg(id, REG[id].value);
   };
   field(W * 0.30, "obs", "obs log");
   field(W * 0.70, "cmd", "cmd log");
-
-  // The logs as mechanical registers. A number that only ever rises cannot be
-  // misread as a queue, which is the trap every other treatment fell into.
-  const reg = (x, id, label) => {
-    const el = document.createElement("div");
-    el.className = "reg";
-    el.style.left = x + "px"; el.style.top = (H - 26) + "px";
-    el.innerHTML = '<div class="cap">' + label + '</div><div class="digits"></div>';
-    deck.appendChild(el);
-    const prev = REG[id] && REG[id].value;
-    REG[id] = { el, digits: el.querySelector(".digits"), value: prev || 0 };
-    setReg(id, REG[id].value);
-  };
-  reg(W * 0.30, "obs", "obs register");
-  reg(W * 0.70, "cmd", "cmd register");
 }
 
 function setReg(id, n){
@@ -531,14 +543,33 @@ function frame(now){
 }
 
 // ---------------------------------------------------------------------------
+let es = null;
+
+function status(state, text){
+  const p = document.getElementById("pill");
+  p.className = "pill " + state;
+  document.getElementById("pillText").textContent = text;
+}
+
 function connect(){
-  const es = new EventSource("/dashboard/stream");
+  disconnect();
+  status("wait", "reconnecting");
+  es = new EventSource("/dashboard/stream");
+  es.onopen = () => status("up", "connected");
+  es.onerror = () => {
+    // EventSource retries on its own; reflect the gap and let it come back.
+    status(es && es.readyState === 2 ? "down" : "wait",
+           es && es.readyState === 2 ? "disconnected" : "reconnecting");
+  };
   es.onmessage = ev => {
     const m = JSON.parse(ev.data);
     if (m.type === "hello"){
+      // A fresh stream: the board resets to the present rather than replaying
+      // whatever queued while we were gone.
+      status("up", "connected");
       TOPO = m.topology; layout();
-      (m.dead || []).forEach(d => DEAD.add(d.log + ":" + d.id));
-      rows.length = 0;
+      DEAD.clear(); (m.dead || []).forEach(d => DEAD.add(d.log + ":" + d.id));
+      calls.clear(); byCmd.clear(); rows.length = 0;
       for (const f of m.backfill) ingest(f, true);
       renderFeed();
     } else if (m.type === "event"){
@@ -549,6 +580,24 @@ function connect(){
     }
   };
 }
+
+function disconnect(){
+  if (es){ es.close(); es = null; }
+}
+
+// The render loop is throttled to ~0fps in a hidden tab while the stream keeps
+// delivering, so a backgrounded tab would queue events and replay the backlog
+// on return. Drop the stream when hidden and reconnect when shown: the hello
+// frame resyncs to now, so you always see the present, not what you missed.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden){
+    disconnect();
+    status("down", "paused");
+    calls.clear();
+  } else {
+    connect();
+  }
+});
 
 document.getElementById("toggle").onclick = e => {
   const f = document.getElementById("feed");
