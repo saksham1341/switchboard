@@ -54,7 +54,6 @@ class Bus:
         self._maintenance: list[str] = []
 
         self._store = store if store is not None else MemoryStore()
-        self._owns_store = store is None
         # serve=False by default so tests register routes and drive .app
         # without any of them binding a port.
         self._http = http if http is not None else HttpServer(serve=False)
@@ -185,10 +184,11 @@ class Bus:
                 except Exception:
                     logger.exception("actuator %s failed to close", a.name)
 
-        if self._owns_store:
-            store_close = getattr(self._store, "close", None)
-            if store_close is not None:
-                store_close()
+        # Symmetric with self._http.stop(): the Bus stops the platform pieces it
+        # was handed, whether or not it constructed them.
+        store_close = getattr(self._store, "close", None)
+        if store_close is not None:
+            store_close()
         if self._conn is not None:
             self._conn.close()
 

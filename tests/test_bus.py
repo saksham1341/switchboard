@@ -161,6 +161,31 @@ async def test_a_sensor_that_returns_cleanly_keeps_its_timers(tmp_path):
         await bus.stop()
 
 
+async def test_timers_stop_before_the_sensor_they_belong_to(tmp_path):
+    order = []
+
+    class _Watching:
+        name = "watcher"
+        def bind(self, ctx):
+            self.ctx = ctx
+            ctx.schedule.every(0.01, self._tick, first_after=0.0)
+        async def _tick(self):
+            order.append("tick")
+        async def start(self): return
+        async def stop(self):
+            order.append("stop")
+
+    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus.add_sensor(_Watching())
+    await bus.start()
+    await _wait(lambda: "tick" in order)
+    await bus.stop()
+
+    assert "stop" in order, "sensor stop never ran"
+    # Every tick precedes the stop: no callback fired during teardown.
+    assert order.index("stop") == len(order) - 1
+
+
 async def test_routes_are_registered_before_the_server_starts(tmp_path):
     calls = []
 
