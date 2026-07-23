@@ -12,16 +12,21 @@ from mamamia.server.registry import LogRegistry
 
 from switchboard.backoff import backoff
 from switchboard.errors import PermanentError
+from switchboard.http import HttpServer
 from switchboard.message import (
     OBS_LOG, CMD_LOG, Observation, Command, DecideCtx, ActCtx,
+    SensorCtx, DeciderCtx, ActuatorCtx, TapCtx,
 )
+from switchboard.scheduler import Scheduler
+from switchboard.store import MemoryStore, ScopedStore
 
 logger = logging.getLogger(__name__)
 
 
 class Bus:
-    def __init__(self, mamamia_db_path, *, default_timeout_s=30.0, wait_ms=30_000,
-                 reaper_interval=60.0, max_retries=10, max_log_messages=10_000, max_dead=500):
+    def __init__(self, mamamia_db_path, *, store=None, http=None,
+                 default_timeout_s=30.0, wait_ms=30_000, reaper_interval=60.0,
+                 max_retries=10, max_log_messages=10_000, max_dead=500):
         self._db = mamamia_db_path
         self._default_timeout_s = default_timeout_s
         self._wait_ms = wait_ms
@@ -36,6 +41,12 @@ class Bus:
         self._conn = None
         self._tasks: list[asyncio.Task] = []
         self._running = False
+
+        self._store = store if store is not None else MemoryStore()
+        # serve=False by default so tests register routes and drive .app
+        # without any of them binding a port.
+        self._http = http if http is not None else HttpServer(serve=False)
+        self._scheduler = Scheduler()
 
     # registration
     def add_sensor(self, s): self._sensors.append(s)
@@ -72,6 +83,24 @@ class Bus:
         self._running = True
         self._registry.start_reaper(interval=self._reaper_interval)
 
+        def scoped(kind, name):
+            return ScopedStore(self._store, f"{kind}/{name}/")
+
+        for d in self._deciders:
+            d.bind(DeciderCtx(store=scoped("decider", d.name)))
+        for a in self._actuators:
+            a.bind(ActuatorCtx(store=scoped("actuator", a.name)))
+        for t in self._taps:
+            t.bind(TapCtx(store=scoped("tap", t.name)))
+        for s in self._sensors:
+            async def _emit(name, payload):
+                return await self.emit_observation(name, payload)
+            s.bind(SensorCtx(emit=_emit, http=self._http,
+                             store=scoped("sensor", s.name),
+                             schedule=self._scheduler.for_owner(s.name)))
+
+        await self._http.start()          # every route is registered by now
+
         for d in self._deciders:
             self._tasks.append(asyncio.create_task(self._run_decider(d)))
         for a in self._actuators:
@@ -80,17 +109,40 @@ class Bus:
             for log in t.logs:
                 self._tasks.append(asyncio.create_task(self._run_tap(t, log)))
         for s in self._sensors:
-            async def _emit(name, payload, _s=s):
-                return await self.emit_observation(name, payload)
-            self._tasks.append(asyncio.create_task(s.start(_emit)))
+            task = asyncio.create_task(s.start())
+            task.add_done_callback(lambda t, n=s.name: self._sensor_exited(n, t))
+            self._tasks.append(task)
+            self._scheduler.start(s.name)
+
+    def _sensor_exited(self, name, task):
+        # A clean return is normal for a route-driven sensor and its timers must
+        # survive; only a crash takes them down.
+        if task.cancelled():
+            return
+        if task.exception() is not None:
+            logger.error("sensor %s died; stopping its timers", name,
+                         exc_info=task.exception())
+            self._tasks.append(asyncio.create_task(self._scheduler.stop(name)))
 
     async def stop(self) -> None:
         self._running = False
         for s in self._sensors:
+            # Timers first: no callback may fire against a connection being
+            # torn down.
+            await self._scheduler.stop(s.name)
             try:
                 await s.stop()
             except Exception:
-                pass
+                logger.exception("sensor %s failed to stop", s.name)
+        await self._scheduler.stop_all()
+        await self._http.stop()
+        for a in self._actuators:
+            close = getattr(a, "close", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:
+                    logger.exception("actuator %s failed to close", a.name)
         for t in self._tasks:
             t.cancel()
         if self._tasks:

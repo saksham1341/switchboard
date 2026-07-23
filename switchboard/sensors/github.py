@@ -46,40 +46,33 @@ def map_event(gh_event: str, payload: dict) -> tuple[str, dict] | None:
 
 import json as _json
 
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Route
-
-from switchboard.dedup import SeenStore
+from starlette.responses import JSONResponse
 
 
 class GitHubSensor:
-    """Sensor half of the GitHub connector: a webhook server that turns GitHub
-    deliveries into observations. Delivery-id dedup (keyed by
-    X-GitHub-Delivery) now lives here, in the sensor's own SeenStore, rather
-    than in the core bus."""
+    """Webhook -> observation. Owns the /webhook/github route and nothing else:
+    the port, the server, and /health belong to the app; dedup state to
+    ctx.store."""
 
     name = "github"
 
-    def __init__(self, secret: str, *, host: str = "0.0.0.0", port: int = 8080,
-                 seen_db: str = ":memory:"):
+    def __init__(self, secret: str, *, dedup_ttl: float = 7 * 86_400.0):
         self._secret = secret
-        self._host = host
-        self._port = port
-        self._emit = None
-        self._server = None
-        self._seen = SeenStore(seen_db)
-        self.app = Starlette(routes=[
-            # Provider-scoped path: one hostname serves every webhook sensor,
-            # each on its own path (/webhook/linear, /webhook/stripe, ...).
-            Route("/webhook/github", self._webhook, methods=["POST"]),
-            Route("/health", lambda request: PlainTextResponse("ok"), methods=["GET"]),
-        ])
+        self._dedup_ttl = dedup_ttl
+        self.ctx = None
 
-    def bind(self, emit) -> None:
-        """Inject the emit callable. Called by start(); exposed so tests can
-        drive `app` without binding a port."""
-        self._emit = emit
+    def bind(self, ctx) -> None:
+        self.ctx = ctx
+        # One hostname serves every webhook sensor, each on its own path
+        # (/webhook/linear, /webhook/stripe, ...).
+        ctx.http.route("/webhook/github", self._webhook,
+                       methods=["POST"], owner=self.name)
+
+    async def start(self) -> None:
+        return          # route-driven: no loop of its own to supervise
+
+    async def stop(self) -> None:
+        return
 
     async def _webhook(self, request):
         body = await request.body()
@@ -91,28 +84,19 @@ class GitHubSensor:
         except ValueError:
             return JSONResponse({"error": "malformed json"}, status_code=400)
 
-        gh_event = request.headers.get("X-GitHub-Event", "")
-        mapped = map_event(gh_event, payload)
+        mapped = map_event(request.headers.get("X-GitHub-Event", ""), payload)
         if mapped is None:
             return JSONResponse({"status": "ignored"}, status_code=200)
-
         name, payload = mapped
+
         delivery_id = request.headers.get("X-GitHub-Delivery")
-        if delivery_id and self._seen.get(delivery_id) is not None:
+        key = f"github:delivery:{delivery_id}" if delivery_id else None
+        if key and await self.ctx.store.get(key) is not None:
             return JSONResponse({"status": "duplicate"}, status_code=200)
 
-        observation_id = await self._emit(name, payload)
-        if delivery_id:
-            self._seen.record(delivery_id, str(observation_id))
+        # Emit first, record second: a crash in between costs a duplicate,
+        # the reverse order costs the event.
+        observation_id = await self.ctx.emit(name, payload)
+        if key:
+            await self.ctx.store.set(key, str(observation_id), ttl=self._dedup_ttl)
         return JSONResponse({"status": "ok", "event_id": observation_id}, status_code=200)
-
-    async def start(self, emit) -> None:
-        import uvicorn
-        self.bind(emit)
-        config = uvicorn.Config(self.app, host=self._host, port=self._port, log_level="info")
-        self._server = uvicorn.Server(config)
-        await self._server.serve()
-
-    async def stop(self) -> None:
-        if self._server is not None:
-            self._server.should_exit = True

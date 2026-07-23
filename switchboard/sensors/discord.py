@@ -51,7 +51,7 @@ class DiscordSensor:
                  commands: list[CommandSpec], guild_id: str | None = None):
         self._token = bot_token
         self._guild_id = guild_id
-        self._emit = None
+        self.ctx = None
         self._synced = False
 
         self._client = discord.Client(intents=discord.Intents.none())
@@ -61,7 +61,17 @@ class DiscordSensor:
 
         @self._client.event
         async def on_ready():
-            await self._sync_commands()
+            await self._on_ready()
+
+    async def _on_ready(self) -> None:
+        first_connect = not self._synced
+        await self._sync_commands()
+        if first_connect:
+            # Any timer this sensor grows is declared here, not in bind(): it
+            # would call the Discord API and must not tick before the gateway is
+            # up. Guarded because on_ready refires on every reconnect and
+            # `every` is not idempotent.
+            pass
 
     async def _sync_commands(self) -> None:
         # on_ready can refire on every (re)connect, so sync only once. The guard
@@ -92,7 +102,7 @@ class DiscordSensor:
         async def callback(interaction: discord.Interaction, **kwargs):
             await interaction.response.defer()             # ack within 3s
             name, payload = _command_observation(spec.name, interaction, kwargs)
-            await self._emit(name, payload)
+            await self.ctx.emit(name, payload)
             # return — no work here; a downstream handler processes and replies
 
         params = [inspect.Parameter("interaction",
@@ -113,9 +123,11 @@ class DiscordSensor:
         return app_commands.Command(
             name=spec.name, description=spec.description, callback=callback)
 
-    async def start(self, emit) -> None:
-        self._emit = emit
-        await self._client.start(self._token)             # runs the gateway loop
+    def bind(self, ctx) -> None:
+        self.ctx = ctx          # no routes; any timer waits for the gateway
+
+    async def start(self) -> None:
+        await self._client.start(self._token)        # runs the gateway loop
 
     async def stop(self) -> None:
         await self._client.close()

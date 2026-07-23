@@ -3,6 +3,7 @@ import hmac as _hmac
 import hashlib as _hashlib
 from pathlib import Path
 
+import pytest
 from starlette.testclient import TestClient
 
 from switchboard.sensors.github import map_event, verify_signature
@@ -44,17 +45,30 @@ def test_verify_signature_roundtrip():
     assert verify_signature("s", body, None) is False
 
 
-def test_webhook_emits_with_real_observation_id_and_dedups():
+def _bound(secret="s3cret", store=None):
+    """A GitHubSensor bound to a fake ctx, plus the pieces to assert against."""
     from switchboard.sensors.github import GitHubSensor
+    from switchboard.http import HttpServer
+    from switchboard.store import MemoryStore
+    from switchboard.message import SensorCtx
+    from switchboard.scheduler import Scheduler
+
     emitted = []
 
-    async def fake_emit(name, payload):
+    async def emit(name, payload):
         emitted.append((name, payload))
         return 4242
 
-    s = GitHubSensor("s3cret", seen_db=":memory:")
-    s.bind(fake_emit)
-    client = TestClient(s.app)
+    http = HttpServer(serve=False)
+    s = GitHubSensor(secret)
+    s.bind(SensorCtx(emit=emit, http=http, store=store or MemoryStore(),
+                     schedule=Scheduler().for_owner("github")))
+    return s, http, emitted
+
+
+def test_webhook_emits_with_real_observation_id_and_dedups():
+    s, http, emitted = _bound()
+    client = TestClient(http.app)
     pr = _load("pull_request.opened.json")
 
     r1 = _signed_post(client, "s3cret", "pull_request", pr, "d-1")
@@ -62,29 +76,53 @@ def test_webhook_emits_with_real_observation_id_and_dedups():
     assert emitted == [("github.home.pr.opened", pr)]
 
     r2 = _signed_post(client, "s3cret", "pull_request", pr, "d-1")
-    assert r2.status_code == 200 and len(emitted) == 1
+    assert r2.status_code == 200 and r2.json()["status"] == "duplicate"
+    assert len(emitted) == 1
 
 
 def test_only_provider_scoped_path_is_served():
-    # /webhook/github is the only GitHub route. The old unscoped /webhook is
-    # gone — one hostname serves every webhook sensor, each on its own path.
-    from switchboard.sensors.github import GitHubSensor
-    emitted = []
-
-    async def fake_emit(name, payload):
-        emitted.append(name)
-        return len(emitted)
-
-    s = GitHubSensor("s3cret", seen_db=":memory:")
-    s.bind(fake_emit)
-    client = TestClient(s.app)
+    s, http, emitted = _bound()
+    client = TestClient(http.app)
     pr = _load("pull_request.opened.json")
 
     ok = _signed_post(client, "s3cret", "pull_request", pr, "d-new", path="/webhook/github")
     assert ok.status_code == 200
-    assert emitted == ["github.home.pr.opened"]
+    assert emitted == [("github.home.pr.opened", pr)]
 
     for gone in ("/webhook", "/webhook/linear"):
         r = _signed_post(client, "s3cret", "pull_request", pr, "d-x", path=gone)
         assert r.status_code == 404, f"{gone} should not be served"
-    assert emitted == ["github.home.pr.opened"]        # no extra emits
+    assert len(emitted) == 1
+
+
+def test_health_is_served_but_the_sensor_did_not_register_it():
+    """/health answers because HttpServer owns it, not because GitHubSensor
+    added it. The sensor's only route is its webhook."""
+    s, http, _ = _bound()
+    assert TestClient(http.app).get("/health").status_code == 200
+    # HttpServer records an owner per (method, path); /health is its own.
+    assert http._owners == {("GET", "/health"): "switchboard",
+                            ("POST", "/webhook/github"): "github"}
+
+
+async def test_dedup_records_after_emit_not_before():
+    """A failing emit must leave the delivery unrecorded, so a retry still lands."""
+    from switchboard.sensors.github import GitHubSensor
+    from switchboard.http import HttpServer
+    from switchboard.store import MemoryStore
+    from switchboard.message import SensorCtx
+    from switchboard.scheduler import Scheduler
+
+    store = MemoryStore()
+
+    async def emit(name, payload):
+        raise RuntimeError("log unavailable")
+
+    http = HttpServer(serve=False)
+    s = GitHubSensor("s3cret")
+    s.bind(SensorCtx(emit=emit, http=http, store=store,
+                     schedule=Scheduler().for_owner("github")))
+    pr = _load("pull_request.opened.json")
+    with pytest.raises(RuntimeError):
+        _signed_post(TestClient(http.app), "s3cret", "pull_request", pr, "d-9")
+    assert await store.get("github:delivery:d-9") is None

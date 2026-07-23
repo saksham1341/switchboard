@@ -1,4 +1,5 @@
 import inspect, discord
+from starlette.testclient import TestClient
 from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 
 
@@ -40,3 +41,18 @@ def test_command_observation_shaping():
         "interaction_token": "int-tok", "channel_id": "7", "guild_id": "9",
         "user_id": "123", "user_name": "alice#0001", "options": {"message": "hi"},
     }
+
+
+def test_bind_stores_ctx_and_declares_no_routes():
+    from switchboard.http import HttpServer
+    from switchboard.store import MemoryStore
+    from switchboard.message import SensorCtx
+    from switchboard.scheduler import Scheduler
+
+    async def emit(name, payload): return 1
+
+    http = HttpServer(serve=False)
+    s = _sensor()
+    s.bind(SensorCtx(emit=emit, http=http, store=MemoryStore(),
+                     schedule=Scheduler().for_owner("discord")))
+    assert TestClient(http.app).post("/webhook/discord").status_code == 404

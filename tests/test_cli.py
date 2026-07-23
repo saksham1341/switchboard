@@ -6,6 +6,7 @@ from switchboard.errors import PermanentError
 
 class _Boom:
     name = "boom"
+    def bind(self, ctx): self.ctx = ctx
     def subscribes(self, obs): return True
     async def decide(self, obs, ctx): raise PermanentError("nope")
 
