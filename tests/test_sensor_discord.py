@@ -55,4 +55,5 @@ def test_bind_stores_ctx_and_declares_no_routes():
     s = _sensor()
     s.bind(SensorCtx(emit=emit, http=http, store=MemoryStore(),
                      schedule=Scheduler().for_owner("discord")))
+    assert s.ctx is not None
     assert TestClient(http.app).post("/webhook/discord").status_code == 404

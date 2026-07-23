@@ -105,6 +105,40 @@ def test_health_is_served_but_the_sensor_did_not_register_it():
                             ("POST", "/webhook/github"): "github"}
 
 
+def test_webhook_rejects_wrong_signature():
+    s, http, emitted = _bound()
+    client = TestClient(http.app)
+    pr = _load("pull_request.opened.json")
+
+    r = _signed_post(client, "wrong-secret", "pull_request", pr, "d-bad-sig")
+    assert r.status_code == 401
+    assert emitted == []
+
+
+def test_webhook_rejects_malformed_json_with_valid_signature():
+    s, http, emitted = _bound()
+    client = TestClient(http.app)
+
+    body = b"not-json{"
+    sig = "sha256=" + _hmac.new(b"s3cret", body, _hashlib.sha256).hexdigest()
+    r = client.post("/webhook/github", content=body, headers={
+        "X-Hub-Signature-256": sig, "X-GitHub-Event": "pull_request",
+        "X-GitHub-Delivery": "d-malformed"})
+    assert r.status_code == 400
+    assert emitted == []
+
+
+def test_webhook_ignores_signed_event_it_deliberately_skips():
+    s, http, emitted = _bound()
+    client = TestClient(http.app)
+    pr = _load("pull_request.opened.json")
+
+    r = _signed_post(client, "s3cret", "star", pr, "d-star")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ignored"}
+    assert emitted == []
+
+
 async def test_dedup_records_after_emit_not_before():
     """A failing emit must leave the delivery unrecorded, so a retry still lands."""
     from switchboard.sensors.github import GitHubSensor

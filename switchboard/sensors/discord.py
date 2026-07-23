@@ -64,14 +64,11 @@ class DiscordSensor:
             await self._on_ready()
 
     async def _on_ready(self) -> None:
-        first_connect = not self._synced
+        # Any timer this sensor grows is declared here, not in bind(): it would
+        # call the Discord API and must not tick before the gateway is up. Guard
+        # such a declaration on first connect — on_ready refires on every
+        # reconnect and `every` is not idempotent.
         await self._sync_commands()
-        if first_connect:
-            # Any timer this sensor grows is declared here, not in bind(): it
-            # would call the Discord API and must not tick before the gateway is
-            # up. Guarded because on_ready refires on every reconnect and
-            # `every` is not idempotent.
-            pass
 
     async def _sync_commands(self) -> None:
         # on_ready can refire on every (re)connect, so sync only once. The guard

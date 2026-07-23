@@ -133,7 +133,56 @@ async def test_a_sensor_that_raises_has_its_timers_stopped(tmp_path):
     try:
         await asyncio.sleep(0.2)
         seen = len(s.calls)
+        assert seen >= 1, "timer never ticked, so its stopping proves nothing"
         await asyncio.sleep(0.2)
         assert len(s.calls) == seen        # timers stopped with the sensor
+    finally:
+        await bus.stop()
+
+
+async def test_a_sensor_that_returns_cleanly_keeps_its_timers(tmp_path):
+    class _Quiet:
+        name = "quiet"
+        def bind(self, ctx):
+            self.ctx = ctx
+            self.calls = []
+            ctx.schedule.every(0.02, self._tick, first_after=0.0)
+        async def _tick(self): self.calls.append(1)
+        async def start(self): return      # no loop to supervise, not "finished"
+        async def stop(self): pass
+
+    s = _Quiet()
+    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus.add_sensor(s)
+    await bus.start()
+    try:
+        await _wait(lambda: len(s.calls) >= 3)
+    finally:
+        await bus.stop()
+
+
+async def test_routes_are_registered_before_the_server_starts(tmp_path):
+    calls = []
+
+    class _RecordingHttp:
+        def __init__(self): self.app = None
+        def route(self, path, handler, *, methods=("GET",), owner="?"):
+            calls.append(("route", path))
+        async def start(self): calls.append(("start", None))
+        async def stop(self): calls.append(("stop", None))
+
+    class _Routed:
+        name = "routed"
+        def bind(self, ctx):
+            ctx.http.route("/x", None, methods=["POST"], owner=self.name)
+        async def start(self): return
+        async def stop(self): pass
+
+    bus = Bus(str(tmp_path / "mm.db"), http=_RecordingHttp(),
+              wait_ms=50, reaper_interval=3600.0)
+    bus.add_sensor(_Routed())
+    await bus.start()
+    try:
+        assert calls.index(("route", "/x")) < calls.index(("start", None))
     finally:
         await bus.stop()

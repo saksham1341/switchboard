@@ -41,8 +41,11 @@ class Bus:
         self._conn = None
         self._tasks: list[asyncio.Task] = []
         self._running = False
+        self._started = False
+        self._started_owners: list[str] = []
 
         self._store = store if store is not None else MemoryStore()
+        self._owns_store = store is None
         # serve=False by default so tests register routes and drive .app
         # without any of them binding a port.
         self._http = http if http is not None else HttpServer(serve=False)
@@ -72,6 +75,12 @@ class Bus:
         return await self._append(CMD_LOG, name, args, observation_id=observation_id)
 
     async def start(self) -> None:
+        if self._started:
+            raise RuntimeError(
+                "Bus.start() is single-use — routes and log consumers are "
+                "registered once. Construct a new Bus rather than restarting "
+                "this one.")
+        self._started = True
         self._conn = await connect(self._db)
         self._registry = LogRegistry(
             storage=SQLiteStorage(self._conn), state=SQLiteStateStore(self._conn),
@@ -113,6 +122,7 @@ class Bus:
             task.add_done_callback(lambda t, n=s.name: self._sensor_exited(n, t))
             self._tasks.append(task)
             self._scheduler.start(s.name)
+            self._started_owners.append(s.name)
 
     def _sensor_exited(self, name, task):
         # A clean return is normal for a route-driven sensor and its timers must
@@ -126,16 +136,29 @@ class Bus:
 
     async def stop(self) -> None:
         self._running = False
+
+        # 1. No new inbound work. uvicorn drains in-flight requests itself.
+        await self._http.stop()
+
+        # 2. Sensors down, each one's timers first: a scheduled callback must
+        #    never fire against a connection being torn down.
+        for name in self._started_owners:
+            await self._scheduler.stop(name)
         for s in self._sensors:
-            # Timers first: no callback may fire against a connection being
-            # torn down.
-            await self._scheduler.stop(s.name)
             try:
                 await s.stop()
             except Exception:
                 logger.exception("sensor %s failed to stop", s.name)
         await self._scheduler.stop_all()
-        await self._http.stop()
+
+        # 3. Drain the consume loops before anything they depend on goes away.
+        for t in self._tasks:
+            t.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+        # 4. Now nothing is using them, so the clients can close.
         for a in self._actuators:
             close = getattr(a, "close", None)
             if close is not None:
@@ -143,11 +166,11 @@ class Bus:
                     await close()
                 except Exception:
                     logger.exception("actuator %s failed to close", a.name)
-        for t in self._tasks:
-            t.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+
+        if self._owns_store:
+            store_close = getattr(self._store, "close", None)
+            if store_close is not None:
+                store_close()
         if self._conn is not None:
             self._conn.close()
 
