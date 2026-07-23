@@ -50,7 +50,6 @@ class ActuatorCtx:
 @dataclass
 class TapCtx:
     store: KeyStore
-    http: HttpServer
 ```
 
 ```python
@@ -80,9 +79,9 @@ class Tap(Protocol):
 
 All four roles bind. `LoggerTap` needs nothing from its ctx today, but a tap reads a log, so the projection rule applies to it as cleanly as to a decider — a metrics tap counting observations by name is exactly a read model. Leaving one role out is how the three-mechanism mess this section removes came about in the first place.
 
-`TapCtx` carries `http` as well as `store` because a live dashboard is exactly a tap: it reads both logs, keeps a projection, and serves a page. Giving taps a route lets that be built entirely on top of this platform, with no change to it. A tap's routes must stay read-only — a page with buttons that mutate state is not a tap, it is a decider reached through a sensor.
+`TapCtx` is a store and nothing else. No `emit`, because a tap that could write to a log would stop being a tap — and no `http` either, though a live dashboard makes that tempting.
 
-`TapCtx` deliberately has no `emit`: a tap that could write to a log would stop being a tap.
+A dashboard is a tap *plus* a served page, and the two halves do not have to be the same object's responsibility. `app.build()` already holds the `HttpServer`, so it wires both — `http.route("/", dash.page)` and `bus.add_tap(dash.tap)` — with the dashboard object holding whatever projection it keeps. Nothing in the platform changes. Putting `http` on `TapCtx` instead would have required a rule that a tap's routes stay read-only, and a capability that needs a rule to stop it breaking the role's invariant is in the wrong place. The same goes for outbound: a tap that wants to push somewhere holds its own client, exactly as an actuator does.
 
 Each role stashes its ctx the way any Python object holds a dependency:
 
@@ -142,7 +141,7 @@ for d in self._deciders:
 for a in self._actuators:
     a.bind(ActuatorCtx(store=scoped("actuator", a.name)))
 for t in self._taps:
-    t.bind(TapCtx(store=scoped("tap", t.name), http=self._http))
+    t.bind(TapCtx(store=scoped("tap", t.name)))
 for s in self._sensors:
     s.bind(SensorCtx(emit=..., http=self._http,
                      store=scoped("sensor", s.name),
@@ -563,4 +562,4 @@ No new environment variables. `SB_PORT` and `SB_DATA_DIR` now reach `HttpServer`
 | A global / unscoped store | Shared memory between roles is an out-of-band channel that bypasses the log. The data a role needs from another role arrives as an observation; each role projects its own copy. Additive later if a genuine case appears. |
 | `LinearSensor` itself | The example the design is answerable to, not a deliverable here. |
 | `LoggerTap` payload redaction | Real outstanding issue — full payloads including `interaction_token` reach persistent logs — but orthogonal to this change. |
-| A live dashboard | A product built on this platform, not part of it: a read-only tap that projects both logs, plus a streaming transport and a UI. `TapCtx.http` is here so it needs no platform change; it gets its own spec. Note that `max_log_messages` bounds the visible history to a rolling window. |
+| A live dashboard | A product built on this platform, not part of it: a projection over both logs plus a streaming transport and a UI. It needs no platform change — `app.build()` owns the `HttpServer` and can register the page alongside `bus.add_tap(...)`. Gets its own spec. Note that `max_log_messages` bounds the visible history to a rolling window. |
