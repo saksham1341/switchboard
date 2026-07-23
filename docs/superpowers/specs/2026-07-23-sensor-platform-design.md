@@ -397,6 +397,20 @@ Four decisions:
 - **A raising callback logs and the loop survives.** Same contract as `Bus._consume`.
 - **No backoff on consecutive failures.** The interval *is* the rate limit. A knob nobody needs yet.
 
+### One timer belongs to the bus, not to a role
+
+`SqliteStore.purge` needs a driver and no role owns it, so the `Bus` declares it against a non-role owner:
+
+```python
+    def schedule_maintenance(self, owner: str, seconds: float, fn) -> None:
+        """A timer owned by the bus rather than by any role. Started with the
+        bus, cancelled by stop_all()."""
+        self._scheduler.for_owner(owner).every(seconds, _as_async(fn), name=owner)
+        self._maintenance.append(owner)
+```
+
+`_as_async` wraps the sync `purge` because the scheduler awaits its callbacks. Owners are just strings, so this needs no new mechanism — which is the point: a scheduler keyed on owner names rather than on role objects absorbs the case for free.
+
 ### A crashed sensor stops ticking
 
 "Only while started" has a third case beyond start and stop: a sensor whose `start()` raised. Its timers would otherwise keep sweeping against a dead connection forever.
