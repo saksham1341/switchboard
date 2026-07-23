@@ -411,7 +411,9 @@ function renderFeed(){
 // a wiring diagram that happens to be alive, and a taut line makes the path a
 // call took legible at a glance rather than something to trace through slack.
 // ---------------------------------------------------------------------------
-const PATCH_MS = 420, CLEAR_MS = 380, STAGGER_MS = 170;
+// Per-segment durations. Legs now run strictly one at a time, so a full
+// four-leg patch takes 4×PATCH_MS end to end — kept short so it stays snappy.
+const PATCH_MS = 300, CLEAR_MS = 260;
 const easeOut = t => 1 - Math.pow(1 - t, 3);
 const easeIn  = t => t * t;
 
@@ -486,12 +488,16 @@ function frame(now){
     }
 
     if (c.state === "patch"){
-      const t1 = Math.min(1, (now - c.tPatch) / PATCH_MS);
-      const t2 = Math.min(1, Math.max(0, now - c.tPatch - STAGGER_MS) / PATCH_MS);
-      leg(c, 0, L, c.cord, 1, glow * .6, 1);
+      // Strictly sequential: leg 2 does not begin until leg 1 has fully seated.
+      const e = now - c.tPatch;
+      leg(c, 0, L, c.cord, 1, glow * .6, 1);                 // already seated
+      const t1 = Math.min(1, e / PATCH_MS);
       leg(c, 1, L, c.cord, easeOut(t1), 0, 1);
-      if (t2 > 0) leg(c, 2, L, c.cord, easeOut(t2), 0, 1);
-      if (t2 >= 1){ c.state = c.wasFault ? "fault" : "waiting"; c.tWait = now; }
+      if (t1 >= 1){
+        const t2 = Math.min(1, (e - PATCH_MS) / PATCH_MS);
+        leg(c, 2, L, c.cord, easeOut(t2), 0, 1);
+        if (t2 >= 1){ c.state = c.wasFault ? "fault" : "waiting"; c.tWait = now; }
+      }
       live++; continue;
     }
 
@@ -512,12 +518,17 @@ function frame(now){
     }
 
     if (c.state === "clear"){
-      // Drawn back far-end first, in the reverse order they were placed.
+      // Pulled far-end first, strictly one segment at a time: each retracts
+      // fully before the next begins, the rest holding seated meanwhile.
+      const e = now - c.tClear;
       let done = true;
-      for (let i = L.length - 1; i >= 0; i--){
-        const delay = (L.length - 1 - i) * STAGGER_MS * 0.6;
-        const t = Math.min(1, Math.max(0, now - c.tClear - delay) / CLEAR_MS);
-        if (t < 1){ leg(c, i, L, c.cord, 1 - easeIn(t), 0, 1 - t * .5); done = false; }
+      for (let k = 0; k < L.length; k++){
+        const i = L.length - 1 - k;                 // far end first
+        const t = (e - k * CLEAR_MS) / CLEAR_MS;
+        if (t >= 1) continue;                        // this one is gone
+        done = false;
+        if (t <= 0) leg(c, i, L, c.cord, 1, 0, 1);   // still seated, waiting its turn
+        else        leg(c, i, L, c.cord, 1 - easeIn(t), 0, 1 - t * .5);
       }
       if (done){
         if (c.slotObs) c.slotObs.el.classList.remove("on");
