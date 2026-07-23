@@ -19,6 +19,7 @@
 - `TapCtx` carries `store` only. No `emit`, no `http`.
 - The GitHub webhook path is exactly `/webhook/github`. No unscoped `/webhook` alias.
 - The health path is exactly `/health`, served by `HttpServer`, returning `200` with body `ok`.
+- `HttpServer` route ownership is keyed on `(method, path)`, not path alone. Same path with different methods is legal; the same `(method, path)` twice raises.
 - `Scheduler.every` uses fixed delay, not fixed rate: the next sleep begins when the callback returns. `first_after` defaults to `seconds`.
 - A scheduled callback that raises is logged and its loop continues. `asyncio.CancelledError` always re-raises.
 - Timers never run outside their owner's lifetime: launched by `Scheduler.start(owner)`, cancelled by `Scheduler.stop(owner)`.
@@ -341,7 +342,9 @@ git commit -m "feat: KeyStore with memory, sqlite, and scoped implementations"
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: `HttpServer(host="0.0.0.0", port=8080, *, serve=True)` with `route(path, handler, *, methods=("GET",))`, `async start()`, `async stop()`, and a `.app` attribute (a Starlette app) that tests drive with `TestClient` without binding a port.
+- Produces: `HttpServer(host="0.0.0.0", port=8080, *, serve=True)` with `route(path, handler, *, methods=("GET",), owner="?")`, `async start()`, `async stop()`, and a `.app` attribute (a Starlette app) that tests drive with `TestClient` without binding a port.
+
+Ownership is keyed on `(method, path)`, uppercased. Methods are validated before any claim is recorded, so a partially-overlapping registration leaves no half-claim behind. Starlette's implicit `HEAD` for a `GET` route is part of that `GET` claim and is not tracked separately.
 
 `serve=False` makes `start()` a no-op. The `Bus` uses that default so its tests register routes and drive `.app` without any test binding port 8080; `app.build()` passes a real one.
 
@@ -381,7 +384,7 @@ def test_unregistered_path_is_404():
     assert TestClient(s.app).post("/nope").status_code == 404
 
 
-def test_duplicate_path_raises_naming_the_first_owner():
+def test_duplicate_method_and_path_raises_naming_the_first_owner():
     s = HttpServer(serve=False)
 
     async def h(request): return PlainTextResponse("x")
@@ -389,6 +392,31 @@ def test_duplicate_path_raises_naming_the_first_owner():
     s.route("/dup", h, methods=["POST"], owner="github")
     with pytest.raises(ValueError, match="github"):
         s.route("/dup", h, methods=["POST"], owner="linear")
+
+
+def test_same_path_different_methods_is_allowed():
+    """Meta-style webhooks answer a GET verification challenge at the same URL
+    that receives event POSTs. Ownership is per request, not per path."""
+    s = HttpServer(serve=False)
+
+    async def verify(request): return PlainTextResponse("challenge")
+    async def event(request): return PlainTextResponse("received")
+
+    s.route("/webhook/meta", verify, methods=["GET"], owner="meta")
+    s.route("/webhook/meta", event, methods=["POST"], owner="meta")
+    client = TestClient(s.app)
+    assert client.get("/webhook/meta").text == "challenge"
+    assert client.post("/webhook/meta").text == "received"
+
+
+def test_overlapping_method_set_raises_on_the_shared_verb():
+    s = HttpServer(serve=False)
+
+    async def h(request): return PlainTextResponse("x")
+
+    s.route("/multi", h, methods=["GET", "POST"], owner="first")
+    with pytest.raises(ValueError, match="first"):
+        s.route("/multi", h, methods=["POST"], owner="second")
 
 
 async def test_start_is_a_noop_when_serve_is_false():
@@ -426,22 +454,31 @@ class HttpServer:
 
     def __init__(self, host: str = "0.0.0.0", port: int = 8080, *, serve: bool = True):
         self._host, self._port, self._serve = host, port, serve
-        self._owners: dict[str, str] = {}
+        self._owners: dict[tuple[str, str], str] = {}
         self._server = None
         self._task = None
         self.app = Starlette(routes=[
             Route("/health", lambda request: PlainTextResponse("ok"), methods=["GET"]),
         ])
+        self._owners[("GET", "/health")] = "switchboard"
 
     def route(self, path: str, handler, *, methods=("GET",), owner: str = "?") -> None:
-        if path in self._owners:
-            raise ValueError(
-                f"{path} already registered by {self._owners[path]!r}. An HTTP path "
-                f"has one response, so it has one owner. To have several consumers "
-                f"react to it, add deciders that subscribe to the observation it "
-                f"emits; to separate tenants, scope the path (e.g. {path}/<tenant>).")
-        self._owners[path] = owner
-        self.app.router.routes.append(Route(path, handler, methods=list(methods)))
+        # Ownership is per (method, path): a request is identified by both, and
+        # that is the granularity at which exactly one response exists. GET /x
+        # and POST /x never contend, so they may have different owners — which
+        # is what lets a provider verify over GET at the URL it POSTs events to.
+        claims = [m.upper() for m in methods]
+        for m in claims:
+            if (m, path) in self._owners:
+                raise ValueError(
+                    f"{m} {path} already registered by {self._owners[(m, path)]!r}. "
+                    f"One request has one response, so it has one owner. To have "
+                    f"several consumers react to it, add deciders that subscribe to "
+                    f"the observation it emits; to separate tenants, scope the path "
+                    f"(e.g. {path}/<tenant>).")
+        for m in claims:
+            self._owners[(m, path)] = owner
+        self.app.router.routes.append(Route(path, handler, methods=claims))
 
     async def start(self) -> None:
         if not self._serve:
@@ -1156,8 +1193,9 @@ def test_health_is_served_but_the_sensor_did_not_register_it():
     added it. The sensor's only route is its webhook."""
     s, http, _ = _bound()
     assert TestClient(http.app).get("/health").status_code == 200
-    # HttpServer records an owner per registered path; /health has no sensor owner.
-    assert http._owners == {"/webhook/github": "github"}
+    # HttpServer records an owner per (method, path); /health is its own.
+    assert http._owners == {("GET", "/health"): "switchboard",
+                            ("POST", "/webhook/github"): "github"}
 
 
 async def test_dedup_records_after_emit_not_before():

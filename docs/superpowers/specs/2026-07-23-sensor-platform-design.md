@@ -182,14 +182,16 @@ class HttpServer:
 
 It serves `/health` itself. That endpoint is not GitHub's — it is the deployment's liveness probe, gating `scripts/update.sh`, and it must answer in a build configured with no webhook sensor at all.
 
-### One owner per path
+### One owner per request
 
-Registering a path twice raises at bind time, before the server starts:
+Ownership is keyed on `(method, path)`, not on path alone — a request is identified by both, and that is the granularity at which exactly one response exists. `GET /x` and `POST /x` never contend, so they may have different owners.
+
+This also matches the router underneath: Starlette already dispatches on method, and providers exist that use one URL for two verbs — Meta webhooks answer a `GET` verification challenge at the same URL that receives event `POST`s. Path-only exclusivity would have stopped even a single sensor from registering those as two handlers.
 
 ```python
 raise ValueError(
-    f"{path} already registered by sensor {self._owners[path]!r}. "
-    f"An HTTP path has one response, so it has one owner. To have several "
+    f"{method} {path} already registered by {self._owners[(method, path)]!r}. "
+    f"One request has one response, so it has one owner. To have several "
     f"consumers react to it, add deciders that subscribe to the observation "
     f"it emits; to separate tenants, scope the path (e.g. {path}/<tenant>)."
 )
