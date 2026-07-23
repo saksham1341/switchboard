@@ -4,449 +4,550 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Switchboard</title>
+<link rel="icon" href="data:,">
 <style>
   :root{
-    --bg:#070a0f; --panel:#0f1621; --line:#1c2534; --dim:#66718a; --ink:#e9edf5;
-    --g:#34d399; --b:#38bdf8; --a:#fbbf24; --r:#f87171; --violet:#a78bfa;
+    --bake:#171310; --bake2:#0d0b09; --brass:#c9a227;
+    --ink:#e8e2d4; --dim:#8a8071; --lamp:#ffb347; --live:#7ee787; --red:#ff5a52;
   }
   *{box-sizing:border-box}
   html,body{height:100%;margin:0}
   body{
-    background:radial-gradient(130% 100% at 50% -10%,#101a29 0%,var(--bg) 65%);
-    color:var(--ink); font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
-    display:flex; flex-direction:column; overflow:hidden;
+    background:#0a0908; color:var(--ink); overflow:hidden;
+    font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
+    display:flex; flex-direction:column;
   }
 
-  header{display:flex;align-items:baseline;gap:14px;padding:14px 20px 8px}
-  header h1{font-size:14px;font-weight:600;letter-spacing:.5px;margin:0}
-  header .sub{color:var(--dim);font-size:11px}
-  .live{display:inline-flex;align-items:center;gap:6px;color:var(--g);font-size:11px}
-  .live i{width:7px;height:7px;border-radius:50%;background:var(--g);
-          box-shadow:0 0 10px var(--g);animation:beat 2.4s ease-in-out infinite}
-  @keyframes beat{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1)}}
+  /* ---------- the board ---------- */
+  #panel{
+    position:relative; flex:1; min-height:0; margin:10px 10px 0;
+    border-radius:6px; overflow:hidden;
+    background:
+      radial-gradient(120% 80% at 50% -10%, #241d17 0%, transparent 60%),
+      repeating-linear-gradient(103deg, #16120f 0 3px, #191411 3px 6px),
+      linear-gradient(180deg, var(--bake) 0%, var(--bake2) 100%);
+    border:1px solid #2a2119;
+    box-shadow:inset 0 1px 0 #3a2f22, inset 0 -30px 60px -30px #000, 0 20px 60px -20px #000;
+  }
+  #panel::before,#panel::after{
+    content:""; position:absolute; left:0; right:0; height:7px; pointer-events:none;
+    background:linear-gradient(180deg,#e5c766,#8a6f1c 45%,#5c4a12 55%,#c9a227);
+    opacity:.5;
+  }
+  #panel::before{top:0} #panel::after{bottom:0;transform:scaleY(-1)}
 
-  /* ---------- stage ---------- */
-  #stage{position:relative;flex:1;min-height:0}
-  #flow{position:absolute;inset:0;width:100%;height:100%}
-  #overlay{position:absolute;inset:0;pointer-events:none}
+  #cables{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+  #chrome{position:absolute;inset:0}
 
-  .bandcap{position:absolute;color:var(--dim);font-size:9px;letter-spacing:1.6px;
-           transform:translateX(-50%);white-space:nowrap}
-  .node{position:absolute;transform:translate(-50%,-50%);background:var(--panel);
-        border:1px solid var(--line);border-radius:8px;padding:7px 11px;font-size:11px;
-        white-space:nowrap;transition:border-color .25s,color .25s,box-shadow .25s,transform .12s}
-  .node .kind{display:block;color:var(--dim);font-size:8px;letter-spacing:1px;margin-bottom:1px}
-  .node.hot{transform:translate(-50%,-50%) scale(1.06)}
-  .node.hot.g{border-color:var(--g);color:var(--g);box-shadow:0 0 26px -6px var(--g)}
-  .node.hot.b{border-color:var(--b);color:var(--b);box-shadow:0 0 26px -6px var(--b)}
-  .node.hot.v{border-color:var(--violet);color:var(--violet);box-shadow:0 0 26px -6px var(--violet)}
-  .node.dead{border-color:var(--r);color:var(--r);box-shadow:0 0 26px -6px var(--r)}
+  .banklbl{position:absolute;transform:translateX(-50%);color:#6d6255;font-size:9px;
+           letter-spacing:3px;text-transform:uppercase}
 
-  /* A log is a boundary and a count, not a container: a seam events cross,
-     and the monotonic id of the last message to cross it. Nothing here can be
-     misread as depth, because nothing here grows. */
-  .logseam{position:absolute;width:1px;transform:translateX(-50%);
-           background:linear-gradient(180deg,transparent,#243044 12%,#243044 88%,transparent)}
-  .logtag{position:absolute;transform:translateX(-50%);text-align:center;white-space:nowrap;
-          color:var(--dim);font-size:9px;letter-spacing:2px}
-  .logtag b{display:block;color:#7f8ba3;font-weight:500;letter-spacing:0;font-size:10px;
-            margin-top:2px;transition:color .3s}
-  .logtag.pulse b{color:var(--b)}
+  /* ---------- a jack ---------- */
+  .jack,.op{position:absolute;transform:translate(-50%,-50%);width:120px;text-align:center}
+  .bore{width:30px;height:30px;margin:0 auto;border-radius:50%;position:relative;
+        background:radial-gradient(circle at 38% 32%, #4a3f2c 0%, #120e0a 62%);
+        box-shadow:0 0 0 3px #6b5a22, 0 0 0 4px #2b2318,
+                   inset 0 3px 6px #000, 0 2px 3px rgba(0,0,0,.8);
+        transition:box-shadow .25s}
+  .bore::after{content:"";position:absolute;inset:9px;border-radius:50%;background:#000}
+  .busy .bore{box-shadow:0 0 0 3px #a8871f, 0 0 0 4px #2b2318,
+              inset 0 3px 6px #000, 0 0 22px -2px var(--lamp)}
+  .fault .bore{box-shadow:0 0 0 3px #8a2b25, 0 0 0 4px #2b2318,
+               inset 0 3px 6px #000, 0 0 26px -2px var(--red)}
 
-  .badge{position:absolute;transform:translate(-50%,-50%);border-radius:5px;padding:2px 7px;
-         font-size:9px;white-space:nowrap;pointer-events:none;
-         animation:pop .4s cubic-bezier(.2,1.4,.4,1) both}
-  @keyframes pop{from{opacity:0;transform:translate(-50%,-30%) scale(.8)}
-                 to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
-  .badge.lat{background:#0d2a21;color:var(--g);border:1px solid #1c4a3c}
-  .badge.slow{background:#2b1d0c;color:var(--a);border:1px solid #4a3a17}
-  .badge.err{background:#2b1212;color:var(--r);border:1px solid #4a1f1f}
+  .lamp{width:9px;height:9px;border-radius:50%;margin:7px auto 5px;
+        background:radial-gradient(circle at 35% 30%, #3a2c15, #1a140b);
+        box-shadow:inset 0 1px 1px #000; transition:background .18s, box-shadow .18s}
+  .busy .lamp{background:radial-gradient(circle at 35% 30%, #fff2c9, var(--lamp));
+              box-shadow:0 0 14px 2px rgba(255,179,71,.75)}
+  .live .lamp{background:radial-gradient(circle at 35% 30%, #dfffe6, var(--live));
+              box-shadow:0 0 14px 2px rgba(126,231,135,.7)}
+  .fault .lamp{background:radial-gradient(circle at 35% 30%, #ffd2cf, var(--red));
+               box-shadow:0 0 16px 3px rgba(255,90,82,.8)}
 
-  /* ---------- status bar + feed drawer ---------- */
-  #bar{display:flex;justify-content:space-between;align-items:center;gap:16px;
-       padding:8px 20px;border-top:1px solid var(--line);background:#0a0f17;font-size:11px}
-  #bar .stats{display:flex;gap:18px;color:var(--dim)}
-  #bar .stats b{color:var(--ink);font-weight:500}
-  #bar button{background:transparent;border:1px solid var(--line);color:var(--b);
-              border-radius:6px;padding:4px 10px;font:inherit;font-size:11px;cursor:pointer}
-  #bar button:hover{border-color:var(--b)}
+  .plate{margin:0 auto;padding:3px 6px;border-radius:2px;max-width:112px;
+         background:linear-gradient(180deg,#2b2419,#1d1811);
+         border:1px solid #3d3222; color:#cbbf9f; font-size:10px;
+         text-shadow:0 1px 0 #000; overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+         box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}
 
-  #feed{height:0;overflow:hidden;transition:height .32s cubic-bezier(.2,.7,.3,1);
-        background:#070b11;border-top:1px solid transparent}
-  #feed.open{height:210px;border-top-color:var(--line)}
-  #feedinner{height:210px;overflow-y:auto;padding:6px 0}
-  .frow{display:grid;grid-template-columns:46px 52px 1fr 190px 74px;gap:10px;
-        padding:3px 20px;cursor:default;font-size:11px}
-  .frow:hover{background:#0e1621}
-  .frow.sel{background:#12202e}
-  .tag{border-radius:3px;padding:0 5px;font-size:9px;text-align:center}
-  .tag.obs{background:#0d3b2e;color:var(--g)} .tag.cmd{background:#0b3550;color:var(--b)}
-  .mid{color:var(--dim)} .nm{color:var(--ink);overflow:hidden;text-overflow:ellipsis}
-  .by{color:#56617a;overflow:hidden;text-overflow:ellipsis}
-  .ms{color:var(--dim);text-align:right}
-  .frow.deadrow .nm{color:var(--r)}
+  /* ---------- operator position: a cord pair with the key between ---------- */
+  .op .pair{display:flex;align-items:center;justify-content:center;gap:9px;margin-bottom:4px}
+  .op .sm{width:19px;height:19px;border-radius:50%;position:relative;flex:none;
+          background:radial-gradient(circle at 38% 32%, #4a3f2c 0%, #120e0a 62%);
+          box-shadow:0 0 0 2px #6b5a22, 0 0 0 3px #2b2318, inset 0 2px 4px #000;
+          transition:box-shadow .25s}
+  .op.busy .sm{box-shadow:0 0 0 2px #a8871f, 0 0 0 3px #2b2318,
+               inset 0 2px 4px #000, 0 0 16px -2px var(--lamp)}
+  .op .key{width:34px;height:18px;border-radius:3px;flex:none;
+           background:linear-gradient(180deg,#3a3124,#1b1610);
+           border:1px solid #4b3f2b;
+           box-shadow:inset 0 1px 0 rgba(255,255,255,.08),0 3px 5px #000;
+           transition:transform .12s, box-shadow .2s}
+  .op.act .key{transform:translateY(3px);
+               box-shadow:inset 0 2px 4px #000, 0 0 18px -2px var(--brass)}
 
-  .hint{position:absolute;left:20px;bottom:14px;color:#3d465c;font-size:10px}
+  /* ---------- log fields: where messages wait to be picked up ---------- */
+  .field{position:absolute;transform:translate(-50%,-50%);border-radius:5px;padding:9px 7px;
+         background:linear-gradient(180deg,#120e0a,#0b0806);border:1px solid #33291c;
+         box-shadow:inset 0 2px 6px #000, 0 2px 4px rgba(0,0,0,.6);
+         display:flex;flex-direction:column;align-items:center;gap:9px}
+  .hole{width:13px;height:13px;border-radius:50%;flex:none;
+        background:radial-gradient(circle at 38% 32%, #3a3122 0%, #0d0a07 62%);
+        box-shadow:0 0 0 1.5px #5b4d1e, inset 0 1px 3px #000;
+        transition:box-shadow .2s}
+  .hole.on{box-shadow:0 0 0 1.5px #b8941f, inset 0 1px 3px #000, 0 0 14px -1px var(--lamp)}
+  .hole.bad{box-shadow:0 0 0 1.5px #8a2b25, inset 0 1px 3px #000, 0 0 16px -1px var(--red)}
+  .fieldcap{position:absolute;transform:translateX(-50%);color:#6d6255;font-size:9px;
+            letter-spacing:3px;text-transform:uppercase}
+
+  /* ---------- registers ---------- */
+  .reg{position:absolute;transform:translateX(-50%);text-align:center}
+  .reg .cap{color:#6d6255;font-size:9px;letter-spacing:3px;margin-bottom:4px}
+  .reg .digits{display:inline-flex;gap:2px;padding:4px 6px;border-radius:3px;
+               background:linear-gradient(180deg,#0e0b08,#161109);
+               border:1px solid #3d3222; box-shadow:inset 0 2px 5px #000}
+  .reg .d{width:13px;height:20px;line-height:20px;font-size:13px;color:#e8d9a8;
+          background:linear-gradient(180deg,#241d13,#120e08);border-radius:2px;
+          text-shadow:0 0 8px rgba(232,217,168,.35);transition:color .2s}
+  .reg.tick .d{color:#fff6d8}
+
+  /* ---------- rail + log book ---------- */
+  #rail{display:flex;justify-content:space-between;align-items:center;gap:16px;
+        padding:7px 18px;background:linear-gradient(180deg,#141009,#0b0907);
+        border-top:1px solid #2a2119;font-size:11px;color:var(--dim)}
+  #rail b{color:var(--ink);font-weight:500}
+  #rail .grp{display:flex;gap:16px;align-items:center}
+  #rail button{background:transparent;border:1px solid #3d3222;color:#c9b98d;
+               border-radius:4px;padding:3px 9px;font:inherit;font-size:11px;cursor:pointer}
+  #rail button:hover{border-color:var(--brass);color:#f0e3b8}
+  .pilot{display:inline-block;width:7px;height:7px;border-radius:50%;
+         background:var(--live);box-shadow:0 0 8px var(--live);animation:brr 3.5s infinite}
+  @keyframes brr{0%,100%{opacity:.3}50%{opacity:1}}
+
+  #feed{height:0;overflow:hidden;transition:height .3s cubic-bezier(.2,.7,.3,1);
+        background:#0b0907;border-top:1px solid transparent}
+  #feed.open{height:190px;border-top-color:#2a2119}
+  #inner{height:190px;overflow-y:auto;padding:6px 0}
+  .frow{display:grid;grid-template-columns:44px 56px 1fr 210px;gap:10px;
+        padding:2px 18px;font-size:11px;color:#a89c85}
+  .frow:hover{background:#12100b}
+  .tag{border-radius:2px;padding:0 5px;font-size:9px;text-align:center;color:#0b0907}
+  .tag.obs{background:#8fbf6a} .tag.cmd{background:#6fa8d8}
+  .frow .nm{color:#ded4bd;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .frow .by{color:#6d6255;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .frow.dead .nm{color:var(--red)}
+  .note{position:absolute;left:16px;bottom:12px;color:#4a4238;font-size:10px}
 </style>
 </head>
 <body>
 
-<header>
-  <h1>SWITCHBOARD</h1>
-  <span class="live"><i></i>live</span>
-  <span class="sub" id="since">idle</span>
-</header>
-
-<div id="stage">
-  <canvas id="flow"></canvas>
-  <div id="overlay"></div>
-  <div class="hint">latency is <b>observed</b> &mdash; measured at the dashboard, not in the relay</div>
+<div id="panel">
+  <div id="chrome"></div>
+  <canvas id="cables"></canvas>
+  <div class="note">patching is animated to a legible minimum &mdash; real calls complete in milliseconds</div>
 </div>
 
-<div id="bar">
-  <div class="stats">
-    <span>obs <b id="sObs">0</b></span>
-    <span>cmd <b id="sCmd">0</b></span>
-    <span>dead <b id="sDead">0</b></span>
-    <span>rate <b id="sRate">—</b></span>
-    <span id="sLast">last event —</span>
+<div id="rail">
+  <div class="grp">
+    <span><span class="pilot"></span> &nbsp;SWITCHBOARD</span>
+    <span>calls <b id="rCalls">0</b></span>
+    <span>live <b id="rLive">0</b></span>
+    <span>faults <b id="rFault">0</b></span>
+    <span id="rLast">idle</span>
   </div>
-  <button id="toggle">▲ feed</button>
+  <button id="toggle">▲ log book</button>
 </div>
-<div id="feed"><div id="feedinner"></div></div>
+<div id="feed"><div id="inner"></div></div>
 
 <script>
 // ---------------------------------------------------------------------------
-// Live data. Topology and backfill arrive in the SSE hello frame; every
-// subsequent frame is one real message off the obs or cmd log.
+// A call is one journey: an observation, patched by an operator through to an
+// outgoing jack, held live, then cleared when its result observation returns.
+//
+// The loopback is not drawn as a line back across the board. It is the cord
+// being pulled — which is what completion actually looks like on a real board,
+// and costs no pixels crossing the forward flow.
 // ---------------------------------------------------------------------------
 let TOPO = { sensors: [], deciders: [], actuators: [] };
-const DEAD = new Set();           // "log:id" of dead-lettered messages
-const pending = new Map();        // observation id -> partial journey
+const DEAD = new Set();
 
-const cv = document.getElementById("flow");
-const ov = document.getElementById("overlay");
+const JACK  = {};          // "kind/name" -> {x,y,el}
+const REG   = {};          // "obs"|"cmd" -> register
+const FIELD = {};          // "obs"|"cmd" -> jack field
+const calls = new Map();   // observation id -> call
+const byCmd = new Map();   // command id -> call
+const rows  = [];
+let nCalls = 0, nFault = 0, lastAt = null;
+
+const cv = document.getElementById("cables");
+const deck = document.getElementById("chrome");   // not `chrome`: that is a browser global
 const ctx = cv.getContext("2d");
-let W = 0, H = 0, DPR = 1;
+let W = 0, H = 0;
 
-const P = {};   // "kind/name" -> {x,y,el}
-const LOG = {}; // "obs"|"cmd" -> {x,top,h,el}
+// Cloth-braided cord colours, keyed by route so a repeated path is recognisable.
+// Period cloth-braid colours: oxblood, navy, mustard, olive, teal, rust.
+const CORD = ["#a8443c", "#3a6ea5", "#c9a227", "#6f8f4a", "#3f8f8a", "#b5652f"];
+function cordFor(key){
+  let h = 0; for (const ch of key) h = (h * 31 + ch.charCodeAt(0)) | 0;
+  return CORD[Math.abs(h) % CORD.length];
+}
 
+// ---------------------------------------------------------------------------
 function layout(){
-  DPR = window.devicePixelRatio || 1;
   const r = cv.getBoundingClientRect();
   W = r.width; H = r.height;
-  cv.width = W * DPR; cv.height = H * DPR;
-  ctx.setTransform(DPR,0,0,DPR,0,0);
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  ov.innerHTML = "";
-  const cols = [0.12, 0.315, 0.5, 0.685, 0.88].map(f => f * W);
-  const top = 62, bot = H - 74;
+  deck.innerHTML = "";
+  for (const k in JACK) delete JACK[k];
 
-  const band = (i, items, kind, cls) => {
+  const top = 96, bot = H - 30;
+
+  const origin = cv.getBoundingClientRect();
+
+  const place = (x, items, kind, label, cls) => {
     const cap = document.createElement("div");
-    cap.className = "bandcap"; cap.textContent = kind;
-    cap.style.left = cols[i] + "px"; cap.style.top = (top - 26) + "px";
-    ov.appendChild(cap);
-    // Cap the spread: a full-height band throws the bezier control points so
-    // far apart that curves bow out of the stage entirely.
-    const span = Math.min(bot - top, 130 * items.length);
+    cap.className = "banklbl"; cap.textContent = label;
+    cap.style.left = x + "px"; cap.style.top = (top - 36) + "px";
+    deck.appendChild(cap);
+
+    const span = Math.min(bot - top, 150 * Math.max(items.length, 1));
     const y0 = (top + bot) / 2 - span / 2;
-    items.forEach((name, k) => {
+    items.forEach((name, i) => {
       const y = items.length === 1 ? (top + bot) / 2
-              : y0 + (span * (k + .5)) / items.length;
+              : y0 + span * (i + .5) / items.length;
       const el = document.createElement("div");
-      el.className = "node " + cls;
-      el.innerHTML = '<span class="kind">' + kind.slice(0,3) + '</span>' + name;
-      el.style.left = cols[i] + "px"; el.style.top = y + "px";
-      ov.appendChild(el);
-      P[kind + "/" + name] = { x: cols[i], y, el };
+      el.className = cls;
+      el.innerHTML = (cls === "op"
+          ? '<div class="pair"><div class="sm"></div><div class="key"></div>' +
+            '<div class="sm"></div></div>'
+          : '<div class="bore"></div>')
+        + '<div class="lamp"></div><div class="plate">' + name + '</div>';
+      el.style.left = x + "px"; el.style.top = y + "px";
+      deck.appendChild(el);
+      // Plug points are measured from the rendered bores, not assumed from the
+      // element's position: a jack is centred on its whole card (bore, lamp,
+      // nameplate), so its hole sits well above that centre.
+      const hole = e => {
+        const b = e.getBoundingClientRect();
+        return { x: b.left - origin.left + b.width / 2,
+                 y: b.top - origin.top + b.height / 2 };
+      };
+      if (cls === "op"){
+        const [l, r] = el.querySelectorAll(".sm");
+        const a = hole(l), b = hole(r);
+        JACK[kind + "/" + name] = { x, y: a.y, el, inX: a.x, outX: b.x };
+      } else {
+        const c = hole(el.querySelector(".bore"));
+        JACK[kind + "/" + name] = { x: c.x, y: c.y, el, inX: c.x, outX: c.x };
+      }
     });
   };
 
-  const logcol = (i, id, label) => {
-    const h = bot - top;
-    const seam = document.createElement("div");
-    seam.className = "logseam";
-    seam.style.left = cols[i] + "px"; seam.style.top = top + "px";
-    seam.style.height = h + "px";
-    ov.appendChild(seam);
+  place(W * 0.10, TOPO.sensors,   "sensor",   "incoming",  "jack");
+  place(W * 0.50, TOPO.deciders,  "decider",  "operators", "op");
+  place(W * 0.90, TOPO.actuators, "actuator", "outgoing",  "jack");
 
-    const tag = document.createElement("div");
-    tag.className = "logtag";
-    tag.style.left = cols[i] + "px"; tag.style.top = (top - 30) + "px";
-    tag.innerHTML = label + '<b>&mdash;</b>';
-    ov.appendChild(tag);
+  // The logs, as jack fields. A message lands in a hole and stays lit until
+  // something consumes it — which is what a log is, and why a dead letter can
+  // simply be a hole nobody ever came for.
+  const field = (x, id, label) => {
+    const el = document.createElement("div");
+    el.className = "field";
+    const cap = document.createElement("div");
+    cap.className = "fieldcap"; cap.textContent = label;
+    cap.style.left = x + "px"; cap.style.top = (top - 36) + "px";
+    deck.appendChild(cap);
 
-    LOG[id] = { x: cols[i], top, h, seam, tag, count: tag.querySelector("b") };
+    const n = Math.max(6, Math.min(14, Math.floor((bot - top) / 34)));
+    el.innerHTML = Array.from({length: n}, () => '<div class="hole"></div>').join("");
+    // Centred on the same axis as the banks, not hung from the top rail.
+    el.style.left = x + "px"; el.style.top = ((top + bot) / 2) + "px";
+    deck.appendChild(el);
+    const holes = [...el.querySelectorAll(".hole")].map(h => {
+      const b = h.getBoundingClientRect();
+      return { el: h, x: b.left - origin.left + b.width / 2,
+                      y: b.top - origin.top + b.height / 2 };
+    });
+    FIELD[id] = { el, holes, n };
   };
+  field(W * 0.30, "obs", "obs log");
+  field(W * 0.70, "cmd", "cmd log");
 
-  band(0, TOPO.sensors, "sensor", "g");
-  logcol(1, "obs", "OBS");
-  band(2, TOPO.deciders, "decider", "v");
-  logcol(3, "cmd", "CMD");
-  band(4, TOPO.actuators, "actuator", "b");
+  // The logs as mechanical registers. A number that only ever rises cannot be
+  // misread as a queue, which is the trap every other treatment fell into.
+  const reg = (x, id, label) => {
+    const el = document.createElement("div");
+    el.className = "reg";
+    el.style.left = x + "px"; el.style.top = (H - 26) + "px";
+    el.innerHTML = '<div class="cap">' + label + '</div><div class="digits"></div>';
+    deck.appendChild(el);
+    const prev = REG[id] && REG[id].value;
+    REG[id] = { el, digits: el.querySelector(".digits"), value: prev || 0 };
+    setReg(id, REG[id].value);
+  };
+  reg(W * 0.30, "obs", "obs register");
+  reg(W * 0.70, "cmd", "cmd register");
 }
 
-const traces = [];
-const packets = [];
-const badges = [];
-const rows = [];
-const stats = { obs:0, cmd:0, dead:0, last:null };
-const recent = [];   // arrival times, for the per-minute rate
-const TRACE_MS = 22000;
-const TRACE_MAX = 14;          // beyond this, older journeys are indistinguishable
-
-function pt(id){ return P[id]; }
-function logPt(id, frac){ const L = LOG[id]; return L ? { x:L.x, y:L.top + L.h*frac } : null; }
-
-// A frame names its emitter as "kind/name", which is exactly a node id.
-function nodeFor(emitted_by){ return emitted_by ? P[emitted_by] : null; }
-
-function animate(from, to, color, ms, node, cls, arc){
-  if (!from || !to) return;
-  packets.push({ legs:[{ from, to, ms, color, node, cls, arc, onEnd:null }],
-                 i:0, t:0, path:[], started:performance.now(), fail:false });
+function setReg(id, n){
+  const R = REG[id]; if (!R) return;
+  R.value = n;
+  R.digits.innerHTML = [...String(n).padStart(5, "0")]
+    .map(d => '<span class="d">' + d + '</span>').join("");
+  R.el.classList.add("tick");
+  clearTimeout(R._t); R._t = setTimeout(() => R.el.classList.remove("tick"), 260);
 }
 
-// ---------------------------------------------------------------------------
-// One real frame -> one animated hop. The dashboard reconstructs journeys from
-// causal links; it never invents a hop it did not see.
+function mark(node, cls, ms){
+  if (!node) return;
+  node.el.classList.add(cls);
+  if (ms){
+    clearTimeout(node["_" + cls]);
+    node["_" + cls] = setTimeout(() => node.el.classList.remove(cls), ms);
+  }
+}
+function unmark(node, cls){ if (node) node.el.classList.remove(cls); }
+
 // ---------------------------------------------------------------------------
 function ingest(f, replay){
-  // One crossing point per log. Fanning by id spread repeated journeys into
-  // ribbons that read as hair; overlaying them reads as a path used often.
-  const o = logPt("obs", 0.5), c = logPt("cmd", 0.5);
-  const src = nodeFor(f.emitted_by);
-  const dead = DEAD.has(f.log + ":" + f.id);
+  if (REG[f.log]) setReg(f.log, Math.max(REG[f.log].value, f.id + 1));
+  row(f);
+  if (replay) return;
+  lastAt = performance.now();
 
-  if (f.log === "obs"){
-    stats.obs++;
-    if (f.command_id != null){
-      // A result observation: the actuator reporting back.
-      if (!replay) animate(src, o, "#34d399", 140, src && src.el, "b", true);
-    } else if (!replay){
-      animate(src, o, "#34d399", 120, src && src.el, "g");
-      // The decider hop is drawn when its command appears, not guessed here.
-      pending.set(f.id, { at: performance.now(), obsPoint: o });
-    }
-  } else {
-    stats.cmd++;
-    const dec = nodeFor(f.emitted_by);
-    const act = P["actuator/" + f.name];
-    const prior = pending.get(f.observation_id);
-    if (!replay){
-      if (prior && dec){
-        animate(prior.obsPoint, dec, "#a78bfa", 180, dec.el, "v");
-        setTimeout(()=>animate(dec, c, "#a78bfa", 120, null, null), 180);
-      }
-      setTimeout(()=>{
-        animate(c, act, "#38bdf8", 200, act && act.el, "b");
-        if (dead && act){
-          act.el.classList.add("dead");
-          setTimeout(()=>act.el.classList.remove("dead"), 1600);
-          badge(act.x, act.y - 44, "dead", "err");
-        }
-      }, 320);
-      pending.delete(f.observation_id);
-    }
+  if (f.log === "obs" && f.command_id == null){
+    // Beat one: the observation lands in the obs log. We know its sensor from
+    // emitted_by, so this cord can be placed now rather than waiting to learn
+    // which operator will take it.
+    const sensor = JACK[f.emitted_by];
+    const slot = holeFor("obs", f.id);
+    mark(sensor, "busy", 0);
+    if (slot) slot.el.classList.add("on");
+    calls.set(f.id, { sensor, slotObs: slot, t0: performance.now(), state: "held",
+                      cord: cordFor(f.emitted_by || "?") });
+    nCalls++;
+    return;
   }
 
-  const L = LOG[f.log];
-  if (L){
-    L.count.textContent = "#" + f.id;
-    if (!replay){
-      L.tag.classList.add("pulse");
-      clearTimeout(L._t);
-      L._t = setTimeout(()=>L.tag.classList.remove("pulse"), 500);
+  if (f.log === "cmd"){
+    // Beat two: an operator takes the call and places a command in the cmd log.
+    const call = calls.get(f.observation_id) || { t0: performance.now() };
+    const slotCmd = holeFor("cmd", f.id);
+    Object.assign(call, {
+      op: JACK[f.emitted_by], dest: JACK["actuator/" + f.name], slotCmd,
+      state: "patch", tPatch: performance.now(),
+      cord: cordFor((f.emitted_by || "") + f.name),
+    });
+    calls.set(f.observation_id ?? -f.id, call);
+    byCmd.set(f.id, call);
+    mark(call.op, "act", 700); mark(call.op, "busy", 0);
+    if (slotCmd) slotCmd.el.classList.add("on");
+    if (DEAD.has("cmd:" + f.id)){
+      // Nobody ever comes for it: the last cord is never placed.
+      call.wasFault = true; call.tFault = performance.now();
+      if (slotCmd){ slotCmd.el.classList.remove("on"); slotCmd.el.classList.add("bad"); }
+      mark(call.dest, "fault", 2200); nFault++;
     }
+    return;
   }
-  stats.last = performance.now();
-  recent.push(stats.last);
-  row(f, dead);
+
+  // Beat three: the actuator consumed the command and reported back, so the
+  // last cord is placed and then the whole call is torn down.
+  const call = byCmd.get(f.command_id);
+  if (call && !call.wasFault && call.state !== "deliver" && call.state !== "clear"){
+    call.state = "deliver"; call.tDeliver = performance.now();
+    mark(call.dest, "live", 1200);
+  }
 }
 
-function flash(el, cls){
-  if (!el) return;
-  el.classList.add("hot", cls);
-  clearTimeout(el._t);
-  el._t = setTimeout(()=>el.classList.remove("hot", cls), 420);
+// A message occupies a hole chosen from its id, so repeated traffic reuses the
+// same holes and the field reads as a field rather than a random scatter.
+function holeFor(log, id){
+  const F = FIELD[log];
+  return F ? F.holes[id % F.n] : null;
 }
 
-function badge(x, y, text, kind){
-  const el = document.createElement("div");
-  el.className = "badge " + kind; el.textContent = text;
-  el.style.left = x + "px"; el.style.top = y + "px";
-  ov.appendChild(el);
-  badges.push({ el, until: performance.now() + 2600 });
-}
-
-function row(f, dead){
-  rows.unshift({ log:f.log, id:f.id, name:f.name, by:f.emitted_by, dead });
+function row(f){
+  rows.unshift({ log: f.log, id: f.id, name: f.name, by: f.emitted_by,
+                 dead: DEAD.has(f.log + ":" + f.id) });
   if (rows.length > 300) rows.pop();
   renderFeed();
 }
-
 function renderFeed(){
-  const box = document.getElementById("feedinner");
+  const box = document.getElementById("inner");
   if (!document.getElementById("feed").classList.contains("open")) return;
-  box.innerHTML = rows.slice(0,150).map(r =>
-    '<div class="frow' + (r.dead ? ' deadrow' : '') + '">' +
-      '<span class="tag ' + r.log + '">' + r.log + '</span>' +
-      '<span class="mid">' + r.id + '</span>' +
+  box.innerHTML = rows.slice(0, 150).map(r =>
+    '<div class="frow' + (r.dead ? ' dead' : '') + '">' +
+      '<span class="tag ' + r.log + '">' + r.log + '</span><span>' + r.id + '</span>' +
       '<span class="nm">' + r.name + '</span>' +
-      '<span class="by">' + (r.by||'') + '</span>' +
-      '<span class="ms">' + (r.dead ? 'dead' : '') + '</span>' +
-    '</div>').join("");
+      '<span class="by">' + (r.by || '') + '</span></div>').join("");
 }
 
 // ---------------------------------------------------------------------------
-// Render loop
+// The cords: straight runs between jacks. No sag, no swing — the board reads as
+// a wiring diagram that happens to be alive, and a taut line makes the path a
+// call took legible at a glance rather than something to trace through slack.
 // ---------------------------------------------------------------------------
-function ease(t){ return t<.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2; }
+const PATCH_MS = 420, CLEAR_MS = 380, STAGGER_MS = 170;
+const easeOut = t => 1 - Math.pow(1 - t, 3);
+const easeIn  = t => t * t;
 
-function curve(a, b, arc){
-  // control points: horizontal ease, or a big sweep for the return arc
-  if (arc){
-    const floor = H - 96;      // above the status bar, so the loop stays visible
-    return [{x:a.x,y:a.y},{x:a.x+40,y:floor},{x:b.x-60,y:floor},{x:b.x,y:b.y}];
+function endAt(leg, reach){
+  return { x: leg.a.x + (leg.b.x - leg.a.x) * reach,
+           y: leg.a.y + (leg.b.y - leg.a.y) * reach };
+}
+
+function run(a, b, color, w, dy){
+  ctx.strokeStyle = color; ctx.lineWidth = w; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(a.x, a.y + dy); ctx.lineTo(b.x, b.y + dy); ctx.stroke();
+}
+
+function drawRun(a, b, color, alpha, lit){
+  ctx.globalAlpha = alpha;
+  run(a, b, "rgba(0,0,0,.5)", 8, 3);                  // shadow on the board
+  run(a, b, color, 5, 0);                             // the braid
+  run(a, b, "rgba(255,255,255,.16)", 1.4, -1.3);      // highlight strand
+  if (lit > 0){
+    ctx.globalAlpha = alpha * .3;
+    run(a, b, "rgba(255,214,140,.9)", 10, 0);         // carrying a call
   }
-  const mx = (a.x + b.x) / 2;
-  return [{x:a.x,y:a.y},{x:mx,y:a.y},{x:mx,y:b.y},{x:b.x,y:b.y}];
-}
-function bez(p, t){
-  const u = 1-t, a = u*u*u, b = 3*u*u*t, c = 3*u*t*t, d = t*t*t;
-  return { x:a*p[0].x+b*p[1].x+c*p[2].x+d*p[3].x,
-           y:a*p[0].y+b*p[1].y+c*p[2].y+d*p[3].y };
-}
-function drawCurve(p, color, alpha, width){
-  ctx.strokeStyle = color; ctx.globalAlpha = alpha; ctx.lineWidth = width;
-  ctx.beginPath(); ctx.moveTo(p[0].x, p[0].y);
-  ctx.bezierCurveTo(p[1].x,p[1].y,p[2].x,p[2].y,p[3].x,p[3].y);
-  ctx.stroke(); ctx.globalAlpha = 1;
+  ctx.globalAlpha = 1;
+  plug(b.x, b.y, color);
+  plug(a.x, a.y, color);
 }
 
-let prev = performance.now();
+function plug(x, y, color){
+  ctx.fillStyle = "#241d14";
+  ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(x, y, 4.2, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.55)";
+  ctx.beginPath(); ctx.arc(x - 1.3, y - 1.6, 1.4, 0, Math.PI * 2); ctx.fill();
+}
+
+// Four legs: into the obs log, out to an operator, out to the cmd log, and out
+// to the actuator that consumed it. Each is a different message state.
+function legs(c){
+  const P = n => ({ x: n.x, y: n.y });
+  const out = [];
+  if (c.sensor && c.slotObs) out.push({ a: P(c.sensor), b: P(c.slotObs) });
+  if (c.slotObs && c.op)     out.push({ a: P(c.slotObs), b: { x: c.op.inX, y: c.op.y } });
+  if (c.op && c.slotCmd)     out.push({ a: { x: c.op.outX, y: c.op.y }, b: P(c.slotCmd) });
+  if (c.slotCmd && c.dest)   out.push({ a: P(c.slotCmd), b: P(c.dest) });
+  return out;
+}
+
+// reach 1 = seated, 0..1 = running out or being drawn back.
+function leg(c, i, L, color, reach, lit, alpha){
+  if (!L[i]) return;
+  drawRun(L[i].a, endAt(L[i], Math.max(0.001, reach)), color, alpha, lit);
+}
+
 function frame(now){
-  const dt = now - prev; prev = now;
-  ctx.clearRect(0,0,W,H);
+  ctx.clearRect(0, 0, W, H);
+  let live = 0;
 
-  // static rails — every role to the log beside it. Which decider serves which
-  // sensor is a runtime predicate, so the rails show reachability, not routing.
-  ctx.lineWidth = 1;
-  const o5 = logPt("obs",.5), c5 = logPt("cmd",.5);
-  if (o5 && c5){
-    for (const n of TOPO.sensors)   drawCurve(curve(pt("sensor/"+n), o5),  "#141c28", 1, 1);
-    for (const n of TOPO.deciders){ drawCurve(curve(o5, pt("decider/"+n)), "#141c28", 1, 1);
-                                    drawCurve(curve(pt("decider/"+n), c5), "#141c28", 1, 1); }
-    for (const n of TOPO.actuators) drawCurve(curve(c5, pt("actuator/"+n)), "#141c28", 1, 1);
-  }
+  for (const [key, c] of calls){
+    const L = legs(c);
+    const glow = .5 + .5 * Math.sin(now / 260);
 
-  // traces — the recent past, fading
-  for (let i = traces.length-1; i >= 0; i--){
-    const tr = traces[i];
-    const age = (now - tr.at) / TRACE_MS;
-    if (age >= 1){ traces.splice(i,1); continue; }
-    const alpha = Math.pow(1 - age, 2) * 0.30;   // squared: fades out of the way fast
-    for (const seg of tr.segs) drawCurve(seg.p, seg.color, alpha, tr.fail ? 1.6 : 1);
-  }
+    if (c.state === "held"){
+      if (!L.length){ calls.delete(key); continue; }
+      const t = Math.min(1, (now - c.t0) / PATCH_MS);
+      leg(c, 0, L, c.cord, easeOut(t), t >= 1 ? glow * .6 : 0, 1);
+      if (now - c.t0 > 20000){
+        if (c.slotObs) c.slotObs.el.classList.remove("on");
+        unmark(c.sensor, "busy"); calls.delete(key);
+      }
+      live++; continue;
+    }
 
-  // in-flight packets
-  for (let i = packets.length-1; i >= 0; i--){
-    const pk = packets[i];
-    const leg = pk.legs[pk.i];
-    pk.t += dt;
-    const t = Math.min(1, pk.t / leg.ms);
-    const p = curve(leg.from, leg.to, leg.arc);
-    const pos = bez(p, ease(t));
+    if (c.state === "patch"){
+      const t1 = Math.min(1, (now - c.tPatch) / PATCH_MS);
+      const t2 = Math.min(1, Math.max(0, now - c.tPatch - STAGGER_MS) / PATCH_MS);
+      leg(c, 0, L, c.cord, 1, glow * .6, 1);
+      leg(c, 1, L, c.cord, easeOut(t1), 0, 1);
+      if (t2 > 0) leg(c, 2, L, c.cord, easeOut(t2), 0, 1);
+      if (t2 >= 1){ c.state = c.wasFault ? "fault" : "waiting"; c.tWait = now; }
+      live++; continue;
+    }
 
-    drawCurve(p, leg.color, 0.30 + 0.5*Math.sin(t*Math.PI), pk.fail ? 2.4 : 2);
-    ctx.beginPath();
-    const grd = ctx.createRadialGradient(pos.x,pos.y,0,pos.x,pos.y,14);
-    grd.addColorStop(0, leg.color); grd.addColorStop(1, "rgba(0,0,0,0)");
-    ctx.fillStyle = grd; ctx.globalAlpha = .85;
-    ctx.arc(pos.x,pos.y,14,0,Math.PI*2); ctx.fill(); ctx.globalAlpha = 1;
-    ctx.beginPath(); ctx.fillStyle = "#fff";
-    ctx.arc(pos.x,pos.y,2.4,0,Math.PI*2); ctx.fill();
+    if (c.state === "waiting" || c.state === "fault"){
+      const fault = c.state === "fault";
+      for (let i = 0; i < 3; i++)
+        leg(c, i, L, fault && i === 2 ? "#5e2b27" : c.cord, 1, fault ? 0 : glow * .6, 1);
+      if (fault && now - c.tFault > 2600){ c.state = "clear"; c.tClear = now; }
+      live++; continue;
+    }
 
-    if (t >= 1){
-      pk.path.push({ p, color: leg.color });
-      if (leg.onEnd) leg.onEnd();
-      if (leg.node) flash(leg.node, leg.cls);
-      pk.i++;
-      pk.t = 0;
+    if (c.state === "deliver"){
+      const t = Math.min(1, (now - c.tDeliver) / PATCH_MS);
+      for (let i = 0; i < 3; i++) leg(c, i, L, c.cord, 1, glow, 1);
+      leg(c, 3, L, c.cord, easeOut(t), t >= 1 ? glow : 0, 1);
+      if (now - c.tDeliver > PATCH_MS + 600){ c.state = "clear"; c.tClear = now; }
+      live++; continue;
+    }
 
-      if (pk.i >= pk.legs.length){
-        traces.push({ at: now, segs: pk.path, fail: pk.fail });
-        while (traces.length > TRACE_MAX) traces.shift();
-        packets.splice(i,1);
+    if (c.state === "clear"){
+      // Drawn back far-end first, in the reverse order they were placed.
+      let done = true;
+      for (let i = L.length - 1; i >= 0; i--){
+        const delay = (L.length - 1 - i) * STAGGER_MS * 0.6;
+        const t = Math.min(1, Math.max(0, now - c.tClear - delay) / CLEAR_MS);
+        if (t < 1){ leg(c, i, L, c.cord, 1 - easeIn(t), 0, 1 - t * .5); done = false; }
+      }
+      if (done){
+        if (c.slotObs) c.slotObs.el.classList.remove("on");
+        if (c.slotCmd) c.slotCmd.el.classList.remove("on", "bad");
+        unmark(c.dest, "busy"); unmark(c.op, "busy"); unmark(c.sensor, "busy");
+        calls.delete(key);
       }
     }
   }
 
-  // badges expire
-  for (let i = badges.length-1; i >= 0; i--){
-    if (now > badges[i].until){ badges[i].el.remove(); badges.splice(i,1); }
+  document.getElementById("rCalls").textContent = nCalls;
+  document.getElementById("rLive").textContent = live;
+  document.getElementById("rFault").textContent = nFault;
+  const rl = document.getElementById("rLast");
+  if (lastAt){
+    const s = Math.floor((now - lastAt) / 1000);
+    rl.textContent = live ? "connecting"
+                   : s < 10 ? "call cleared"
+                   : s < 60 ? "quiet · " + s + "s"
+                            : "quiet · " + Math.floor(s / 60) + "m";
   }
-
-  // stats
-  document.getElementById("sObs").textContent = stats.obs;
-  document.getElementById("sCmd").textContent = stats.cmd;
-    // Rate over the last minute. Observed latency was dropped: the tap batches an
-  // observation and its command into one POST, so the gap measured my own
-  // batching rather than the decider.
-  const cut = now - 60000;
-  while (recent.length && recent[0] < cut) recent.shift();
-  document.getElementById("sRate").textContent = recent.length + "/min";
-  document.getElementById("sDead").textContent = DEAD.size;
-  const since = document.getElementById("since");
-  if (stats.last){
-    const secs = Math.floor((now - stats.last)/1000);
-    const txt = secs < 60 ? secs + "s ago" : Math.floor(secs/60) + "m ago";
-    document.getElementById("sLast").textContent = "last event " + txt;
-    // "quiet" only when nothing is moving AND nothing landed recently — it read
-    // as quiet mid-burst before, because it only looked at in-flight packets.
-    since.textContent = packets.length ? packets.length + " in flight"
-                      : secs < 10     ? "active"
-                                      : "quiet · " + txt;
-  }
-
   requestAnimationFrame(frame);
 }
 
 // ---------------------------------------------------------------------------
-// Transport: SSE, with EventSource's native reconnect. On reconnect the hello
-// frame re-sends backfill, because frames missed during the gap are gone.
-// ---------------------------------------------------------------------------
 function connect(){
   const es = new EventSource("/dashboard/stream");
   es.onmessage = ev => {
-    const msg = JSON.parse(ev.data);
-    if (msg.type === "hello"){
-      TOPO = msg.topology; layout();
-      (msg.dead || []).forEach(d => DEAD.add(d.log + ":" + d.id));
+    const m = JSON.parse(ev.data);
+    if (m.type === "hello"){
+      TOPO = m.topology; layout();
+      (m.dead || []).forEach(d => DEAD.add(d.log + ":" + d.id));
       rows.length = 0;
-      for (const f of msg.backfill) ingest(f, true);   // replay: no animation
+      for (const f of m.backfill) ingest(f, true);
       renderFeed();
-      document.getElementById("since").textContent = "connected";
-    } else if (msg.type === "event"){
-      ingest(msg.frame, false);
-    } else if (msg.type === "dead"){
-      DEAD.clear();
-      (msg.dead || []).forEach(d => DEAD.add(d.log + ":" + d.id));
+    } else if (m.type === "event"){
+      ingest(m.frame, false);
+    } else if (m.type === "dead"){
+      DEAD.clear(); (m.dead || []).forEach(d => DEAD.add(d.log + ":" + d.id));
       renderFeed();
     }
   };
-  es.onerror = () => { document.getElementById("since").textContent = "reconnecting…"; };
 }
 
 document.getElementById("toggle").onclick = e => {
   const f = document.getElementById("feed");
   f.classList.toggle("open");
-  e.target.textContent = f.classList.contains("open") ? "▼ feed" : "▲ feed";
+  e.target.textContent = f.classList.contains("open") ? "▼ log book" : "▲ log book";
   renderFeed();
-  // The drawer changes the stage height without firing a resize, so nothing
-  // recomputed and the spine kept its old geometry.
   f.addEventListener("transitionend", layout, { once: true });
 };
 addEventListener("resize", layout);
