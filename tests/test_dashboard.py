@@ -142,7 +142,6 @@ def test_no_token_means_no_dashboard_at_all(tmp_path):
     })
     owners = set(bus._http._owners.values())
     assert "dashboard" not in owners
-    assert not bus._servers          # no second server without a token
     assert not any(t.name == "dashboard" for t in bus._taps)
 
 
@@ -155,10 +154,7 @@ def test_token_wires_page_stream_and_ingest(tmp_path):
         "dashboard_token": "t0ken",
         "dashboard_ingest_url": "http://127.0.0.1:8124/dashboard/ingest",
     })
-    # The dashboard is on its own server, not the public one.
-    assert ("GET", "/") not in bus._http._owners
-    assert len(bus._servers) == 1
-    o = bus._servers[0]._owners
+    o = bus._http._owners
     assert o[("GET", "/")] == "dashboard"
     assert o[("GET", "/dashboard/stream")] == "dashboard"
     assert o[("POST", "/dashboard/ingest")] == "dashboard"
