@@ -26,26 +26,25 @@ python -m pytest -q
    ./scripts/vendor-mamamia.sh          # MAMAMIA_DIR=../mamamia by default
    ```
 2. `cp .env.example .env` and fill it in (`chmod 600 .env`).
-   `GITHUB_WEBHOOK_SECRET` and `TUNNEL_TOKEN` are required; the Discord block is
-   optional — see below.
+   `GITHUB_WEBHOOK_SECRET` is required; the Discord block is optional — see below.
 3. `docker compose up -d --build`
 4. Point the GitHub webhook at the tunnel hostname's `/webhook`, content-type
    `application/json`, with the same secret.
 
-### Ingress: two tunnel modes
+### Ingress
 
-The app is published on **loopback only** (`127.0.0.1:8080`), never on the LAN.
-Pick whichever connector you already have — the Public Hostname origin differs:
+This stack does **not** ship a tunnel. It publishes the app on **loopback only**
+(`127.0.0.1:8080` — never the LAN) and stops there; getting traffic to the host
+is the host's job.
 
-| mode | run with | origin to configure |
-|---|---|---|
-| **cloudflared already a host service** (typical on a Pi) | `docker compose up -d` | `http://localhost:8080` |
-| **no host cloudflared** — use the bundled container | `docker compose --profile tunnel up -d` (needs `TUNNEL_TOKEN`) | `http://switchboard:8080` |
+Point whatever you already run — cloudflared, nginx, caddy — at:
 
-Don't run both: two connectors for one tunnel is redundant. The bundled service
-sits behind a compose profile so it stays off unless you ask for it.
+```
+http://localhost:8080
+```
 
-GitHub's webhook then points at that public hostname's `/webhook`.
+GitHub's webhook then targets that public hostname's `/webhook`. Nothing in this
+repo needs tunnel credentials.
 
 ## Discord (optional)
 Leave `DISCORD_BOT_TOKEN` empty to run GitHub-only — no bot, no slash commands,
