@@ -27,4 +27,7 @@ build-backend = "setuptools.build_meta"
 # Explicit, so setuptools never falls back to flat-layout auto-discovery and
 # trips over a sibling directory (vendor/, data/, docs/) in the project root.
 [tool.setuptools]
-packages = ["switchboard"]
+packages = ["switchboard", "switchboard.dashboard"]
+
+[tool.setuptools.package-data]
+"switchboard.dashboard" = ["page.html"]

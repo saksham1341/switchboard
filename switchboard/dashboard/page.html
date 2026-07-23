@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Switchboard</title>
+<style>
+  :root{
+    --bg:#070a0f; --panel:#0f1621; --line:#1c2534; --dim:#66718a; --ink:#e9edf5;
+    --g:#34d399; --b:#38bdf8; --a:#fbbf24; --r:#f87171; --violet:#a78bfa;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:radial-gradient(130% 100% at 50% -10%,#101a29 0%,var(--bg) 65%);
+    color:var(--ink); font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+
+  header{display:flex;align-items:baseline;gap:14px;padding:14px 20px 8px}
+  header h1{font-size:14px;font-weight:600;letter-spacing:.5px;margin:0}
+  header .sub{color:var(--dim);font-size:11px}
+  .live{display:inline-flex;align-items:center;gap:6px;color:var(--g);font-size:11px}
+  .live i{width:7px;height:7px;border-radius:50%;background:var(--g);
+          box-shadow:0 0 10px var(--g);animation:beat 2.4s ease-in-out infinite}
+  @keyframes beat{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1)}}
+
+  /* ---------- stage ---------- */
+  #stage{position:relative;flex:1;min-height:0}
+  #flow{position:absolute;inset:0;width:100%;height:100%}
+  #overlay{position:absolute;inset:0;pointer-events:none}
+
+  .bandcap{position:absolute;color:var(--dim);font-size:9px;letter-spacing:1.6px;
+           transform:translateX(-50%);white-space:nowrap}
+  .node{position:absolute;transform:translate(-50%,-50%);background:var(--panel);
+        border:1px solid var(--line);border-radius:8px;padding:7px 11px;font-size:11px;
+        white-space:nowrap;transition:border-color .25s,color .25s,box-shadow .25s,transform .12s}
+  .node .kind{display:block;color:var(--dim);font-size:8px;letter-spacing:1px;margin-bottom:1px}
+  .node.hot{transform:translate(-50%,-50%) scale(1.06)}
+  .node.hot.g{border-color:var(--g);color:var(--g);box-shadow:0 0 26px -6px var(--g)}
+  .node.hot.b{border-color:var(--b);color:var(--b);box-shadow:0 0 26px -6px var(--b)}
+  .node.hot.v{border-color:var(--violet);color:var(--violet);box-shadow:0 0 26px -6px var(--violet)}
+  .node.dead{border-color:var(--r);color:var(--r);box-shadow:0 0 26px -6px var(--r)}
+
+  .logcol{position:absolute;transform:translateX(-50%);border:1px solid var(--line);
+          border-radius:8px;background:linear-gradient(180deg,#0b111a,#080d14);overflow:hidden}
+  .logcol .lbl{position:absolute;top:8px;left:50%;transform:translateX(-50%);
+               color:var(--dim);font-size:9px;letter-spacing:2px;writing-mode:vertical-rl}
+
+  .badge{position:absolute;transform:translate(-50%,-50%);border-radius:5px;padding:2px 7px;
+         font-size:9px;white-space:nowrap;pointer-events:none;
+         animation:pop .4s cubic-bezier(.2,1.4,.4,1) both}
+  @keyframes pop{from{opacity:0;transform:translate(-50%,-30%) scale(.8)}
+                 to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+  .badge.lat{background:#0d2a21;color:var(--g);border:1px solid #1c4a3c}
+  .badge.slow{background:#2b1d0c;color:var(--a);border:1px solid #4a3a17}
+  .badge.err{background:#2b1212;color:var(--r);border:1px solid #4a1f1f}
+
+  /* ---------- status bar + feed drawer ---------- */
+  #bar{display:flex;justify-content:space-between;align-items:center;gap:16px;
+       padding:8px 20px;border-top:1px solid var(--line);background:#0a0f17;font-size:11px}
+  #bar .stats{display:flex;gap:18px;color:var(--dim)}
+  #bar .stats b{color:var(--ink);font-weight:500}
+  #bar button{background:transparent;border:1px solid var(--line);color:var(--b);
+              border-radius:6px;padding:4px 10px;font:inherit;font-size:11px;cursor:pointer}
+  #bar button:hover{border-color:var(--b)}
+
+  #feed{height:0;overflow:hidden;transition:height .32s cubic-bezier(.2,.7,.3,1);
+        background:#070b11;border-top:1px solid transparent}
+  #feed.open{height:210px;border-top-color:var(--line)}
+  #feedinner{height:210px;overflow-y:auto;padding:6px 0}
+  .frow{display:grid;grid-template-columns:46px 52px 1fr 190px 74px;gap:10px;
+        padding:3px 20px;cursor:default;font-size:11px}
+  .frow:hover{background:#0e1621}
+  .frow.sel{background:#12202e}
+  .tag{border-radius:3px;padding:0 5px;font-size:9px;text-align:center}
+  .tag.obs{background:#0d3b2e;color:var(--g)} .tag.cmd{background:#0b3550;color:var(--b)}
+  .mid{color:var(--dim)} .nm{color:var(--ink);overflow:hidden;text-overflow:ellipsis}
+  .by{color:#56617a;overflow:hidden;text-overflow:ellipsis}
+  .ms{color:var(--dim);text-align:right}
+  .frow.deadrow .nm{color:var(--r)}
+
+  .hint{position:absolute;left:20px;bottom:14px;color:#3d465c;font-size:10px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SWITCHBOARD</h1>
+  <span class="live"><i></i>live</span>
+  <span class="sub" id="since">idle</span>
+</header>
+
+<div id="stage">
+  <canvas id="flow"></canvas>
+  <div id="overlay"></div>
+  <div class="hint">latency is <b>observed</b> &mdash; measured at the dashboard, not in the relay</div>
+</div>
+
+<div id="bar">
+  <div class="stats">
+    <span>obs <b id="sObs">0</b></span>
+    <span>cmd <b id="sCmd">0</b></span>
+    <span>dead <b id="sDead">0</b></span>
+    <span>p50~ <b id="sP50">—</b></span>
+    <span id="sLast">last event —</span>
+  </div>
+  <button id="toggle">▲ feed</button>
+</div>
+<div id="feed"><div id="feedinner"></div></div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Live data. Topology and backfill arrive in the SSE hello frame; every
+// subsequent frame is one real message off the obs or cmd log.
+// ---------------------------------------------------------------------------
+let TOPO = { sensors: [], deciders: [], actuators: [] };
+const DEAD = new Set();           // "log:id" of dead-lettered messages
+const pending = new Map();        // observation id -> partial journey
+
+const cv = document.getElementById("flow");
+const ov = document.getElementById("overlay");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+
+const P = {};   // "kind/name" -> {x,y,el}
+const LOG = {}; // "obs"|"cmd" -> {x,top,h,el}
+
+function layout(){
+  DPR = window.devicePixelRatio || 1;
+  const r = cv.getBoundingClientRect();
+  W = r.width; H = r.height;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+
+  ov.innerHTML = "";
+  const cols = [0.12, 0.315, 0.5, 0.685, 0.88].map(f => f * W);
+  const top = 62, bot = H - 74;
+
+  const band = (i, items, kind, cls) => {
+    const cap = document.createElement("div");
+    cap.className = "bandcap"; cap.textContent = kind;
+    cap.style.left = cols[i] + "px"; cap.style.top = (top - 26) + "px";
+    ov.appendChild(cap);
+    const span = bot - top;
+    items.forEach((name, k) => {
+      const y = items.length === 1 ? (top + span/2)
+              : top + (span * (k + .5)) / items.length;
+      const el = document.createElement("div");
+      el.className = "node " + cls;
+      el.innerHTML = '<span class="kind">' + kind.slice(0,3) + '</span>' + name;
+      el.style.left = cols[i] + "px"; el.style.top = y + "px";
+      ov.appendChild(el);
+      P[kind + "/" + name] = { x: cols[i], y, el };
+    });
+  };
+
+  const logcol = (i, id, label) => {
+    const w = 34, h = bot - top;
+    const el = document.createElement("div");
+    el.className = "logcol";
+    el.style.left = cols[i] + "px"; el.style.top = top + "px";
+    el.style.width = w + "px"; el.style.height = h + "px";
+    // No depth, no counts: how a log should represent itself is a question for
+    // the running system, not a mockup.
+    el.innerHTML = '<div class="lbl">' + label + '</div>';
+    ov.appendChild(el);
+    LOG[id] = { x: cols[i], top, h, el };
+  };
+
+  band(0, TOPO.sensors, "sensor", "g");
+  logcol(1, "obs", "OBS");
+  band(2, TOPO.deciders, "decider", "v");
+  logcol(3, "cmd", "CMD");
+  band(4, TOPO.actuators, "actuator", "b");
+}
+
+const traces = [];
+const packets = [];
+const badges = [];
+const rows = [];
+const stats = { obs:0, cmd:0, dead:0, lat:[], last:null };
+const TRACE_MS = 60000;
+
+function pt(id){ return P[id]; }
+function logPt(id, frac){ const L = LOG[id]; return L ? { x:L.x, y:L.top + L.h*frac } : null; }
+
+// A frame names its emitter as "kind/name", which is exactly a node id.
+function nodeFor(emitted_by){ return emitted_by ? P[emitted_by] : null; }
+
+function animate(from, to, color, ms, node, cls, arc){
+  if (!from || !to) return;
+  packets.push({ legs:[{ from, to, ms, color, node, cls, arc, onEnd:null }],
+                 i:0, t:0, path:[], started:performance.now(), fail:false });
+}
+
+// ---------------------------------------------------------------------------
+// One real frame -> one animated hop. The dashboard reconstructs journeys from
+// causal links; it never invents a hop it did not see.
+// ---------------------------------------------------------------------------
+function ingest(f, replay){
+  const frac = 0.25 + ((f.id * 37) % 50) / 100;
+  const o = logPt("obs", frac), c = logPt("cmd", frac);
+  const src = nodeFor(f.emitted_by);
+  const dead = DEAD.has(f.log + ":" + f.id);
+
+  if (f.log === "obs"){
+    stats.obs++;
+    if (f.command_id != null){
+      // A result observation: the actuator reporting back.
+      if (!replay) animate(src, o, "#34d399", 140, src && src.el, "b", true);
+    } else if (!replay){
+      animate(src, o, "#34d399", 120, src && src.el, "g");
+      // The decider hop is drawn when its command appears, not guessed here.
+      pending.set(f.id, { at: performance.now(), obsPoint: o });
+    }
+  } else {
+    stats.cmd++;
+    const dec = nodeFor(f.emitted_by);
+    const act = P["actuator/" + f.name];
+    const prior = pending.get(f.observation_id);
+    if (!replay){
+      if (prior && dec){
+        animate(prior.obsPoint, dec, "#a78bfa", 180, dec.el, "v");
+        setTimeout(()=>animate(dec, c, "#a78bfa", 120, null, null), 180);
+        const observed = Math.round(performance.now() - prior.at);
+        stats.lat.push(observed); if (stats.lat.length > 60) stats.lat.shift();
+        badge(dec.x, dec.y - 44, "~" + observed + "ms", observed > 800 ? "slow" : "lat");
+      }
+      setTimeout(()=>{
+        animate(c, act, "#38bdf8", 200, act && act.el, "b");
+        if (dead && act){
+          act.el.classList.add("dead");
+          setTimeout(()=>act.el.classList.remove("dead"), 1600);
+          badge(act.x, act.y - 44, "dead", "err");
+        }
+      }, 320);
+      pending.delete(f.observation_id);
+    }
+  }
+
+  stats.last = performance.now();
+  row(f, dead);
+}
+
+function flash(el, cls){
+  if (!el) return;
+  el.classList.add("hot", cls);
+  clearTimeout(el._t);
+  el._t = setTimeout(()=>el.classList.remove("hot", cls), 420);
+}
+
+function badge(x, y, text, kind){
+  const el = document.createElement("div");
+  el.className = "badge " + kind; el.textContent = text;
+  el.style.left = x + "px"; el.style.top = y + "px";
+  ov.appendChild(el);
+  badges.push({ el, until: performance.now() + 2600 });
+}
+
+function row(f, dead){
+  rows.unshift({ log:f.log, id:f.id, name:f.name, by:f.emitted_by, dead });
+  if (rows.length > 300) rows.pop();
+  renderFeed();
+}
+
+function renderFeed(){
+  const box = document.getElementById("feedinner");
+  if (!document.getElementById("feed").classList.contains("open")) return;
+  box.innerHTML = rows.slice(0,150).map(r =>
+    '<div class="frow' + (r.dead ? ' deadrow' : '') + '">' +
+      '<span class="tag ' + r.log + '">' + r.log + '</span>' +
+      '<span class="mid">' + r.id + '</span>' +
+      '<span class="nm">' + r.name + '</span>' +
+      '<span class="by">' + (r.by||'') + '</span>' +
+      '<span class="ms">' + (r.dead ? 'dead' : '') + '</span>' +
+    '</div>').join("");
+}
+
+// ---------------------------------------------------------------------------
+// Render loop
+// ---------------------------------------------------------------------------
+function ease(t){ return t<.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2; }
+
+function curve(a, b, arc){
+  // control points: horizontal ease, or a big sweep for the return arc
+  if (arc) return [{x:a.x, y:a.y}, {x:a.x+40, y:H-24}, {x:b.x-60, y:H-24}, {x:b.x, y:b.y}];
+  const mx = (a.x + b.x) / 2;
+  return [{x:a.x,y:a.y},{x:mx,y:a.y},{x:mx,y:b.y},{x:b.x,y:b.y}];
+}
+function bez(p, t){
+  const u = 1-t, a = u*u*u, b = 3*u*u*t, c = 3*u*t*t, d = t*t*t;
+  return { x:a*p[0].x+b*p[1].x+c*p[2].x+d*p[3].x,
+           y:a*p[0].y+b*p[1].y+c*p[2].y+d*p[3].y };
+}
+function drawCurve(p, color, alpha, width){
+  ctx.strokeStyle = color; ctx.globalAlpha = alpha; ctx.lineWidth = width;
+  ctx.beginPath(); ctx.moveTo(p[0].x, p[0].y);
+  ctx.bezierCurveTo(p[1].x,p[1].y,p[2].x,p[2].y,p[3].x,p[3].y);
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+
+let prev = performance.now();
+function frame(now){
+  const dt = now - prev; prev = now;
+  ctx.clearRect(0,0,W,H);
+
+  // static rails — every role to the log beside it. Which decider serves which
+  // sensor is a runtime predicate, so the rails show reachability, not routing.
+  ctx.lineWidth = 1;
+  const o5 = logPt("obs",.5), c5 = logPt("cmd",.5);
+  if (o5 && c5){
+    for (const n of TOPO.sensors)   drawCurve(curve(pt("sensor/"+n), o5),  "#141c28", 1, 1);
+    for (const n of TOPO.deciders){ drawCurve(curve(o5, pt("decider/"+n)), "#141c28", 1, 1);
+                                    drawCurve(curve(pt("decider/"+n), c5), "#141c28", 1, 1); }
+    for (const n of TOPO.actuators) drawCurve(curve(c5, pt("actuator/"+n)), "#141c28", 1, 1);
+  }
+
+  // traces — the recent past, fading
+  for (let i = traces.length-1; i >= 0; i--){
+    const tr = traces[i];
+    const age = (now - tr.at) / TRACE_MS;
+    if (age >= 1){ traces.splice(i,1); continue; }
+    const alpha = (1 - age) * 0.55;
+    for (const seg of tr.segs) drawCurve(seg.p, seg.color, alpha, tr.fail ? 2 : 1.6);
+  }
+
+  // in-flight packets
+  for (let i = packets.length-1; i >= 0; i--){
+    const pk = packets[i];
+    const leg = pk.legs[pk.i];
+    pk.t += dt;
+    const t = Math.min(1, pk.t / leg.ms);
+    const p = curve(leg.from, leg.to, leg.arc);
+    const pos = bez(p, ease(t));
+
+    drawCurve(p, leg.color, 0.30 + 0.5*Math.sin(t*Math.PI), pk.fail ? 2.4 : 2);
+    ctx.beginPath();
+    const grd = ctx.createRadialGradient(pos.x,pos.y,0,pos.x,pos.y,14);
+    grd.addColorStop(0, leg.color); grd.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = grd; ctx.globalAlpha = .85;
+    ctx.arc(pos.x,pos.y,14,0,Math.PI*2); ctx.fill(); ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.fillStyle = "#fff";
+    ctx.arc(pos.x,pos.y,2.4,0,Math.PI*2); ctx.fill();
+
+    if (t >= 1){
+      pk.path.push({ p, color: leg.color });
+      if (leg.onEnd) leg.onEnd();
+      if (leg.node) flash(leg.node, leg.cls);
+      pk.i++;
+      pk.t = 0;
+
+      if (pk.i >= pk.legs.length){
+        traces.push({ at: now, segs: pk.path, fail: pk.fail });
+        packets.splice(i,1);
+      }
+    }
+  }
+
+  // badges expire
+  for (let i = badges.length-1; i >= 0; i--){
+    if (now > badges[i].until){ badges[i].el.remove(); badges.splice(i,1); }
+  }
+
+  // stats
+  document.getElementById("sObs").textContent = stats.obs;
+  document.getElementById("sCmd").textContent = stats.cmd;
+    if (stats.lat.length){
+    const s = [...stats.lat].sort((a,b)=>a-b);
+    document.getElementById("sP50").textContent = s[(s.length/2)|0] + "ms";
+  }
+  document.getElementById("sDead").textContent = DEAD.size;
+  const since = document.getElementById("since");
+  if (stats.last){
+    const secs = Math.floor((performance.now() - stats.last)/1000);
+    const txt = secs < 60 ? secs + "s ago" : Math.floor(secs/60) + "m ago";
+    document.getElementById("sLast").textContent = "last event " + txt;
+    since.textContent = packets.length ? packets.length + " in flight" : "quiet · " + txt;
+  }
+
+  requestAnimationFrame(frame);
+}
+
+// ---------------------------------------------------------------------------
+// Transport: SSE, with EventSource's native reconnect. On reconnect the hello
+// frame re-sends backfill, because frames missed during the gap are gone.
+// ---------------------------------------------------------------------------
+function connect(){
+  const es = new EventSource("/dashboard/stream");
+  es.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "hello"){
+      TOPO = msg.topology; layout();
+      (msg.dead || []).forEach(d => DEAD.add(d.log + ":" + d.id));
+      rows.length = 0;
+      for (const f of msg.backfill) ingest(f, true);   // replay: no animation
+      renderFeed();
+      document.getElementById("since").textContent = "connected";
+    } else if (msg.type === "event"){
+      ingest(msg.frame, false);
+    } else if (msg.type === "dead"){
+      DEAD.clear();
+      (msg.dead || []).forEach(d => DEAD.add(d.log + ":" + d.id));
+      renderFeed();
+    }
+  };
+  es.onerror = () => { document.getElementById("since").textContent = "reconnecting…"; };
+}
+
+document.getElementById("toggle").onclick = e => {
+  const f = document.getElementById("feed");
+  f.classList.toggle("open");
+  e.target.textContent = f.classList.contains("open") ? "▼ feed" : "▲ feed";
+  renderFeed();
+};
+addEventListener("resize", layout);
+
+layout();
+requestAnimationFrame(frame);
+connect();
+</script>
+</body>
+</html>
