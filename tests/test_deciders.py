@@ -1,6 +1,7 @@
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
-from switchboard.message import Observation, DecideCtx
+from switchboard.message import Observation, DecideCtx, DeciderCtx
+from switchboard.store import MemoryStore
 
 
 def _obs(name, payload): return Observation(id=1, name=name, payload=payload)
@@ -15,6 +16,7 @@ def _ctx(obs, rec): return DecideCtx(obs=obs, _emit_command=rec)
 async def test_github_notify_emits_discord_post():
     rec = _Rec()
     d = GitHubNotifyDecider(channel_id="chan-9")
+    d.bind(DeciderCtx(store=MemoryStore()))
     obs = _obs("github.home.pr.opened",
                {"repository": {"full_name": "yp/home", "html_url": "https://github.com/yp/home"},
                 "sender": {"login": "alice"},
@@ -31,6 +33,7 @@ async def test_github_notify_emits_discord_post():
 async def test_github_notify_skips_unknown_kind():
     rec = _Rec()
     d = GitHubNotifyDecider(channel_id="c")
+    d.bind(DeciderCtx(store=MemoryStore()))
     obs = _obs("github.home.pr.locked", {})
     await d.decide(obs, _ctx(obs, rec))
     assert rec.cmds == []
@@ -39,6 +42,7 @@ async def test_github_notify_skips_unknown_kind():
 async def test_ping_and_echo_emit_reply():
     rec = _Rec()
     p = PingDecider()
+    p.bind(DeciderCtx(store=MemoryStore()))
     obs = _obs("discord.command.ping", {"interaction_token": "tok"})
     assert p.subscribes(obs)
     await p.decide(obs, _ctx(obs, rec))
@@ -46,6 +50,14 @@ async def test_ping_and_echo_emit_reply():
 
     rec2 = _Rec()
     e = EchoDecider()
+    e.bind(DeciderCtx(store=MemoryStore()))
     obs2 = _obs("discord.command.echo", {"interaction_token": "t2", "options": {"message": "hi"}})
     await e.decide(obs2, _ctx(obs2, rec2))
     assert rec2.cmds == [("discord.reply", {"interaction_token": "t2", "content": "hi"})]
+
+
+async def test_decider_ctx_store_is_scoped_and_usable():
+    d = PingDecider()
+    d.bind(DeciderCtx(store=MemoryStore()))
+    await d.ctx.store.set("debounce:pr-7", "1")
+    assert await d.ctx.store.get("debounce:pr-7") == "1"
