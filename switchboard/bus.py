@@ -12,16 +12,29 @@ from mamamia.server.registry import LogRegistry
 
 from switchboard.backoff import backoff
 from switchboard.errors import PermanentError
+from switchboard.http import HttpServer
 from switchboard.message import (
     OBS_LOG, CMD_LOG, Observation, Command, DecideCtx, ActCtx,
+    SensorCtx, DeciderCtx, ActuatorCtx, TapCtx,
 )
+from switchboard.scheduler import Scheduler
+from switchboard.store import MemoryStore, ScopedStore
 
 logger = logging.getLogger(__name__)
 
 
+def _as_async(fn):
+    """Wrap a sync callable so the scheduler, which awaits its callbacks, can
+    drive it. SqliteStore.purge is a plain method."""
+    async def call():
+        return fn()
+    return call
+
+
 class Bus:
-    def __init__(self, mamamia_db_path, *, default_timeout_s=30.0, wait_ms=30_000,
-                 reaper_interval=60.0, max_retries=10, max_log_messages=10_000, max_dead=500):
+    def __init__(self, mamamia_db_path, *, store=None, http=None,
+                 default_timeout_s=30.0, wait_ms=30_000, reaper_interval=60.0,
+                 max_retries=10, max_log_messages=10_000, max_dead=500):
         self._db = mamamia_db_path
         self._default_timeout_s = default_timeout_s
         self._wait_ms = wait_ms
@@ -36,12 +49,27 @@ class Bus:
         self._conn = None
         self._tasks: list[asyncio.Task] = []
         self._running = False
+        self._started = False
+        self._started_owners: list[str] = []
+        self._maintenance: list[str] = []
+
+        self._store = store if store is not None else MemoryStore()
+        # serve=False by default so tests register routes and drive .app
+        # without any of them binding a port.
+        self._http = http if http is not None else HttpServer(serve=False)
+        self._scheduler = Scheduler()
 
     # registration
     def add_sensor(self, s): self._sensors.append(s)
     def add_decider(self, d): self._deciders.append(d)
     def add_actuator(self, a): self._actuators.append(a)
     def add_tap(self, t): self._taps.append(t)
+
+    def schedule_maintenance(self, owner: str, seconds: float, fn) -> None:
+        """A timer owned by the bus rather than by any role. Started with the
+        bus; cancelled by stop_all() in stop()."""
+        self._scheduler.for_owner(owner).every(seconds, _as_async(fn), name=owner)
+        self._maintenance.append(owner)
 
     # emit
     async def _append(self, log, name, payload, *, command_id=None, observation_id=None) -> int:
@@ -61,6 +89,12 @@ class Bus:
         return await self._append(CMD_LOG, name, args, observation_id=observation_id)
 
     async def start(self) -> None:
+        if self._started:
+            raise RuntimeError(
+                "Bus.start() is single-use — routes and log consumers are "
+                "registered once. Construct a new Bus rather than restarting "
+                "this one.")
+        self._started = True
         self._conn = await connect(self._db)
         self._registry = LogRegistry(
             storage=SQLiteStorage(self._conn), state=SQLiteStateStore(self._conn),
@@ -72,6 +106,24 @@ class Bus:
         self._running = True
         self._registry.start_reaper(interval=self._reaper_interval)
 
+        def scoped(kind, name):
+            return ScopedStore(self._store, f"{kind}/{name}/")
+
+        for d in self._deciders:
+            d.bind(DeciderCtx(store=scoped("decider", d.name)))
+        for a in self._actuators:
+            a.bind(ActuatorCtx(store=scoped("actuator", a.name)))
+        for t in self._taps:
+            t.bind(TapCtx(store=scoped("tap", t.name)))
+        for s in self._sensors:
+            async def _emit(name, payload):
+                return await self.emit_observation(name, payload)
+            s.bind(SensorCtx(emit=_emit, http=self._http,
+                             store=scoped("sensor", s.name),
+                             schedule=self._scheduler.for_owner(s.name)))
+
+        await self._http.start()          # every route is registered by now
+
         for d in self._deciders:
             self._tasks.append(asyncio.create_task(self._run_decider(d)))
         for a in self._actuators:
@@ -80,22 +132,63 @@ class Bus:
             for log in t.logs:
                 self._tasks.append(asyncio.create_task(self._run_tap(t, log)))
         for s in self._sensors:
-            async def _emit(name, payload, _s=s):
-                return await self.emit_observation(name, payload)
-            self._tasks.append(asyncio.create_task(s.start(_emit)))
+            task = asyncio.create_task(s.start())
+            task.add_done_callback(lambda t, n=s.name: self._sensor_exited(n, t))
+            self._tasks.append(task)
+            self._scheduler.start(s.name)
+            self._started_owners.append(s.name)
+
+        for owner in self._maintenance:
+            self._scheduler.start(owner)
+
+    def _sensor_exited(self, name, task):
+        # A clean return is normal for a route-driven sensor and its timers must
+        # survive; only a crash takes them down.
+        if task.cancelled():
+            return
+        if task.exception() is not None:
+            logger.error("sensor %s died; stopping its timers", name,
+                         exc_info=task.exception())
+            self._tasks.append(asyncio.create_task(self._scheduler.stop(name)))
 
     async def stop(self) -> None:
         self._running = False
+
+        # 1. No new inbound work. uvicorn drains in-flight requests itself.
+        await self._http.stop()
+
+        # 2. Sensors down, each one's timers first: a scheduled callback must
+        #    never fire against a connection being torn down.
+        for name in self._started_owners:
+            await self._scheduler.stop(name)
         for s in self._sensors:
             try:
                 await s.stop()
             except Exception:
-                pass
+                logger.exception("sensor %s failed to stop", s.name)
+        await self._scheduler.stop_all()
+
+        # 3. Drain the consume loops before anything they depend on goes away.
         for t in self._tasks:
             t.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+
+        # 4. Now nothing is using them, so the clients can close.
+        for a in self._actuators:
+            close = getattr(a, "close", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:
+                    logger.exception("actuator %s failed to close", a.name)
+
+        # Symmetric with self._http.stop(): the Bus stops the platform pieces it
+        # was handed, whether or not it constructed them.
+        store_close = getattr(self._store, "close", None)
+        if store_close is not None:
+            store_close()
         if self._conn is not None:
             self._conn.close()
 
@@ -145,10 +238,10 @@ class Bus:
                             Observation.from_message, d.subscribes, handle)
 
     async def _run_actuator(self, a):
-        ctx_obj = a.context()
         async def handle(cmd):
-            ctx = ActCtx(cmd=cmd, context=ctx_obj,
-                         _emit_result=lambda name, payload, cid: self.emit_observation(name, payload, command_id=cid))
+            ctx = ActCtx(cmd=cmd,
+                         _emit_result=lambda name, payload, cid:
+                             self.emit_observation(name, payload, command_id=cid))
             await a.act(cmd, ctx)
         await self._consume(CMD_LOG, f"actuator/{a.name}",
                             Command.from_message, lambda c: c.name == a.name, handle)

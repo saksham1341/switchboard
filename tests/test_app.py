@@ -4,7 +4,9 @@ from switchboard.sensors.discord import DiscordSensor
 
 
 def _base(tmp_path):
-    return {"mamamia_db_path": str(tmp_path / "mm.db"), "github_secret": "s"}
+    return {"mamamia_db_path": str(tmp_path / "mm.db"),
+            "switchboard_db_path": str(tmp_path / "sb.db"),
+            "github_secret": "s"}
 
 
 def test_build_github_only(tmp_path):
@@ -57,3 +59,36 @@ def test_discord_commands_shape():
     assert isinstance(echo, CommandSpec)
     assert [o.name for o in echo.options] == ["message"]
     assert echo.options[0].type is str and echo.options[0].required is True
+
+
+def test_build_gives_the_bus_a_real_http_server_and_store(tmp_path):
+    from switchboard.http import HttpServer
+    from switchboard.store import SqliteStore
+    bus, sensors = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s",
+        "port": 8099,
+    })
+    assert isinstance(bus._http, HttpServer)
+    assert isinstance(bus._store, SqliteStore)
+
+
+def test_github_sensor_no_longer_takes_port_or_seen_db(tmp_path):
+    import inspect
+    from switchboard.sensors.github import GitHubSensor
+    params = inspect.signature(GitHubSensor.__init__).parameters
+    assert "port" not in params and "seen_db" not in params and "host" not in params
+
+
+async def test_maintenance_timer_is_registered_and_started(tmp_path):
+    from switchboard.bus import Bus
+    from tests.test_bus import _wait
+    calls = []
+    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus.schedule_maintenance("store", 0.02, lambda: calls.append(1))
+    await bus.start()
+    try:
+        await _wait(lambda: len(calls) >= 2)
+    finally:
+        await bus.stop()

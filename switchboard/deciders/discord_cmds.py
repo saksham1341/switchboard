@@ -5,6 +5,9 @@ from switchboard.message import DecideCtx, Observation
 class PingDecider:
     name = "ping"
 
+    def bind(self, ctx) -> None:
+        self.ctx = ctx
+
     def subscribes(self, obs: Observation) -> bool:
         return obs.name == "discord.command.ping"
 
@@ -17,6 +20,9 @@ class PingDecider:
 
 class EchoDecider:
     name = "echo"
+
+    def bind(self, ctx) -> None:
+        self.ctx = ctx
 
     def subscribes(self, obs: Observation) -> bool:
         return obs.name == "discord.command.echo"

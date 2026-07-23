@@ -121,6 +121,10 @@ class GitHubNotifyDecider:
 
     def __init__(self, channel_id: str):
         self.channel_id = channel_id
+        self.ctx = None
+
+    def bind(self, ctx) -> None:
+        self.ctx = ctx
 
     def subscribes(self, obs: Observation) -> bool:
         return obs.name.startswith("github.")

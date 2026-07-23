@@ -9,6 +9,10 @@ class LoggerTap:
 
     def __init__(self, stream=None):
         self._stream = stream or sys.stdout
+        self.ctx = None
+
+    def bind(self, ctx) -> None:
+        self.ctx = ctx
 
     async def observe(self, log, view) -> None:
         line = {"log": log, "id": view.id, "name": view.name,
