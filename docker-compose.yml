@@ -16,6 +16,13 @@ services:
       # no GitHub events relayed into Discord.
       DISCORD_GITHUB_NOTIFY_CHANNEL_ID: ${DISCORD_GITHUB_NOTIFY_CHANNEL_ID:-}
 
+      # --- Dashboard ---
+      # Set a token to enable the live dashboard; unset = no dashboard at all.
+      # It serves on the main port, so the public tunnel reaches it. The page is
+      # structure-only (names, ids, causal links — never payloads or tokens),
+      # which is what makes public exposure acceptable.
+      SB_DASHBOARD_TOKEN: ${SB_DASHBOARD_TOKEN:-}
+
       # --- Tuning ---
       SB_MAX_LOG_MESSAGES: ${SB_MAX_LOG_MESSAGES:-10000}
       SB_PORT: ${SB_PORT:-8080}
