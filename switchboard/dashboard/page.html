@@ -42,10 +42,16 @@
   .node.hot.v{border-color:var(--violet);color:var(--violet);box-shadow:0 0 26px -6px var(--violet)}
   .node.dead{border-color:var(--r);color:var(--r);box-shadow:0 0 26px -6px var(--r)}
 
-  .logcol{position:absolute;transform:translateX(-50%);border:1px solid var(--line);
-          border-radius:8px;background:linear-gradient(180deg,#0b111a,#080d14);overflow:hidden}
-  .logcol .lbl{position:absolute;top:8px;left:50%;transform:translateX(-50%);
-               color:var(--dim);font-size:9px;letter-spacing:2px;writing-mode:vertical-rl}
+  /* A log is a boundary and a count, not a container: a seam events cross,
+     and the monotonic id of the last message to cross it. Nothing here can be
+     misread as depth, because nothing here grows. */
+  .logseam{position:absolute;width:1px;transform:translateX(-50%);
+           background:linear-gradient(180deg,transparent,#243044 12%,#243044 88%,transparent)}
+  .logtag{position:absolute;transform:translateX(-50%);text-align:center;white-space:nowrap;
+          color:var(--dim);font-size:9px;letter-spacing:2px}
+  .logtag b{display:block;color:#7f8ba3;font-weight:500;letter-spacing:0;font-size:10px;
+            margin-top:2px;transition:color .3s}
+  .logtag.pulse b{color:var(--b)}
 
   .badge{position:absolute;transform:translate(-50%,-50%);border-radius:5px;padding:2px 7px;
          font-size:9px;white-space:nowrap;pointer-events:none;
@@ -102,7 +108,7 @@
     <span>obs <b id="sObs">0</b></span>
     <span>cmd <b id="sCmd">0</b></span>
     <span>dead <b id="sDead">0</b></span>
-    <span>p50~ <b id="sP50">—</b></span>
+    <span>rate <b id="sRate">—</b></span>
     <span id="sLast">last event —</span>
   </div>
   <button id="toggle">▲ feed</button>
@@ -142,10 +148,13 @@ function layout(){
     cap.className = "bandcap"; cap.textContent = kind;
     cap.style.left = cols[i] + "px"; cap.style.top = (top - 26) + "px";
     ov.appendChild(cap);
-    const span = bot - top;
+    // Cap the spread: a full-height band throws the bezier control points so
+    // far apart that curves bow out of the stage entirely.
+    const span = Math.min(bot - top, 130 * items.length);
+    const y0 = (top + bot) / 2 - span / 2;
     items.forEach((name, k) => {
-      const y = items.length === 1 ? (top + span/2)
-              : top + (span * (k + .5)) / items.length;
+      const y = items.length === 1 ? (top + bot) / 2
+              : y0 + (span * (k + .5)) / items.length;
       const el = document.createElement("div");
       el.className = "node " + cls;
       el.innerHTML = '<span class="kind">' + kind.slice(0,3) + '</span>' + name;
@@ -156,16 +165,20 @@ function layout(){
   };
 
   const logcol = (i, id, label) => {
-    const w = 34, h = bot - top;
-    const el = document.createElement("div");
-    el.className = "logcol";
-    el.style.left = cols[i] + "px"; el.style.top = top + "px";
-    el.style.width = w + "px"; el.style.height = h + "px";
-    // No depth, no counts: how a log should represent itself is a question for
-    // the running system, not a mockup.
-    el.innerHTML = '<div class="lbl">' + label + '</div>';
-    ov.appendChild(el);
-    LOG[id] = { x: cols[i], top, h, el };
+    const h = bot - top;
+    const seam = document.createElement("div");
+    seam.className = "logseam";
+    seam.style.left = cols[i] + "px"; seam.style.top = top + "px";
+    seam.style.height = h + "px";
+    ov.appendChild(seam);
+
+    const tag = document.createElement("div");
+    tag.className = "logtag";
+    tag.style.left = cols[i] + "px"; tag.style.top = (top - 30) + "px";
+    tag.innerHTML = label + '<b>&mdash;</b>';
+    ov.appendChild(tag);
+
+    LOG[id] = { x: cols[i], top, h, seam, tag, count: tag.querySelector("b") };
   };
 
   band(0, TOPO.sensors, "sensor", "g");
@@ -179,8 +192,10 @@ const traces = [];
 const packets = [];
 const badges = [];
 const rows = [];
-const stats = { obs:0, cmd:0, dead:0, lat:[], last:null };
-const TRACE_MS = 60000;
+const stats = { obs:0, cmd:0, dead:0, last:null };
+const recent = [];   // arrival times, for the per-minute rate
+const TRACE_MS = 22000;
+const TRACE_MAX = 14;          // beyond this, older journeys are indistinguishable
 
 function pt(id){ return P[id]; }
 function logPt(id, frac){ const L = LOG[id]; return L ? { x:L.x, y:L.top + L.h*frac } : null; }
@@ -199,8 +214,9 @@ function animate(from, to, color, ms, node, cls, arc){
 // causal links; it never invents a hop it did not see.
 // ---------------------------------------------------------------------------
 function ingest(f, replay){
-  const frac = 0.25 + ((f.id * 37) % 50) / 100;
-  const o = logPt("obs", frac), c = logPt("cmd", frac);
+  // One crossing point per log. Fanning by id spread repeated journeys into
+  // ribbons that read as hair; overlaying them reads as a path used often.
+  const o = logPt("obs", 0.5), c = logPt("cmd", 0.5);
   const src = nodeFor(f.emitted_by);
   const dead = DEAD.has(f.log + ":" + f.id);
 
@@ -223,9 +239,6 @@ function ingest(f, replay){
       if (prior && dec){
         animate(prior.obsPoint, dec, "#a78bfa", 180, dec.el, "v");
         setTimeout(()=>animate(dec, c, "#a78bfa", 120, null, null), 180);
-        const observed = Math.round(performance.now() - prior.at);
-        stats.lat.push(observed); if (stats.lat.length > 60) stats.lat.shift();
-        badge(dec.x, dec.y - 44, "~" + observed + "ms", observed > 800 ? "slow" : "lat");
       }
       setTimeout(()=>{
         animate(c, act, "#38bdf8", 200, act && act.el, "b");
@@ -239,7 +252,17 @@ function ingest(f, replay){
     }
   }
 
+  const L = LOG[f.log];
+  if (L){
+    L.count.textContent = "#" + f.id;
+    if (!replay){
+      L.tag.classList.add("pulse");
+      clearTimeout(L._t);
+      L._t = setTimeout(()=>L.tag.classList.remove("pulse"), 500);
+    }
+  }
   stats.last = performance.now();
+  recent.push(stats.last);
   row(f, dead);
 }
 
@@ -284,7 +307,10 @@ function ease(t){ return t<.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2; }
 
 function curve(a, b, arc){
   // control points: horizontal ease, or a big sweep for the return arc
-  if (arc) return [{x:a.x, y:a.y}, {x:a.x+40, y:H-24}, {x:b.x-60, y:H-24}, {x:b.x, y:b.y}];
+  if (arc){
+    const floor = H - 96;      // above the status bar, so the loop stays visible
+    return [{x:a.x,y:a.y},{x:a.x+40,y:floor},{x:b.x-60,y:floor},{x:b.x,y:b.y}];
+  }
   const mx = (a.x + b.x) / 2;
   return [{x:a.x,y:a.y},{x:mx,y:a.y},{x:mx,y:b.y},{x:b.x,y:b.y}];
 }
@@ -321,8 +347,8 @@ function frame(now){
     const tr = traces[i];
     const age = (now - tr.at) / TRACE_MS;
     if (age >= 1){ traces.splice(i,1); continue; }
-    const alpha = (1 - age) * 0.55;
-    for (const seg of tr.segs) drawCurve(seg.p, seg.color, alpha, tr.fail ? 2 : 1.6);
+    const alpha = Math.pow(1 - age, 2) * 0.30;   // squared: fades out of the way fast
+    for (const seg of tr.segs) drawCurve(seg.p, seg.color, alpha, tr.fail ? 1.6 : 1);
   }
 
   // in-flight packets
@@ -352,6 +378,7 @@ function frame(now){
 
       if (pk.i >= pk.legs.length){
         traces.push({ at: now, segs: pk.path, fail: pk.fail });
+        while (traces.length > TRACE_MAX) traces.shift();
         packets.splice(i,1);
       }
     }
@@ -365,17 +392,23 @@ function frame(now){
   // stats
   document.getElementById("sObs").textContent = stats.obs;
   document.getElementById("sCmd").textContent = stats.cmd;
-    if (stats.lat.length){
-    const s = [...stats.lat].sort((a,b)=>a-b);
-    document.getElementById("sP50").textContent = s[(s.length/2)|0] + "ms";
-  }
+    // Rate over the last minute. Observed latency was dropped: the tap batches an
+  // observation and its command into one POST, so the gap measured my own
+  // batching rather than the decider.
+  const cut = now - 60000;
+  while (recent.length && recent[0] < cut) recent.shift();
+  document.getElementById("sRate").textContent = recent.length + "/min";
   document.getElementById("sDead").textContent = DEAD.size;
   const since = document.getElementById("since");
   if (stats.last){
-    const secs = Math.floor((performance.now() - stats.last)/1000);
+    const secs = Math.floor((now - stats.last)/1000);
     const txt = secs < 60 ? secs + "s ago" : Math.floor(secs/60) + "m ago";
     document.getElementById("sLast").textContent = "last event " + txt;
-    since.textContent = packets.length ? packets.length + " in flight" : "quiet · " + txt;
+    // "quiet" only when nothing is moving AND nothing landed recently — it read
+    // as quiet mid-burst before, because it only looked at in-flight packets.
+    since.textContent = packets.length ? packets.length + " in flight"
+                      : secs < 10     ? "active"
+                                      : "quiet · " + txt;
   }
 
   requestAnimationFrame(frame);
@@ -412,6 +445,9 @@ document.getElementById("toggle").onclick = e => {
   f.classList.toggle("open");
   e.target.textContent = f.classList.contains("open") ? "▼ feed" : "▲ feed";
   renderFeed();
+  // The drawer changes the stage height without firing a resize, so nothing
+  // recomputed and the spine kept its old geometry.
+  f.addEventListener("transitionend", layout, { once: true });
 };
 addEventListener("resize", layout);
 
