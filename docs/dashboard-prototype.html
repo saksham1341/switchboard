@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Switchboard — prototype</title>
+<style>
+  :root{
+    --bg:#070a0f; --panel:#0f1621; --line:#1c2534; --dim:#66718a; --ink:#e9edf5;
+    --g:#34d399; --b:#38bdf8; --a:#fbbf24; --r:#f87171; --violet:#a78bfa;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:radial-gradient(130% 100% at 50% -10%,#101a29 0%,var(--bg) 65%);
+    color:var(--ink); font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+
+  header{display:flex;align-items:baseline;gap:14px;padding:14px 20px 8px}
+  header h1{font-size:14px;font-weight:600;letter-spacing:.5px;margin:0}
+  header .sub{color:var(--dim);font-size:11px}
+  .live{display:inline-flex;align-items:center;gap:6px;color:var(--g);font-size:11px}
+  .live i{width:7px;height:7px;border-radius:50%;background:var(--g);
+          box-shadow:0 0 10px var(--g);animation:beat 2.4s ease-in-out infinite}
+  @keyframes beat{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1)}}
+
+  /* ---------- stage ---------- */
+  #stage{position:relative;flex:1;min-height:0}
+  #flow{position:absolute;inset:0;width:100%;height:100%}
+  #overlay{position:absolute;inset:0;pointer-events:none}
+
+  .bandcap{position:absolute;color:var(--dim);font-size:9px;letter-spacing:1.6px;
+           transform:translateX(-50%);white-space:nowrap}
+  .node{position:absolute;transform:translate(-50%,-50%);background:var(--panel);
+        border:1px solid var(--line);border-radius:8px;padding:7px 11px;font-size:11px;
+        white-space:nowrap;transition:border-color .25s,color .25s,box-shadow .25s,transform .12s}
+  .node .kind{display:block;color:var(--dim);font-size:8px;letter-spacing:1px;margin-bottom:1px}
+  .node.hot{transform:translate(-50%,-50%) scale(1.06)}
+  .node.hot.g{border-color:var(--g);color:var(--g);box-shadow:0 0 26px -6px var(--g)}
+  .node.hot.b{border-color:var(--b);color:var(--b);box-shadow:0 0 26px -6px var(--b)}
+  .node.hot.v{border-color:var(--violet);color:var(--violet);box-shadow:0 0 26px -6px var(--violet)}
+  .node.dead{border-color:var(--r);color:var(--r);box-shadow:0 0 26px -6px var(--r)}
+
+  .logcol{position:absolute;transform:translateX(-50%);border:1px solid var(--line);
+          border-radius:8px;background:linear-gradient(180deg,#0b111a,#080d14);overflow:hidden}
+  .logcol .lbl{position:absolute;top:8px;left:50%;transform:translateX(-50%);
+               color:var(--dim);font-size:9px;letter-spacing:2px;writing-mode:vertical-rl}
+
+  .badge{position:absolute;transform:translate(-50%,-50%);border-radius:5px;padding:2px 7px;
+         font-size:9px;white-space:nowrap;pointer-events:none;
+         animation:pop .4s cubic-bezier(.2,1.4,.4,1) both}
+  @keyframes pop{from{opacity:0;transform:translate(-50%,-30%) scale(.8)}
+                 to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+  .badge.lat{background:#0d2a21;color:var(--g);border:1px solid #1c4a3c}
+  .badge.slow{background:#2b1d0c;color:var(--a);border:1px solid #4a3a17}
+  .badge.err{background:#2b1212;color:var(--r);border:1px solid #4a1f1f}
+
+  /* ---------- status bar + feed drawer ---------- */
+  #bar{display:flex;justify-content:space-between;align-items:center;gap:16px;
+       padding:8px 20px;border-top:1px solid var(--line);background:#0a0f17;font-size:11px}
+  #bar .stats{display:flex;gap:18px;color:var(--dim)}
+  #bar .stats b{color:var(--ink);font-weight:500}
+  #bar button{background:transparent;border:1px solid var(--line);color:var(--b);
+              border-radius:6px;padding:4px 10px;font:inherit;font-size:11px;cursor:pointer}
+  #bar button:hover{border-color:var(--b)}
+
+  #feed{height:0;overflow:hidden;transition:height .32s cubic-bezier(.2,.7,.3,1);
+        background:#070b11;border-top:1px solid transparent}
+  #feed.open{height:210px;border-top-color:var(--line)}
+  #feedinner{height:210px;overflow-y:auto;padding:6px 0}
+  .frow{display:grid;grid-template-columns:46px 52px 1fr 190px 74px;gap:10px;
+        padding:3px 20px;cursor:default;font-size:11px}
+  .frow:hover{background:#0e1621}
+  .frow.sel{background:#12202e}
+  .tag{border-radius:3px;padding:0 5px;font-size:9px;text-align:center}
+  .tag.obs{background:#0d3b2e;color:var(--g)} .tag.cmd{background:#0b3550;color:var(--b)}
+  .mid{color:var(--dim)} .nm{color:var(--ink);overflow:hidden;text-overflow:ellipsis}
+  .by{color:#56617a;overflow:hidden;text-overflow:ellipsis}
+  .ms{color:var(--dim);text-align:right}
+  .frow.deadrow .nm{color:var(--r)}
+
+  .hint{position:absolute;left:20px;bottom:14px;color:#3d465c;font-size:10px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SWITCHBOARD</h1>
+  <span class="live"><i></i>live</span>
+  <span class="sub" id="since">idle</span>
+</header>
+
+<div id="stage">
+  <canvas id="flow"></canvas>
+  <div id="overlay"></div>
+  <div class="hint">prototype &middot; simulated traffic &middot; press <b>B</b> for a burst, <b>F</b> for a failure</div>
+</div>
+
+<div id="bar">
+  <div class="stats">
+    <span>obs <b id="sObs">0</b></span>
+    <span>cmd <b id="sCmd">0</b></span>
+    <span>dead <b id="sDead">0</b></span>
+    <span>p50 <b id="sP50">—</b></span>
+    <span id="sLast">last event —</span>
+  </div>
+  <button id="toggle">▲ feed</button>
+</div>
+<div id="feed"><div id="feedinner"></div></div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Topology — mirrors what Bus.topology() would hand the dashboard.
+// ---------------------------------------------------------------------------
+const TOPO = {
+  sensors:   ["github", "discord"],
+  deciders:  ["github_notify", "ping", "echo"],
+  actuators: ["discord.post", "discord.reply"],
+};
+
+// Which decider reacts to which sensor, and which actuator it commands.
+const ROUTES = [
+  { sensor:"github",  decider:"github_notify", actuator:"discord.post",
+    names:["github.switchboard.pr.opened","github.switchboard.pr.merged",
+           "github.switchboard.check_run.succeeded","github.switchboard.issue.opened",
+           "github.switchboard.review.approved"], weight:7 },
+  { sensor:"discord", decider:"ping",  actuator:"discord.reply",
+    names:["discord.command.ping"],  weight:1 },
+  { sensor:"discord", decider:"echo",  actuator:"discord.reply",
+    names:["discord.command.echo"],  weight:1 },
+];
+
+const cv = document.getElementById("flow");
+const ov = document.getElementById("overlay");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+
+// ---------------------------------------------------------------------------
+// Layout — five bands: sensors, obs log, deciders, cmd log, actuators
+// ---------------------------------------------------------------------------
+const P = {};   // node id -> {x,y,el}
+const LOG = {}; // "obs"|"cmd" -> {x,top,h,el}
+
+function layout(){
+  DPR = window.devicePixelRatio || 1;
+  const r = cv.getBoundingClientRect();
+  W = r.width; H = r.height;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+
+  ov.innerHTML = "";
+  const cols = [0.12, 0.315, 0.5, 0.685, 0.88].map(f => f * W);
+  const top = 62, bot = H - 74;
+
+  const band = (i, items, kind, cls) => {
+    const cap = document.createElement("div");
+    cap.className = "bandcap"; cap.textContent = kind;
+    cap.style.left = cols[i] + "px"; cap.style.top = (top - 26) + "px";
+    ov.appendChild(cap);
+    const span = bot - top;
+    items.forEach((name, k) => {
+      const y = items.length === 1 ? (top + span/2)
+              : top + (span * (k + .5)) / items.length;
+      const el = document.createElement("div");
+      el.className = "node " + cls;
+      el.innerHTML = '<span class="kind">' + kind.slice(0,3) + '</span>' + name;
+      el.style.left = cols[i] + "px"; el.style.top = y + "px";
+      ov.appendChild(el);
+      P[kind + "/" + name] = { x: cols[i], y, el };
+    });
+  };
+
+  const logcol = (i, id, label) => {
+    const w = 34, h = bot - top;
+    const el = document.createElement("div");
+    el.className = "logcol";
+    el.style.left = cols[i] + "px"; el.style.top = top + "px";
+    el.style.width = w + "px"; el.style.height = h + "px";
+    el.innerHTML = '<div class="lbl">' + label + '</div>';
+    ov.appendChild(el);
+    // No depth or counts: how a log should represent itself is a question for
+    // the running system, not a mockup.
+    LOG[id] = { x: cols[i], top, h, el };
+  };
+
+  band(0, TOPO.sensors, "sensor", "g");
+  logcol(1, "obs", "OBS");
+  band(2, TOPO.deciders, "decider", "v");
+  logcol(3, "cmd", "CMD");
+  band(4, TOPO.actuators, "actuator", "b");
+}
+
+// ---------------------------------------------------------------------------
+// Event model — each event walks a path of hops with real durations
+// ---------------------------------------------------------------------------
+let seq = { obs: 0, cmd: 0 };
+const traces = [];     // completed paths, fade over TRACE_MS
+const packets = [];    // in-flight
+const badges = [];
+const rows = [];
+const stats = { obs:0, cmd:0, dead:0, lat:[], last:null };
+const TRACE_MS = 60000;
+
+function pick(){
+  const total = ROUTES.reduce((s,r)=>s+r.weight,0);
+  let n = Math.random()*total;
+  for (const r of ROUTES){ if ((n -= r.weight) < 0) return r; }
+  return ROUTES[0];
+}
+
+function pt(id){ return P[id]; }
+function logPt(id, frac){ const L = LOG[id]; return { x:L.x, y:L.top + L.h*frac }; }
+
+function spawn(force){
+  const r = pick();
+  const name = r.names[(Math.random()*r.names.length)|0];
+  const fail = force === "fail" || Math.random() < 0.06;
+  const slow = Math.random() < 0.18;
+  const frac = 0.25 + Math.random()*0.5;
+
+  const s = pt("sensor/" + r.sensor);
+  const d = pt("decider/" + r.decider);
+  const a = pt("actuator/" + r.actuator);
+  const o = logPt("obs", frac), c = logPt("cmd", frac);
+
+  const obsId = ++seq.obs;
+  const legs = [
+    { from:s, to:o, ms: 40 + Math.random()*60,  color:"#34d399", node:s.el, cls:"g",
+      onEnd:()=>{ stats.obs++;
+        row("obs", obsId, name, "sensor/" + r.sensor, null); } },
+    { from:o, to:d, ms: 90 + Math.random()*120, color:"#a78bfa", node:d.el, cls:"v",
+      onEnd:null },
+    { from:d, to:c, ms: 40 + Math.random()*60,  color:"#a78bfa", node:null,
+      onEnd:()=>{ stats.cmd++;
+        row("cmd", ++seq.cmd, r.actuator, "decider/" + r.decider, null); } },
+    { from:c, to:a, ms: (slow?900:120) + Math.random()*260, color:"#38bdf8", node:a.el, cls:"b",
+      onEnd:null },
+  ];
+  if (!fail) legs.push(
+    { from:a, to:o, ms: 60 + Math.random()*80, color:"#34d399", node:null, arc:true,
+      onEnd:()=>{ stats.obs++;
+        row("obs", ++seq.obs, r.actuator + ".ok", "actuator/" + r.actuator, null); } });
+
+  packets.push({ legs, i:0, t:0, path:[], name, fail, slow,
+                 started:performance.now(), actuator:a });
+}
+
+function flash(el, cls){
+  if (!el) return;
+  el.classList.add("hot", cls);
+  clearTimeout(el._t);
+  el._t = setTimeout(()=>el.classList.remove("hot", cls), 420);
+}
+
+function badge(x, y, text, kind){
+  const el = document.createElement("div");
+  el.className = "badge " + kind; el.textContent = text;
+  el.style.left = x + "px"; el.style.top = y + "px";
+  ov.appendChild(el);
+  badges.push({ el, until: performance.now() + 2200 });
+}
+
+function row(log, id, name, by, ms){
+  rows.unshift({ log, id, name, by, ms, dead:false });
+  if (rows.length > 300) rows.pop();
+  renderFeed();
+}
+
+function renderFeed(){
+  const box = document.getElementById("feedinner");
+  if (!document.getElementById("feed").classList.contains("open")) return;
+  box.innerHTML = rows.slice(0,120).map(r =>
+    '<div class="frow' + (r.dead ? ' deadrow' : '') + '">' +
+      '<span class="tag ' + r.log + '">' + r.log + '</span>' +
+      '<span class="mid">' + r.id + '</span>' +
+      '<span class="nm">' + r.name + '</span>' +
+      '<span class="by">' + (r.by||'') + '</span>' +
+      '<span class="ms">' + (r.ms != null ? r.ms + 'ms' : '') + '</span>' +
+    '</div>').join("");
+}
+
+// ---------------------------------------------------------------------------
+// Render loop
+// ---------------------------------------------------------------------------
+function ease(t){ return t<.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2; }
+
+function curve(a, b, arc){
+  // control points: horizontal ease, or a big sweep for the return arc
+  if (arc) return [{x:a.x, y:a.y}, {x:a.x+40, y:H-24}, {x:b.x-60, y:H-24}, {x:b.x, y:b.y}];
+  const mx = (a.x + b.x) / 2;
+  return [{x:a.x,y:a.y},{x:mx,y:a.y},{x:mx,y:b.y},{x:b.x,y:b.y}];
+}
+function bez(p, t){
+  const u = 1-t, a = u*u*u, b = 3*u*u*t, c = 3*u*t*t, d = t*t*t;
+  return { x:a*p[0].x+b*p[1].x+c*p[2].x+d*p[3].x,
+           y:a*p[0].y+b*p[1].y+c*p[2].y+d*p[3].y };
+}
+function drawCurve(p, color, alpha, width){
+  ctx.strokeStyle = color; ctx.globalAlpha = alpha; ctx.lineWidth = width;
+  ctx.beginPath(); ctx.moveTo(p[0].x, p[0].y);
+  ctx.bezierCurveTo(p[1].x,p[1].y,p[2].x,p[2].y,p[3].x,p[3].y);
+  ctx.stroke(); ctx.globalAlpha = 1;
+}
+
+let prev = performance.now();
+function frame(now){
+  const dt = now - prev; prev = now;
+  ctx.clearRect(0,0,W,H);
+
+  // static rails
+  ctx.lineWidth = 1;
+  for (const r of ROUTES){
+    const s = pt("sensor/"+r.sensor), d = pt("decider/"+r.decider), a = pt("actuator/"+r.actuator);
+    const o = logPt("obs",.5), c = logPt("cmd",.5);
+    drawCurve(curve(s,o), "#141c28", 1, 1);
+    drawCurve(curve(o,d), "#141c28", 1, 1);
+    drawCurve(curve(d,c), "#141c28", 1, 1);
+    drawCurve(curve(c,a), "#141c28", 1, 1);
+  }
+
+  // traces — the recent past, fading
+  for (let i = traces.length-1; i >= 0; i--){
+    const tr = traces[i];
+    const age = (now - tr.at) / TRACE_MS;
+    if (age >= 1){ traces.splice(i,1); continue; }
+    const alpha = (1 - age) * 0.55;
+    for (const seg of tr.segs) drawCurve(seg.p, seg.color, alpha, tr.fail ? 2 : 1.6);
+  }
+
+  // in-flight packets
+  for (let i = packets.length-1; i >= 0; i--){
+    const pk = packets[i];
+    const leg = pk.legs[pk.i];
+    pk.t += dt;
+    const t = Math.min(1, pk.t / leg.ms);
+    const p = curve(leg.from, leg.to, leg.arc);
+    const pos = bez(p, ease(t));
+
+    drawCurve(p, leg.color, 0.30 + 0.5*Math.sin(t*Math.PI), pk.fail ? 2.4 : 2);
+    ctx.beginPath();
+    const grd = ctx.createRadialGradient(pos.x,pos.y,0,pos.x,pos.y,14);
+    grd.addColorStop(0, leg.color); grd.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = grd; ctx.globalAlpha = .85;
+    ctx.arc(pos.x,pos.y,14,0,Math.PI*2); ctx.fill(); ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.fillStyle = "#fff";
+    ctx.arc(pos.x,pos.y,2.4,0,Math.PI*2); ctx.fill();
+
+    if (t >= 1){
+      pk.path.push({ p, color: leg.color });
+      if (leg.onEnd) leg.onEnd();
+      if (leg.node) flash(leg.node, leg.cls);
+      pk.i++;
+      pk.t = 0;
+
+      if (pk.i >= pk.legs.length){
+        const total = Math.round(performance.now() - pk.started);
+        stats.lat.push(total); if (stats.lat.length > 60) stats.lat.shift();
+        stats.last = performance.now();
+        if (pk.fail){
+          stats.dead++;
+          pk.actuator.el.classList.add("dead");
+          setTimeout(()=>pk.actuator.el.classList.remove("dead"), 1200);
+          badge(pk.actuator.x, pk.actuator.y - 42, "dead · " + pk.name.split(".").pop(), "err");
+          const r0 = rows.find(r => r.log === "cmd");
+          if (r0){ r0.dead = true; renderFeed(); }
+        } else {
+          badge(pk.actuator.x, pk.actuator.y - 42, "+" + total + "ms",
+                pk.slow ? "slow" : "lat");
+        }
+        traces.push({ at: now, segs: pk.path, fail: pk.fail });
+        packets.splice(i,1);
+      }
+    }
+  }
+
+  // badges expire
+  for (let i = badges.length-1; i >= 0; i--){
+    if (now > badges[i].until){ badges[i].el.remove(); badges.splice(i,1); }
+  }
+
+  // stats
+  document.getElementById("sObs").textContent = stats.obs;
+  document.getElementById("sCmd").textContent = stats.cmd;
+  document.getElementById("sDead").textContent = stats.dead;
+  if (stats.lat.length){
+    const s = [...stats.lat].sort((a,b)=>a-b);
+    document.getElementById("sP50").textContent = s[(s.length/2)|0] + "ms";
+  }
+  const since = document.getElementById("since");
+  if (stats.last){
+    const secs = Math.floor((performance.now() - stats.last)/1000);
+    const txt = secs < 60 ? secs + "s ago" : Math.floor(secs/60) + "m ago";
+    document.getElementById("sLast").textContent = "last event " + txt;
+    since.textContent = packets.length ? packets.length + " in flight" : "quiet · " + txt;
+  }
+
+  requestAnimationFrame(frame);
+}
+
+// ---------------------------------------------------------------------------
+// Traffic simulation — mostly quiet, occasional clusters, like the real thing
+// ---------------------------------------------------------------------------
+function schedule(){
+  const gap = Math.random() < 0.25 ? 400 + Math.random()*900     // cluster
+                                   : 3000 + Math.random()*7000;  // quiet
+  setTimeout(()=>{ spawn(); schedule(); }, gap);
+}
+
+document.getElementById("toggle").onclick = e => {
+  const f = document.getElementById("feed");
+  f.classList.toggle("open");
+  e.target.textContent = f.classList.contains("open") ? "▼ feed" : "▲ feed";
+  renderFeed();
+};
+addEventListener("keydown", e => {
+  if (e.key === "b" || e.key === "B") for (let i=0;i<6;i++) setTimeout(spawn, i*130);
+  if (e.key === "f" || e.key === "F") spawn("fail");
+});
+addEventListener("resize", layout);
+
+layout();
+requestAnimationFrame(frame);
+setTimeout(()=>{ spawn(); }, 400);
+schedule();
+</script>
+</body>
+</html>

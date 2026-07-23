@@ -59,6 +59,13 @@ class Bus:
         self._http = http if http is not None else HttpServer(serve=False)
         self._scheduler = Scheduler()
 
+    def topology(self) -> dict:
+        """What is actually wired, by kind and name — so a view draws the real
+        graph rather than a hardcoded picture. Call after registration."""
+        return {"sensors":   [s.name for s in self._sensors],
+                "deciders":  [d.name for d in self._deciders],
+                "actuators": [a.name for a in self._actuators]}
+
     # registration
     def add_sensor(self, s): self._sensors.append(s)
     def add_decider(self, d): self._deciders.append(d)
@@ -187,13 +194,13 @@ class Bus:
         self._tasks.clear()
 
         # 4. Now nothing is using them, so the clients can close.
-        for a in self._actuators:
-            close = getattr(a, "close", None)
+        for role in (*self._actuators, *self._taps):
+            close = getattr(role, "close", None)
             if close is not None:
                 try:
                     await close()
                 except Exception:
-                    logger.exception("actuator %s failed to close", a.name)
+                    logger.exception("%s failed to close", role.name)
 
         # Symmetric with self._http.stop(): the Bus stops the platform pieces it
         # was handed, whether or not it constructed them.
