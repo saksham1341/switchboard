@@ -28,9 +28,12 @@ if [ "$PULL" = 1 ]; then
   if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     die "working tree has uncommitted changes to tracked files; commit/stash or use --no-pull"
   fi
-  # --depth 1 keeps this working on the shallow clones deploy hosts usually have
+  # --depth 1 keeps this working on the shallow clones deploy hosts usually have.
+  # Reset to FETCH_HEAD, not origin/$BRANCH: a --single-branch clone only tracks
+  # the cloned branch, so fetching any other one populates FETCH_HEAD and no
+  # remote-tracking ref at all.
   git fetch --depth 1 --quiet origin "$BRANCH"
-  git reset --hard --quiet "origin/$BRANCH"
+  git reset --hard --quiet FETCH_HEAD
 fi
 echo "at $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
 
