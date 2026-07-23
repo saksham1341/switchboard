@@ -18,8 +18,8 @@ def test_registered_routes_are_served():
     async def a(request): return PlainTextResponse("A")
     async def b(request): return PlainTextResponse("B")
 
-    s.route("/one", a, methods=["POST"])
-    s.route("/two", b, methods=["POST"])
+    s.route("/one", a, methods=["POST"], owner="one")
+    s.route("/two", b, methods=["POST"], owner="two")
     client = TestClient(s.app)
     assert client.post("/one").text == "A"
     assert client.post("/two").text == "B"
@@ -69,3 +69,14 @@ async def test_start_is_a_noop_when_serve_is_false():
     s = HttpServer(serve=False)
     await s.start()          # binds nothing
     await s.stop()
+
+
+def test_owner_is_required():
+    """Unattributed claims produce exactly the useless collision message the
+    parameter exists to prevent, so it has no default."""
+    s = HttpServer(serve=False)
+
+    async def h(request): return PlainTextResponse("x")
+
+    with pytest.raises(TypeError):
+        s.route("/x", h, methods=["POST"])

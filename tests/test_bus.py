@@ -211,3 +211,66 @@ async def test_routes_are_registered_before_the_server_starts(tmp_path):
         assert calls.index(("route", "/x")) < calls.index(("start", None))
     finally:
         await bus.stop()
+
+
+async def test_bus_stamps_the_emitting_role_on_every_message(tmp_path):
+    """The Bus knows who it handed each emit callable to, so it stamps the
+    emitter itself. A role never passes its own name and so cannot misattribute."""
+    seen = []
+
+    class _Spy:
+        name = "spy"
+        logs = (OBS_LOG, CMD_LOG)
+        def bind(self, ctx): self.ctx = ctx
+        async def observe(self, log, view):
+            seen.append((log, view.name, view.emitted_by))
+
+    class _Emitting:
+        name = "probe"
+        def bind(self, ctx): self.ctx = ctx
+        async def start(self):
+            await self.ctx.emit("thing.happened", {"v": 1})
+        async def stop(self): pass
+
+    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus.add_sensor(_Emitting()); bus.add_decider(_Decider())
+    bus.add_actuator(_Actuator()); bus.add_tap(_Spy())
+    await bus.start()
+    try:
+        await _wait(lambda: any(n == "do.it.ok" for _, n, _ in seen))
+        by = {name: emitted_by for _, name, emitted_by in seen}
+        assert by["thing.happened"] == "sensor/probe"
+        assert by["do.it"] == "decider/trigger"
+        assert by["do.it.ok"] == "actuator/do.it"
+    finally:
+        await bus.stop()
+
+
+async def test_each_sensor_is_attributed_to_itself(tmp_path):
+    """Regression guard: the per-sensor emit closure must bind its own sensor.
+    An unbound loop variable would attribute every observation to the last one."""
+    seen = []
+
+    class _Spy:
+        name = "spy"
+        logs = (OBS_LOG,)
+        def bind(self, ctx): self.ctx = ctx
+        async def observe(self, log, view): seen.append((view.name, view.emitted_by))
+
+    def make(sensor_name):
+        class _S:
+            name = sensor_name
+            def bind(self, ctx): self.ctx = ctx
+            async def start(self): await self.ctx.emit(f"{sensor_name}.event", {})
+            async def stop(self): pass
+        return _S()
+
+    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus.add_sensor(make("alpha")); bus.add_sensor(make("beta"))
+    bus.add_tap(_Spy())
+    await bus.start()
+    try:
+        await _wait(lambda: len(seen) >= 2)
+        assert dict(seen) == {"alpha.event": "sensor/alpha", "beta.event": "sensor/beta"}
+    finally:
+        await bus.stop()

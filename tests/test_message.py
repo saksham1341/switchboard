@@ -58,3 +58,31 @@ def test_tap_ctx_is_store_only():
 def test_act_ctx_has_no_context_field():
     from switchboard.message import ActCtx
     assert "context" not in ActCtx.__dataclass_fields__
+
+
+def test_observation_carries_emitted_by():
+    class M:
+        id = 7
+        payload = {"a": 1}
+        metadata = {"name": "github.home.pr.opened", "emitted_by": "sensor/github"}
+    obs = Observation.from_message(M())
+    assert obs.emitted_by == "sensor/github"
+
+
+def test_command_carries_emitted_by():
+    class M:
+        id = 3
+        payload = {}
+        metadata = {"name": "discord.post", "observation_id": 7,
+                    "emitted_by": "decider/github_notify"}
+    cmd = Command.from_message(M())
+    assert cmd.emitted_by == "decider/github_notify"
+
+
+def test_emitted_by_is_none_when_absent():
+    class M:
+        id = 1
+        payload = {}
+        metadata = {"name": "x"}
+    assert Observation.from_message(M()).emitted_by is None
+    assert Command.from_message(M()).emitted_by is None

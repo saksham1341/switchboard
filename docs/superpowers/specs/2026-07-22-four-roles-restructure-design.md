@@ -56,17 +56,26 @@ A Switchboard event **is** a mamamia message. mamamia already gives identity, or
 
 ```
 # obs log
-metadata = { "name": "github.acme.pr.opened", "command_id": <int>? }   # command_id present ⇒ result-observation
+metadata = { "name": "github.acme.pr.opened", "command_id": <int>?,
+             "emitted_by": "sensor/github" }        # command_id present ⇒ result-observation
 payload  = { …content… }
 
 # cmd log
-metadata = { "name": "discord.post", "observation_id": <int> }
+metadata = { "name": "discord.post", "observation_id": <int>,
+             "emitted_by": "decider/github_notify" }
 payload  = { …args… }
 ```
 
 - **`name`** — the dispatch key. For an observation, its class; for a command, the actuator that executes it. (Concrete commands: a command names its one executor. No semantic fan-out.)
 - **Directional back-reference** — a command always carries **`observation_id`** (the observation that triggered its decider); an observation *optionally* carries **`command_id`** (present ⇒ it is the result of that command). The field name says which log it points into.
+- **`emitted_by`** — `"<kind>/<name>"` of the role that produced the message. **Stamped by the Bus, never passed by a role.** The Bus builds each role's emit callable, so it already knows who is calling; a role therefore cannot claim to be another role, and cannot forget to identify itself.
 - **Identity + ordering** = mamamia `msg.id` (int, per log). **Stream** = mamamia `log_id`. Nothing else.
+
+### Why `emitted_by` exists
+
+Attribution was already recoverable for two roles and impossible for the third. An **actuator** is exact — `Actuator.name` *is* the command name it consumes, and a result observation points back through `command_id`. A **sensor** was inferable only by convention, from the provider prefix in an observation name. A **decider** was unrecoverable: nothing recorded it, and `subscribes()` is an arbitrary predicate that cannot be introspected.
+
+So this closes one real hole and upgrades one convention to a guarantee. It is not attribution invented from nothing.
 
 Result-observation of a command `C` = an observation with `command_id = C.msg.id`, `name = "<C.name>.<outcome>"` (e.g. `discord.post.ok`), payload carrying the effect handle (e.g. `{message_id}`).
 

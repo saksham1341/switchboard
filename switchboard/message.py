@@ -15,12 +15,14 @@ class Observation:
     name: str
     payload: dict
     command_id: int | None = None      # present ⇒ this is a result observation
+    emitted_by: str | None = None      # "sensor/github", "actuator/discord.post"
 
     @classmethod
     def from_message(cls, msg) -> "Observation":
         md = msg.metadata or {}
         return cls(id=msg.id, name=md.get("name", ""),
-                   payload=msg.payload or {}, command_id=md.get("command_id"))
+                   payload=msg.payload or {}, command_id=md.get("command_id"),
+                   emitted_by=md.get("emitted_by"))
 
 
 @dataclass(frozen=True)
@@ -29,12 +31,14 @@ class Command:
     name: str
     args: dict
     observation_id: int | None = None  # the observation that triggered this command
+    emitted_by: str | None = None      # "decider/github_notify"
 
     @classmethod
     def from_message(cls, msg) -> "Command":
         md = msg.metadata or {}
         return cls(id=msg.id, name=md.get("name", ""),
-                   args=msg.payload or {}, observation_id=md.get("observation_id"))
+                   args=msg.payload or {}, observation_id=md.get("observation_id"),
+                   emitted_by=md.get("emitted_by"))
 
 
 @dataclass
