@@ -57,15 +57,7 @@ class Bus:
         # serve=False by default so tests register routes and drive .app
         # without any of them binding a port.
         self._http = http if http is not None else HttpServer(serve=False)
-        # Extra servers on their own ports — the dashboard lives on one so it can
-        # be published loopback-only, off the public tunnel that reaches _http.
-        self._servers: list = []
         self._scheduler = Scheduler()
-
-    def add_server(self, server) -> None:
-        """Register an extra HttpServer for the Bus to start and stop. Its routes
-        must be registered before start(), same as the main server's."""
-        self._servers.append(server)
 
     def topology(self) -> dict:
         """What is actually wired, by kind and name — so a view draws the real
@@ -149,8 +141,6 @@ class Bus:
                              schedule=self._scheduler.for_owner(s.name)))
 
         await self._http.start()          # every route is registered by now
-        for srv in self._servers:
-            await srv.start()
 
         for d in self._deciders:
             self._tasks.append(asyncio.create_task(self._run_decider(d)))
@@ -184,11 +174,6 @@ class Bus:
 
         # 1. No new inbound work. uvicorn drains in-flight requests itself.
         await self._http.stop()
-        for srv in self._servers:
-            try:
-                await srv.stop()
-            except Exception:
-                logger.exception("extra server failed to stop")
 
         # 2. Sensors down, each one's timers first: a scheduled callback must
         #    never fire against a connection being torn down.
