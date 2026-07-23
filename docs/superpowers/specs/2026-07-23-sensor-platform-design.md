@@ -25,7 +25,11 @@ Those four are `SensorCtx`.
 
 ---
 
-## SensorCtx
+## Role contexts
+
+Every role has the same two-tier need: things it receives once at wiring, and things it receives per invocation. Today each role solves that differently — sensors take a bare `emit`, actuators expose a `context()` factory whose result the Bus stashes and re-delivers inside every `ActCtx`, and deciders have nothing. Three mechanisms for one concept.
+
+One mechanism instead. **Lifetime dependencies arrive through `bind(ctx)`; per-invocation state stays a call argument.**
 
 ```python
 @dataclass
@@ -34,11 +38,15 @@ class SensorCtx:
     http: HttpServer                              # .route(path, handler, methods=)
     store: KeyStore                               # .get / .set / .delete
     schedule: OwnerSchedule                       # .every(seconds, fn)
+
+@dataclass
+class DeciderCtx:
+    store: KeyStore
+
+@dataclass
+class ActuatorCtx:
+    store: KeyStore
 ```
-
-Symmetric with `DecideCtx` and `ActCtx`: one object, constructed by the `Bus`, handed to the role, carrying exactly the authority that role is allowed to have. A sensor never constructs its own server, store, or timer.
-
-The `Sensor` protocol gains `bind` and loses the `emit` argument to `start`:
 
 ```python
 class Sensor(Protocol):
@@ -46,7 +54,58 @@ class Sensor(Protocol):
     def bind(self, ctx: SensorCtx) -> None: ...   # sync: declare routes and timers
     async def start(self) -> None: ...            # long-running loop, or return
     async def stop(self) -> None: ...
+
+class Decider(Protocol):
+    name: str
+    def bind(self, ctx: DeciderCtx) -> None: ...
+    def subscribes(self, obs: Observation) -> bool: ...
+    async def decide(self, obs: Observation, ctx: DecideCtx) -> None: ...
+
+class Actuator(Protocol):
+    name: str
+    def bind(self, ctx: ActuatorCtx) -> None: ...  # replaces context()
+    async def act(self, cmd: Command, ctx: ActCtx) -> None: ...
 ```
+
+Each role stashes its ctx the way any Python object holds a dependency:
+
+```python
+def bind(self, ctx) -> None:
+    self.ctx = ctx
+    ...declare routes and timers, build clients...
+```
+
+The alternative — the Bus injecting `role.ctx` so `bind()` takes no argument and only declares — saves one line per role but hides the contract. Roles are structural `Protocol`s, so nothing would catch a role reading `self.ctx` before the Bus set it. Not worth trading a visible parameter for a shorter method.
+
+### `Actuator.context()` is removed
+
+The factory existed to defer client construction until an event loop was running — an aiohttp session wants one. That reason was never written down, and it survives here: `bind` runs inside `Bus.start()`, with the loop up. So the actuator simply holds its client.
+
+```python
+class DiscordPost:
+    name = "discord.post"
+
+    def __init__(self, token, application_id):
+        self._token, self._app_id = token, application_id
+
+    def bind(self, ctx):
+        self.ctx = ctx
+        self._sender = DiscordSender(self._token, self._app_id)
+```
+
+`ActCtx` correspondingly loses its `context: Any` field and carries only per-command state (`cmd`, `result()`).
+
+### Deciders get memory, not world access
+
+Giving a decider a store looks like it weakens the role's defining constraint. It doesn't, because the constraint was never purity — nothing today stops a decider keeping `self._seen = set()`. Refusing it a store buys no determinism; it only makes decider state invisible, non-durable, and unreadable by any tap or CLI.
+
+So the constraint is restated rather than relaxed:
+
+> A decider has **no world access**. It has memory. The store is its own notebook: no effects outside Switchboard, durable, inspectable. Determinism means "no side effects outside Switchboard", not "pure function of the observation".
+
+That is what makes the real cases expressible — debounce, rate limiting, and the PR→Discord-message-id mapping an agent-decider needs in order to reply in a thread.
+
+The decider ctx is deliberately *only* a store. No `emit`, no `http`, no `schedule`: nothing that could reach the world, and nothing that could produce a message outside the one path `DecideCtx.command()` already provides.
 
 ### Why the lifecycle splits
 
@@ -56,8 +115,16 @@ Splitting gives a deterministic sequence with no timing assumptions:
 
 ```python
 # Bus.start()
+def scoped(kind, name):
+    return ScopedStore(self._store, f"{kind}/{name}/")
+
+for d in self._deciders:
+    d.bind(DeciderCtx(store=scoped("decider", d.name)))
+for a in self._actuators:
+    a.bind(ActuatorCtx(store=scoped("actuator", a.name)))
 for s in self._sensors:
-    s.bind(SensorCtx(emit=..., http=self._http, store=self._store,
+    s.bind(SensorCtx(emit=..., http=self._http,
+                     store=scoped("sensor", s.name),
                      schedule=self._scheduler.for_owner(s.name)))
 await self._http.start()                    # every route is registered by now
 for s in self._sensors:
@@ -141,6 +208,47 @@ def _check(key, value=None):
 ```
 
 Implicit `str()` would make `set(k, 5)` followed by `get(k) == 5` evaluate `False`, discovered in production. Callers that want structure call `json.dumps` — visible, and their choice of format.
+
+### Two memories, one API
+
+`ttl` is optional and defaults to `None`, meaning never expires. Long-term memory is the default; short-term is opt-in.
+
+```python
+await store.set("cursor", ts)                 # remembered until deleted
+await store.set(key, oid, ttl=7 * 86_400)     # forgets itself
+```
+
+Caveat for the docstring: long-term keys grow without bound, and some are per-entity. A sweep cursor is one key forever; a PR→message-id mapping is one key per PR, accumulating for the life of the deployment. Give per-entity mappings a TTL unless they genuinely must be permanent.
+
+### Every store is scoped, and there is no global store
+
+Each role gets a `ScopedStore` — a view over the shared backend, prefixed with the role's kind and name:
+
+```
+sensor/github/delivery:abc123
+decider/github_notify/thread:pr-7
+actuator/discord.post/idem:cmd-4412
+```
+
+```python
+class ScopedStore:
+    """A KeyStore view over a prefix. Roles never see the prefix and cannot
+    reach another role's keys — the log is the channel between roles."""
+
+    def __init__(self, inner: KeyStore, prefix: str):
+        self._inner, self._prefix = inner, prefix
+
+    async def get(self, key):
+        _check(key)
+        return await self._inner.get(self._prefix + key)
+    ...
+```
+
+Collision safety is the obvious benefit — `cursor` is the natural key name and every polling sensor wants it — but the reason is architectural. **Roles communicate through logs. A store is private memory.** A shared keyspace would be an out-of-band channel between roles that bypasses the durable log: invisible to taps, unordered, unreplayable, impossible to dead-letter. Two roles coordinating through a shared key would be doing precisely what the two-log design exists to prevent.
+
+The cross-role case people reach for does not need it. An actuator posts to Discord, receives a message id, and emits a result observation carrying it; a decider that wants to remember "PR #7 → message 123" reads that observation and writes its own key. The log already moved the data between roles.
+
+Scoping by `kind/name` rather than by class also gives two properties for free: state survives restarts because names are stable (they are already the consumer-group ids), and two instances of the same class must already have distinct names, so two GitHub orgs get separate keyspaces without special handling.
 
 ### Two implementations, one test suite
 
@@ -392,7 +500,9 @@ No new environment variables. `SB_PORT` and `SB_DATA_DIR` now reach `HttpServer`
 ## Testing
 
 - `HttpServer` — routes registered by several fake sensors are all served; duplicate path raises at bind; `/health` answers with no sensors registered at all.
-- `KeyStore` — one parametrized suite over `MemoryStore` and `SqliteStore`: get/set/delete, overwrite, TTL expiry via an injected clock, non-`str` key and value both raise, `purge` removes only expired rows. `SqliteStore` additionally: values survive reopening the database.
+- `KeyStore` — one parametrized suite over `MemoryStore` and `SqliteStore`: get/set/delete, overwrite, `ttl=None` never expires, TTL expiry via an injected clock, non-`str` key and value both raise, `purge` removes only expired rows. `SqliteStore` additionally: values survive reopening the database.
+- `ScopedStore` — two scopes writing the same key do not see each other; the prefix never leaks back through `get`; a scoped `delete` leaves the other scope intact.
+- Role binding — `bind` is called on every sensor, decider, and actuator before any message is consumed; each receives a store scoped to its own `kind/name`.
 - `Scheduler` — a timer does not fire before `start(owner)`; fires after; stops firing after `stop(owner)`; a raising callback does not kill the loop; a slow callback does not overlap itself; `every` called while running launches immediately; a sensor whose `start()` raises has its timers stopped.
 - `GitHubSensor` — existing tests port to the new lifecycle: construct, `bind` with a fake ctx, drive `ctx.http`'s app with `TestClient`. Signature verification, event mapping, dedup, and the emit-then-record ordering assertions all carry over unchanged in intent.
 - `Bus` — bind happens before the server starts; timers stop before `stop()` is awaited.
@@ -409,5 +519,6 @@ No new environment variables. `SB_PORT` and `SB_DATA_DIR` now reach `HttpServer`
 | Cron scheduling | Cron's step values (`*/7`) are wall-clock matching, not intervals — `*/7` fires at :00 :07 … :56 with a 4-minute gap at the hour, and only divisors of 60 behave interval-like. It also has no sub-minute resolution. So it does not subsume `every()`, and `every()` does not subsume it: cron alone expresses "3am daily". Nothing wants a wall-clock job yet, and adopting it now would import a parser dependency, a DST policy for the hour that repeats and the hour that does not exist, and a skip-if-running policy that fixed-delay currently makes unnecessary. Add later as a second verb, `at("0 9 * * 1-5", fn)`, decided against a real job. |
 | Non-exclusive HTTP routes | Decider fan-out already serves the use case without coupling failure domains. |
 | Cross-process coordination | mamamia is single-node by design. |
+| A global / unscoped store | Shared memory between roles is an out-of-band channel that bypasses the log. The data a role needs from another role arrives as an observation; each role projects its own copy. Additive later if a genuine case appears. |
 | `LinearSensor` itself | The example the design is answerable to, not a deliverable here. |
 | `LoggerTap` payload redaction | Real outstanding issue — full payloads including `interaction_token` reach persistent logs — but orthogonal to this change. |
