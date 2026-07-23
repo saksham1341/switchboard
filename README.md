@@ -11,25 +11,42 @@ world and reports a result observation, **Tap** reads a log and records.
 ## Design
 See [docs/superpowers/specs/2026-07-21-switchboard-design.md](docs/superpowers/specs/2026-07-21-switchboard-design.md).
 
+## Scripts
+
+| script | when |
+|---|---|
+| `./scripts/dev.sh [run\|test\|shell]` | local development |
+| `./scripts/deploy.sh` | first deploy on a host (idempotent) |
+| `./scripts/update.sh` | redeploy an existing host |
+| `./scripts/vendor-mamamia.sh` | rebuild the pinned mamamia wheel into `vendor/` |
+
 ## Develop
 ```bash
-python3.12 -m venv venv && . venv/bin/activate
-pip install -e ../mamamia          # co-developed sibling checkout
-pip install -e ".[dev]"
-python -m pytest -q
+./scripts/dev.sh test        # venv + deps if needed, then pytest
+./scripts/dev.sh run         # app on 127.0.0.1:8199, data in .devdata/
 ```
+It creates the venv, installs mamamia editable from `../mamamia` (falling back to
+the vendored wheel), and always overrides `SB_PORT`/`SB_DATA_DIR` so a dev run
+can't collide with a deployment.
 
-## Run (Docker, on the Pi)
-1. Vendor the pinned mamamia wheel (it is not on any index, and `vendor/` is
-   gitignored — re-run after bumping mamamia):
+## Run (Docker, on a host)
+1. Vendor the pinned mamamia wheel — it is not on any index and `vendor/` is
+   gitignored, so no `git pull` ever refreshes it:
    ```bash
    ./scripts/vendor-mamamia.sh          # MAMAMIA_DIR=../mamamia by default
    ```
-2. `cp .env.example .env` and fill it in (`chmod 600 .env`).
+   No mamamia checkout on the host? Build it elsewhere and `scp` the wheel into
+   `vendor/`.
+2. `cp .env.example .env`, fill it in, `chmod 600 .env`.
    `GITHUB_WEBHOOK_SECRET` is required; the Discord block is optional — see below.
-3. `docker compose up -d --build`
-4. Point the GitHub webhook at the tunnel hostname's `/webhook`, content-type
-   `application/json`, with the same secret.
+3. `./scripts/deploy.sh` — checks prerequisites, validates `.env`, builds,
+   starts, and waits for `/health` before reporting success.
+4. Point the GitHub webhook at your hostname's `/webhook`, content-type
+   `application/json`, same secret, events `pull_request`,
+   `pull_request_review`, `issues`, `check_run`.
+
+Afterwards, `./scripts/update.sh` pulls, re-checks the wheel, rebuilds, restarts
+and re-verifies health.
 
 ### Ingress
 
