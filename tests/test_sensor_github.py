@@ -11,11 +11,11 @@ FIX = Path(__file__).parent / "fixtures" / "github"
 def _load(n): return json.loads((FIX / n).read_text())
 
 
-def _signed_post(client, secret, gh_event, payload_dict, delivery):
+def _signed_post(client, secret, gh_event, payload_dict, delivery, path="/webhook/github"):
     import json as _json
     body = _json.dumps(payload_dict).encode()
     sig = "sha256=" + _hmac.new(secret.encode(), body, _hashlib.sha256).hexdigest()
-    return client.post("/webhook", content=body, headers={
+    return client.post(path, content=body, headers={
         "X-Hub-Signature-256": sig, "X-GitHub-Event": gh_event, "X-GitHub-Delivery": delivery})
 
 
@@ -63,3 +63,28 @@ def test_webhook_emits_with_real_observation_id_and_dedups():
 
     r2 = _signed_post(client, "s3cret", "pull_request", pr, "d-1")
     assert r2.status_code == 200 and len(emitted) == 1
+
+
+def test_only_provider_scoped_path_is_served():
+    # /webhook/github is the only GitHub route. The old unscoped /webhook is
+    # gone — one hostname serves every webhook sensor, each on its own path.
+    from switchboard.sensors.github import GitHubSensor
+    emitted = []
+
+    async def fake_emit(name, payload):
+        emitted.append(name)
+        return len(emitted)
+
+    s = GitHubSensor("s3cret", seen_db=":memory:")
+    s.bind(fake_emit)
+    client = TestClient(s.app)
+    pr = _load("pull_request.opened.json")
+
+    ok = _signed_post(client, "s3cret", "pull_request", pr, "d-new", path="/webhook/github")
+    assert ok.status_code == 200
+    assert emitted == ["github.home.pr.opened"]
+
+    for gone in ("/webhook", "/webhook/linear"):
+        r = _signed_post(client, "s3cret", "pull_request", pr, "d-x", path=gone)
+        assert r.status_code == 404, f"{gone} should not be served"
+    assert emitted == ["github.home.pr.opened"]        # no extra emits
