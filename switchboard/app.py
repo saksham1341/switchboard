@@ -17,7 +17,8 @@ DISCORD_COMMANDS = [
 
 
 def build(config: dict):
-    bus = Bus(config["mamamia_db_path"])
+    bus = Bus(config["mamamia_db_path"],
+              max_log_messages=int(config.get("max_log_messages", 10_000)))
     bus.add_tap(LoggerTap())
 
     sensors = [GitHubSensor(secret=config["github_secret"],
@@ -52,6 +53,7 @@ async def run() -> None:
         "switchboard_db_path": os.path.join(data_dir, "switchboard.db"),
         "github_secret": os.environ["GITHUB_WEBHOOK_SECRET"],
         "port": int(os.environ.get("SB_PORT", "8080")),
+        "max_log_messages": int(os.environ.get("SB_MAX_LOG_MESSAGES", "10000")),
         "discord_bot_token": os.environ.get("DISCORD_BOT_TOKEN"),
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),

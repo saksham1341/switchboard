@@ -25,6 +25,13 @@ def test_build_wires_discord_and_relay(tmp_path):
     assert {"ping", "echo", "github-notify"} <= {d.name for d in bus._deciders}
 
 
+def test_max_log_messages_reaches_the_bus(tmp_path):
+    # SB_MAX_LOG_MESSAGES is passed through compose; it must not be inert.
+    bus, _ = build(_base(tmp_path) | {"max_log_messages": 250})
+    assert bus._max_log_messages == 250
+    assert build(_base(tmp_path))[0]._max_log_messages == 10_000   # default
+
+
 def test_relay_decider_absent_without_notify_channel(tmp_path):
     cfg = _base(tmp_path) | {"discord_bot_token": "bot", "discord_application_id": "app"}
     bus, _ = build(cfg)
