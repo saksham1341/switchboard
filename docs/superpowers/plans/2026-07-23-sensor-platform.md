@@ -45,7 +45,14 @@
 **Delete:**
 - `switchboard/dedup.py`, `tests/test_dedup.py` (Task 7)
 
-**Deliberate non-change:** the existing `seen` table in `switchboard.db` is left in place, not migrated and not dropped. GitHub dedup keys carry a 7-day TTL and the practical exposure is a redelivery arriving in the seconds around a deploy — worth one possible duplicate post rather than a migration step that can only go wrong. A later cleanup drops the table once the new path has run for a while.
+**On `SeenStore`:** the module and its tests are deleted outright in Task 7. Its rows are not migrated into `kv` — GitHub dedup keys carry a 7-day TTL, so the only exposure is a redelivery arriving in the seconds around a deploy, which costs one duplicate Discord post. Not worth a migration path that exists to be run once.
+
+The dead `seen` table is dropped by hand at deploy time rather than from code, because a generic `KeyStore` should not carry knowledge of a legacy table it never owned:
+
+```bash
+docker compose exec switchboard python -c \
+  "import sqlite3; sqlite3.connect('/data/switchboard.db').execute('DROP TABLE IF EXISTS seen')"
+```
 
 ---
 
@@ -721,17 +728,17 @@ git commit -m "feat: owner-scoped Scheduler with fixed-delay timers"
 
 ---
 
-### Task 4: Role context types
+### Task 4: Role contexts and actuator migration
 
 **Files:**
-- Modify: `switchboard/message.py`
-- Test: `tests/test_message.py`
+- Modify: `switchboard/message.py`, `switchboard/actuators/discord.py`, `switchboard/bus.py`
+- Test: `tests/test_message.py`, `tests/test_actuators_discord.py`
 
 **Interfaces:**
 - Consumes: `KeyStore` (Task 1), `HttpServer` (Task 2), `OwnerSchedule` (Task 3)
-- Produces: `SensorCtx(emit, http, store, schedule)`, `DeciderCtx(store)`, `ActuatorCtx(store)`, `TapCtx(store)`; `bind` declared on all four role protocols.
+- Produces: `SensorCtx(emit, http, store, schedule)`, `DeciderCtx(store)`, `ActuatorCtx(store)`, `TapCtx(store)`; `bind` on all four role protocols; `ActCtx(cmd, _emit_result)` — the `context` field is **gone**, and `Actuator.context()` with it.
 
-This task is **additive only**. `ActCtx.context` and `Actuator.context()` still exist and are removed in Task 6, so the suite stays green throughout.
+`ActCtx.context` is removed here rather than deferred behind a compatibility shim. Its only consumers are `bus._run_actuator`, the two Discord actuators, and their tests — all of which migrate in this task, so nothing is preserved and nothing is left red.
 
 Import note: `switchboard/http.py` shadows nothing (the stdlib module is `http`, imported absolutely), but `message.py` must import these for typing only — use `from switchboard.http import HttpServer` at module level; there is no cycle because `http.py`, `store.py`, and `scheduler.py` import nothing from `switchboard`.
 
@@ -767,6 +774,62 @@ def test_actuator_ctx_is_store_only():
 def test_tap_ctx_is_store_only():
     ctx = TapCtx(store=MemoryStore())
     assert set(vars(ctx)) == {"store"}          # no emit, no http: a tap reads
+
+
+def test_act_ctx_has_no_context_field():
+    from switchboard.message import ActCtx
+    assert "context" not in ActCtx.__dataclass_fields__
+```
+
+And the actuator tests, which drop `context=` and gain `bind`:
+
+```python
+# tests/test_actuators_discord.py
+from switchboard.message import Command, ActCtx, ActuatorCtx
+from switchboard.store import MemoryStore
+
+
+def _bind(a):
+    a.bind(ActuatorCtx(store=MemoryStore()))
+    return a
+
+
+async def test_discord_post_sends_embed_and_reports_result():
+    seen, results = {}, []
+    def h(req):
+        seen["url"] = str(req.url); seen["body"] = json.loads(req.content)
+        seen["auth"] = req.headers.get("authorization")
+        return httpx.Response(200, json={"id": "m-1"})
+    a = _bind(DiscordPost("bot", "app", channel_id="chan-9", client=_client(h)))
+    ctx = ActCtx(cmd=_cmd("discord.post", {"channel_id": "chan-9", "embed": {"title": "hi"}}),
+                 _emit_result=await _recorder(results))
+    await a.act(ctx.cmd, ctx)
+    assert seen["url"] == f"{DISCORD_API}/channels/chan-9/messages"
+    assert seen["body"]["embeds"] == [{"title": "hi"}]
+    assert seen["auth"] == "Bot bot"
+    assert results and results[0][0] == "discord.post.ok"
+
+
+async def test_discord_reply_uses_followup_and_reports_result():
+    seen, results = {}, []
+    def h(req):
+        seen["url"] = str(req.url); seen["body"] = json.loads(req.content)
+        seen["auth"] = req.headers.get("authorization")
+        return httpx.Response(200, json={})
+    a = _bind(DiscordReply("bot", "app", client=_client(h)))
+    ctx = ActCtx(cmd=_cmd("discord.reply", {"interaction_token": "tok", "content": "pong"}),
+                 _emit_result=await _recorder(results))
+    await a.act(ctx.cmd, ctx)
+    assert seen["url"] == f"{DISCORD_API}/webhooks/app/tok"
+    assert seen["body"] == {"content": "pong"}
+    assert seen["auth"] is None
+    assert results and results[0][0] == "discord.reply.ok"
+
+
+async def test_actuator_ctx_store_is_available_after_bind():
+    a = _bind(DiscordReply("bot", "app", client=_client(lambda r: httpx.Response(200, json={}))))
+    await a.ctx.store.set("idem:cmd-1", "sent")
+    assert await a.ctx.store.get("idem:cmd-1") == "sent"
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -814,7 +877,19 @@ class TapCtx:
     store: KeyStore
 ```
 
-Then add `bind` to each protocol (leaving `Actuator.context` in place for now):
+Strip `ActCtx` to per-command state only:
+
+```python
+@dataclass
+class ActCtx:
+    cmd: Command
+    _emit_result: Callable[[str, dict, int], Awaitable[int]]
+
+    async def result(self, outcome: str, payload: dict | None = None) -> int:
+        return await self._emit_result(f"{self.cmd.name}.{outcome}", payload or {}, self.cmd.id)
+```
+
+Then add `bind` to each protocol, with no `context()` on `Actuator`:
 
 ```python
 @runtime_checkable
@@ -837,7 +912,6 @@ class Decider(Protocol):
 class Actuator(Protocol):
     name: str
     def bind(self, ctx: ActuatorCtx) -> None: ...
-    def context(self) -> Any: ...          # removed in Task 6
     async def act(self, cmd: Command, ctx: ActCtx) -> None: ...
 
 
@@ -849,16 +923,64 @@ class Tap(Protocol):
     async def observe(self, log: str, view) -> None: ...
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 4: Migrate the actuators**
 
-Run: `./scripts/dev.sh test`
-Expected: PASS, whole suite green (this task adds only)
+In `switchboard/bus.py`, `_run_actuator` stops calling `context()`:
 
-- [ ] **Step 5: Commit**
+```python
+    async def _run_actuator(self, a):
+        async def handle(cmd):
+            ctx = ActCtx(cmd=cmd,
+                         _emit_result=lambda name, payload, cid:
+                             self.emit_observation(name, payload, command_id=cid))
+            await a.act(cmd, ctx)
+        await self._consume(CMD_LOG, f"actuator/{a.name}",
+                            Command.from_message, lambda c: c.name == a.name, handle)
+```
+
+Delete the `ctx_obj = a.context()` line above it.
+
+In `switchboard/actuators/discord.py`, build the sender in `bind` rather than `__init__` — that deferral is the one thing `context()` was actually buying, since an httpx client wants a running loop:
+
+```python
+class DiscordPost:
+    """Actuator for the `discord.post` command: post a channel message."""
+    name = "discord.post"
+
+    def __init__(self, bot_token, application_id, *, channel_id=None, client=None):
+        self._token, self._app_id = bot_token, application_id
+        self._default_channel = channel_id
+        self._client = client
+        self._sender = None
+
+    def bind(self, ctx):
+        self.ctx = ctx
+        self._sender = DiscordSender(self._token, self._app_id, client=self._client)
+
+    async def act(self, cmd, ctx):
+        channel = cmd.args.get("channel_id") or self._default_channel
+        await self._sender.send(channel, embed=cmd.args.get("embed"),
+                                components=cmd.args.get("components"))
+        await ctx.result("ok", {"channel_id": channel})
+
+    async def close(self):
+        if self._sender is not None:
+            await self._sender.close()
+```
+
+Apply the same shape to `DiscordReply`, whose `act` calls `self._sender.reply(...)`.
+
+- [ ] **Step 5: Run the tests**
+
+Run: `./scripts/dev.sh test tests/test_message.py tests/test_actuators_discord.py`
+Expected: PASS. `tests/test_relay_e2e.py` fails here — the Bus does not bind actuators yet, so `self._sender` is `None`. Fixed in Task 5.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add switchboard/message.py tests/test_message.py
-git commit -m "feat: role context types for sensor, decider, actuator, tap"
+git add switchboard/message.py switchboard/actuators/ switchboard/bus.py \
+        tests/test_message.py tests/test_actuators_discord.py
+git commit -m "feat: role contexts; drop ActCtx.context and Actuator.context()"
 ```
 
 ---
@@ -1288,8 +1410,8 @@ Note the `_emit` closure no longer needs the `_s=s` default-argument trick — i
 
 - [ ] **Step 6: Run the tests**
 
-Run: `./scripts/dev.sh test tests/test_bus.py tests/test_sensor_github.py tests/test_sensor_discord.py`
-Expected: PASS. `tests/test_app.py` and `tests/test_relay_e2e.py` may still fail here — they are fixed in Tasks 6 and 7.
+Run: `./scripts/dev.sh test tests/test_bus.py tests/test_sensor_github.py tests/test_sensor_discord.py tests/test_relay_e2e.py`
+Expected: PASS. `test_relay_e2e.py` recovers here — it goes through `bus.start()`, which now binds actuators, so the sender built in Task 4's `bind` exists. `tests/test_app.py` still fails; it is fixed in Task 7.
 
 - [ ] **Step 7: Commit**
 
@@ -1301,155 +1423,69 @@ git commit -m "feat: bind every role, shared http, owner-scoped timers"
 
 ---
 
-### Task 6: Decider, actuator, and tap migration
+### Task 6: Decider and tap migration
 
 **Files:**
-- Modify: `switchboard/deciders/discord_cmds.py`, `switchboard/deciders/github_notify.py`, `switchboard/actuators/discord.py`, `switchboard/taps/logger.py`, `switchboard/message.py`, `switchboard/bus.py`
-- Test: `tests/test_actuators_discord.py`, `tests/test_deciders.py`, `tests/test_github_notify.py`, `tests/test_tap_logger.py`, `tests/test_relay_e2e.py`
+- Modify: `switchboard/deciders/discord_cmds.py`, `switchboard/deciders/github_notify.py`, `switchboard/taps/logger.py`
+- Test: `tests/test_deciders.py`, `tests/test_github_notify.py`, `tests/test_tap_logger.py`, `tests/test_relay_e2e.py`
 
 **Interfaces:**
-- Consumes: `ActuatorCtx`, `DeciderCtx`, `TapCtx` (Task 4)
-- Produces: `ActCtx(cmd, _emit_result)` — the `context` field is gone; `Actuator` protocol no longer declares `context()`.
+- Consumes: `DeciderCtx`, `TapCtx` (Task 4)
+- Produces: `bind` on `PingDecider`, `EchoDecider`, `GitHubNotifyDecider`, `LoggerTap`.
 
-- [ ] **Step 1: Update the actuator tests**
+Actuators migrated in Task 4 alongside the `ActCtx` change. This task is the remaining mechanical half.
+
+- [ ] **Step 1: Update the decider and tap tests**
+
+Every place a decider or tap is constructed and driven directly gains a `bind`:
 
 ```python
-# tests/test_actuators_discord.py
-from switchboard.message import Command, ActCtx, ActuatorCtx
+# tests/test_deciders.py, tests/test_github_notify.py, tests/test_tap_logger.py
+from switchboard.message import DeciderCtx, TapCtx
 from switchboard.store import MemoryStore
 
-
-def _bind(a):
-    a.bind(ActuatorCtx(store=MemoryStore()))
-    return a
-
-
-async def test_discord_post_sends_embed_and_reports_result():
-    seen, results = {}, []
-    def h(req):
-        seen["url"] = str(req.url); seen["body"] = json.loads(req.content)
-        seen["auth"] = req.headers.get("authorization")
-        return httpx.Response(200, json={"id": "m-1"})
-    a = _bind(DiscordPost("bot", "app", channel_id="chan-9", client=_client(h)))
-    ctx = ActCtx(cmd=_cmd("discord.post", {"channel_id": "chan-9", "embed": {"title": "hi"}}),
-                 _emit_result=await _recorder(results))
-    await a.act(ctx.cmd, ctx)
-    assert seen["url"] == f"{DISCORD_API}/channels/chan-9/messages"
-    assert seen["body"]["embeds"] == [{"title": "hi"}]
-    assert seen["auth"] == "Bot bot"
-    assert results and results[0][0] == "discord.post.ok"
-
-
-async def test_discord_reply_uses_followup_and_reports_result():
-    seen, results = {}, []
-    def h(req):
-        seen["url"] = str(req.url); seen["body"] = json.loads(req.content)
-        seen["auth"] = req.headers.get("authorization")
-        return httpx.Response(200, json={})
-    a = _bind(DiscordReply("bot", "app", client=_client(h)))
-    ctx = ActCtx(cmd=_cmd("discord.reply", {"interaction_token": "tok", "content": "pong"}),
-                 _emit_result=await _recorder(results))
-    await a.act(ctx.cmd, ctx)
-    assert seen["url"] == f"{DISCORD_API}/webhooks/app/tok"
-    assert seen["body"] == {"content": "pong"}
-    assert seen["auth"] is None
-    assert results and results[0][0] == "discord.reply.ok"
-
-
-async def test_actuator_ctx_store_is_available_after_bind():
-    a = _bind(DiscordReply("bot", "app", client=_client(lambda r: httpx.Response(200, json={}))))
-    await a.ctx.store.set("idem:cmd-1", "sent")
-    assert await a.ctx.store.get("idem:cmd-1") == "sent"
+d = PingDecider()
+d.bind(DeciderCtx(store=MemoryStore()))
 ```
 
-Add `bind` to the fake roles in `tests/test_deciders.py`, `tests/test_github_notify.py`, `tests/test_tap_logger.py`, and `tests/test_relay_e2e.py` wherever a decider/actuator/tap is constructed and driven directly.
+```python
+# tests/test_deciders.py — add
+async def test_decider_ctx_store_is_scoped_and_usable():
+    d = PingDecider()
+    d.bind(DeciderCtx(store=MemoryStore()))
+    await d.ctx.store.set("debounce:pr-7", "1")
+    assert await d.ctx.store.get("debounce:pr-7") == "1"
+```
+
+`tests/test_relay_e2e.py` needs no per-role change — it goes through `bus.start()`, which binds everything.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `./scripts/dev.sh test tests/test_actuators_discord.py`
-Expected: FAIL — `TypeError: ActCtx.__init__() missing 1 required positional argument: 'context'`
+Run: `./scripts/dev.sh test tests/test_deciders.py`
+Expected: FAIL — `AttributeError: 'PingDecider' object has no attribute 'bind'`
 
-- [ ] **Step 3: Remove `ActCtx.context` and `Actuator.context()`**
+- [ ] **Step 3: Add `bind` to each decider and the tap**
 
-In `switchboard/message.py`:
-
-```python
-@dataclass
-class ActCtx:
-    cmd: Command
-    _emit_result: Callable[[str, dict, int], Awaitable[int]]
-
-    async def result(self, outcome: str, payload: dict | None = None) -> int:
-        return await self._emit_result(f"{self.cmd.name}.{outcome}", payload or {}, self.cmd.id)
-```
-
-Delete the `def context(self) -> Any: ...` line from the `Actuator` protocol.
-
-In `switchboard/bus.py`, `_run_actuator` loses the `context()` call:
-
-```python
-    async def _run_actuator(self, a):
-        async def handle(cmd):
-            ctx = ActCtx(cmd=cmd,
-                         _emit_result=lambda name, payload, cid:
-                             self.emit_observation(name, payload, command_id=cid))
-            await a.act(cmd, ctx)
-        await self._consume(CMD_LOG, f"actuator/{a.name}",
-                            Command.from_message, lambda c: c.name == a.name, handle)
-```
-
-- [ ] **Step 4: Add `bind` to every concrete role**
-
-`switchboard/actuators/discord.py` — construct the sender in `bind`, not `__init__`, so the aiohttp/httpx client is created with a loop running (the reason `context()` existed):
-
-```python
-class DiscordPost:
-    """Actuator for the `discord.post` command: post a channel message."""
-    name = "discord.post"
-
-    def __init__(self, bot_token, application_id, *, channel_id=None, client=None):
-        self._token, self._app_id = bot_token, application_id
-        self._default_channel = channel_id
-        self._client = client
-        self._sender = None
-
-    def bind(self, ctx):
-        self.ctx = ctx
-        self._sender = DiscordSender(self._token, self._app_id, client=self._client)
-
-    async def act(self, cmd, ctx):
-        channel = cmd.args.get("channel_id") or self._default_channel
-        await self._sender.send(channel, embed=cmd.args.get("embed"),
-                                components=cmd.args.get("components"))
-        await ctx.result("ok", {"channel_id": channel})
-
-    async def close(self):
-        if self._sender is not None:
-            await self._sender.close()
-```
-
-Apply the same shape to `DiscordReply` (`self._sender.reply(...)` in `act`).
-
-`switchboard/deciders/discord_cmds.py`, `switchboard/deciders/github_notify.py`, `switchboard/taps/logger.py` — each gains:
+`switchboard/deciders/discord_cmds.py` (both deciders), `switchboard/deciders/github_notify.py`, and `switchboard/taps/logger.py` each gain:
 
 ```python
     def bind(self, ctx) -> None:
         self.ctx = ctx
 ```
 
-- [ ] **Step 5: Run the full suite**
+`build_message` and the tap's `observe` are otherwise unchanged.
+
+- [ ] **Step 4: Run the full suite**
 
 Run: `./scripts/dev.sh test`
 Expected: PASS except `tests/test_app.py`, fixed in Task 7
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add switchboard/ tests/
-git commit -m "feat: bind deciders, actuators, and taps; drop Actuator.context()"
+git add switchboard/deciders/ switchboard/taps/ tests/
+git commit -m "feat: bind deciders and taps"
 ```
-
----
 
 ### Task 7: App wiring and dedup removal
 
@@ -1578,4 +1614,11 @@ git commit -m "feat: wire the platform into app.build and remove SeenStore"
 
 ## Post-merge deployment note
 
-`switchboard.db` gains a `kv` table; the old `seen` table is left in place, unread. No migration step, no schema drop. Deploy with `./scripts/update.sh` as usual — the health gate covers the change, since `/health` moving from `GitHubSensor` to `HttpServer` is exactly what that gate exercises.
+`switchboard.db` gains a `kv` table. Deploy with `./scripts/update.sh` as usual — its health gate covers the riskiest part of this change, since `/health` moving from `GitHubSensor` to `HttpServer` is exactly what that gate exercises. Then drop the dead `seen` table with the one-liner in File Structure above.
+
+Verify after deploy, as with the last one:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://switchboard.yellowpages.ink/health         # 200
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://switchboard.yellowpages.ink/webhook/github  # 401
+```
