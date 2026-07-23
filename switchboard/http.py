@@ -26,11 +26,28 @@ class HttpServer:
         ])
         self._owners[("GET", "/health")] = "switchboard"
 
-    def route(self, path: str, handler, *, methods=("GET",), owner: str = "?") -> None:
-        # Ownership is per (method, path): a request is identified by both, and
-        # that is the granularity at which exactly one response exists. GET /x
-        # and POST /x never contend, so they may have different owners — which
-        # is what lets a provider verify over GET at the URL it POSTs events to.
+    def route(self, path: str, handler, *, owner: str, methods=("GET",)) -> None:
+        """Register a handler and record who owns it.
+
+        `owner` is diagnostic, not functional — it never affects routing. It is
+        the name of the component claiming this request, and it exists so a
+        collision can say *who* it collided with:
+
+            POST /webhook/github already registered by 'github'.
+
+        Without it the error is "already registered" and nothing more, which on
+        a server shared by several sensors is the difference between a
+        five-second fix and a grep. It is required rather than defaulted for
+        that reason: an unattributed claim produces exactly the useless message
+        the parameter exists to prevent. Use the role's `name` ("github",
+        "dashboard"); anything a reader can grep for is fine.
+
+        Ownership is keyed on (method, path), not path alone: a request is
+        identified by both, and that is the granularity at which exactly one
+        response exists. GET /x and POST /x never contend, so they may have
+        different owners — which is what lets a provider answer a verification
+        challenge over GET at the same URL it POSTs events to.
+        """
         claims = [m.upper() for m in methods]
         for m in claims:
             if (m, path) in self._owners:
