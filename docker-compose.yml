@@ -16,12 +16,20 @@ services:
       # no GitHub events relayed into Discord.
       DISCORD_GITHUB_NOTIFY_CHANNEL_ID: ${DISCORD_GITHUB_NOTIFY_CHANNEL_ID:-}
 
+      # --- Dashboard ---
+      # Unset SB_DASHBOARD_TOKEN entirely = no dashboard (no server, no routes).
+      SB_DASHBOARD_TOKEN: ${SB_DASHBOARD_TOKEN:-}
+      SB_DASHBOARD_PORT: ${SB_DASHBOARD_PORT:-8090}
+
       # --- Tuning ---
       SB_MAX_LOG_MESSAGES: ${SB_MAX_LOG_MESSAGES:-10000}
       SB_PORT: ${SB_PORT:-8080}
-    # Loopback only — never the LAN. Ingress (tunnel, reverse proxy, whatever)
-    # is the host's concern, not this stack's; point it at 127.0.0.1:8080.
+    # Both loopback only — never the LAN. The public tunnel is pointed at
+    # :8080 and reaches the webhook and /health. The dashboard is on :8090,
+    # published loopback too but NOT tunneled, so it is reachable over an SSH
+    # tunnel and never from the internet.
     ports:
       - "127.0.0.1:${SB_HOST_PORT:-8080}:${SB_PORT:-8080}"
+      - "127.0.0.1:${SB_DASHBOARD_PORT:-8090}:${SB_DASHBOARD_PORT:-8090}"
     volumes:
       - ./data:/data
