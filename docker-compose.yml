@@ -3,7 +3,20 @@ services:
     build: .
     restart: unless-stopped
     environment:
+      # --- GitHub ingress (required) ---
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?set GITHUB_WEBHOOK_SECRET in .env}
+
+      # --- Discord (optional) ---
+      # The Discord half is wired only when DISCORD_BOT_TOKEN is set. If it is
+      # set, DISCORD_APPLICATION_ID is required — the app fails fast without it.
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      DISCORD_APPLICATION_ID: ${DISCORD_APPLICATION_ID:-}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      # Target channel for the github-notify relay. Unset = slash commands only,
+      # no GitHub events relayed into Discord.
+      DISCORD_GITHUB_NOTIFY_CHANNEL_ID: ${DISCORD_GITHUB_NOTIFY_CHANNEL_ID:-}
+
+      # --- Tuning ---
       SB_MAX_LOG_MESSAGES: ${SB_MAX_LOG_MESSAGES:-10000}
       SB_PORT: ${SB_PORT:-8080}
     expose:

@@ -17,7 +17,8 @@ DISCORD_COMMANDS = [
 
 
 def build(config: dict):
-    bus = Bus(config["mamamia_db_path"])
+    bus = Bus(config["mamamia_db_path"],
+              max_log_messages=int(config.get("max_log_messages", 10_000)))
     bus.add_tap(LoggerTap())
 
     sensors = [GitHubSensor(secret=config["github_secret"],
@@ -37,8 +38,9 @@ def build(config: dict):
         bus.add_sensor(discord_sensor); sensors.append(discord_sensor)
         bus.add_decider(PingDecider()); bus.add_decider(EchoDecider())
         bus.add_actuator(DiscordReply(token, app_id))
-        if config.get("discord_notify_channel_id"):
-            bus.add_decider(GitHubNotifyDecider(channel_id=config["discord_notify_channel_id"]))
+        if config.get("discord_github_notify_channel_id"):
+            bus.add_decider(GitHubNotifyDecider(
+                channel_id=config["discord_github_notify_channel_id"]))
             bus.add_actuator(DiscordPost(token, app_id))
 
     return bus, sensors
@@ -51,10 +53,11 @@ async def run() -> None:
         "switchboard_db_path": os.path.join(data_dir, "switchboard.db"),
         "github_secret": os.environ["GITHUB_WEBHOOK_SECRET"],
         "port": int(os.environ.get("SB_PORT", "8080")),
+        "max_log_messages": int(os.environ.get("SB_MAX_LOG_MESSAGES", "10000")),
         "discord_bot_token": os.environ.get("DISCORD_BOT_TOKEN"),
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
-        "discord_notify_channel_id": os.environ.get("DISCORD_NOTIFY_CHANNEL_ID"),
+        "discord_github_notify_channel_id": os.environ.get("DISCORD_GITHUB_NOTIFY_CHANNEL_ID"),
     }
     bus, _ = build(config)
     await bus.start()
