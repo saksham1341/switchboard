@@ -52,11 +52,18 @@ def build(config: dict):
     # No token, no dashboard: fail closed rather than serving an unauthenticated
     # ingest endpoint. There is deliberately no default token.
     if config.get("dashboard_token"):
+        # The dashboard gets its own HttpServer on its own port. The main server
+        # is what the public tunnel reaches; this one is published loopback-only,
+        # so the page and stream are reachable via an SSH tunnel and never from
+        # the internet, while the webhook and /health stay public.
+        dash_http = HttpServer(host=config.get("host", "0.0.0.0"),
+                               port=int(config.get("dashboard_port", 8090)))
         dash = Dashboard(topology=bus.topology(), token=config["dashboard_token"],
                          db_path=config["mamamia_db_path"])
-        http.route("/", dash.page, owner="dashboard")
-        http.route("/dashboard/stream", dash.stream, owner="dashboard")
-        http.route("/dashboard/ingest", dash.ingest, methods=["POST"], owner="dashboard")
+        dash_http.route("/", dash.page, owner="dashboard")
+        dash_http.route("/dashboard/stream", dash.stream, owner="dashboard")
+        dash_http.route("/dashboard/ingest", dash.ingest, methods=["POST"], owner="dashboard")
+        bus.add_server(dash_http)
         bus.add_tap(DashboardTap(url=config["dashboard_ingest_url"],
                                  token=config["dashboard_token"]))
         # The only polling in the design: a dead command emits no result
@@ -79,9 +86,10 @@ async def run() -> None:
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
         "discord_github_notify_channel_id": os.environ.get("DISCORD_GITHUB_NOTIFY_CHANNEL_ID"),
         "dashboard_token": os.environ.get("SB_DASHBOARD_TOKEN"),
+        "dashboard_port": int(os.environ.get("SB_DASHBOARD_PORT", "8090")),
         "dashboard_ingest_url": os.environ.get(
             "SB_DASHBOARD_INGEST_URL",
-            f"http://127.0.0.1:{os.environ.get('SB_PORT', '8080')}/dashboard/ingest"),
+            f"http://127.0.0.1:{os.environ.get('SB_DASHBOARD_PORT', '8090')}/dashboard/ingest"),
     }
     bus, _ = build(config)
     await bus.start()
