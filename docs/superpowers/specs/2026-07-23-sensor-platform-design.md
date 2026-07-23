@@ -221,13 +221,18 @@ class KeyStore(Protocol):
 **`str` → `str`, enforced, no coercion.**
 
 ```python
-def _check(key, value=None):
+def _check_key(key):
     if not isinstance(key, str):
         raise TypeError(f"KeyStore keys must be str, got {type(key).__name__}")
-    if value is not None and not isinstance(value, str):
+
+
+def _check_value(value):
+    if not isinstance(value, str):
         raise TypeError(f"KeyStore values must be str, got {type(value).__name__}. "
                         f"Serialize structured values yourself (json.dumps).")
 ```
+
+Two functions rather than one with an optional `value` parameter. A single `_check(key, value=None)` would have to treat `None` as "no value supplied", which silently exempts `set(k, None)` from validation and stores a `None` that reads back indistinguishable from an unset key.
 
 Implicit `str()` would make `set(k, 5)` followed by `get(k) == 5` evaluate `False`, discovered in production. Callers that want structure call `json.dumps` — visible, and their choice of format.
 
@@ -261,7 +266,7 @@ class ScopedStore:
         self._inner, self._prefix = inner, prefix
 
     async def get(self, key):
-        _check(key)
+        _check_key(key)
         return await self._inner.get(self._prefix + key)
     ...
 ```
