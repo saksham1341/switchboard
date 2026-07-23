@@ -23,6 +23,14 @@ from switchboard.store import MemoryStore, ScopedStore
 logger = logging.getLogger(__name__)
 
 
+def _as_async(fn):
+    """Wrap a sync callable so the scheduler, which awaits its callbacks, can
+    drive it. SqliteStore.purge is a plain method."""
+    async def call():
+        return fn()
+    return call
+
+
 class Bus:
     def __init__(self, mamamia_db_path, *, store=None, http=None,
                  default_timeout_s=30.0, wait_ms=30_000, reaper_interval=60.0,
@@ -43,6 +51,7 @@ class Bus:
         self._running = False
         self._started = False
         self._started_owners: list[str] = []
+        self._maintenance: list[str] = []
 
         self._store = store if store is not None else MemoryStore()
         self._owns_store = store is None
@@ -56,6 +65,12 @@ class Bus:
     def add_decider(self, d): self._deciders.append(d)
     def add_actuator(self, a): self._actuators.append(a)
     def add_tap(self, t): self._taps.append(t)
+
+    def schedule_maintenance(self, owner: str, seconds: float, fn) -> None:
+        """A timer owned by the bus rather than by any role. Started with the
+        bus; cancelled by stop_all() in stop()."""
+        self._scheduler.for_owner(owner).every(seconds, _as_async(fn), name=owner)
+        self._maintenance.append(owner)
 
     # emit
     async def _append(self, log, name, payload, *, command_id=None, observation_id=None) -> int:
@@ -123,6 +138,9 @@ class Bus:
             self._tasks.append(task)
             self._scheduler.start(s.name)
             self._started_owners.append(s.name)
+
+        for owner in self._maintenance:
+            self._scheduler.start(owner)
 
     def _sensor_exited(self, name, task):
         # A clean return is normal for a route-driven sensor and its timers must

@@ -2,6 +2,8 @@ import asyncio
 import os
 
 from switchboard.bus import Bus
+from switchboard.http import HttpServer
+from switchboard.store import SqliteStore
 from switchboard.sensors.github import GitHubSensor
 from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
@@ -17,14 +19,14 @@ DISCORD_COMMANDS = [
 
 
 def build(config: dict):
-    bus = Bus(config["mamamia_db_path"],
+    http = HttpServer(host=config.get("host", "0.0.0.0"),
+                      port=int(config.get("port", 8080)))
+    store = SqliteStore(config["switchboard_db_path"])
+    bus = Bus(config["mamamia_db_path"], store=store, http=http,
               max_log_messages=int(config.get("max_log_messages", 10_000)))
     bus.add_tap(LoggerTap())
 
-    sensors = [GitHubSensor(secret=config["github_secret"],
-                            host=config.get("host", "0.0.0.0"),
-                            port=int(config.get("port", 8080)),
-                            seen_db=config.get("switchboard_db_path", ":memory:"))]
+    sensors = [GitHubSensor(secret=config["github_secret"])]
     for s in sensors:
         bus.add_sensor(s)
 
@@ -42,6 +44,9 @@ def build(config: dict):
             bus.add_decider(GitHubNotifyDecider(
                 channel_id=config["discord_github_notify_channel_id"]))
             bus.add_actuator(DiscordPost(token, app_id))
+
+    # Expired keys are already invisible to reads; this is only about disk.
+    bus.schedule_maintenance("store", 3600.0, store.purge)
 
     return bus, sensors
 
