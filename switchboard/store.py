@@ -3,12 +3,17 @@ import time
 from typing import Protocol, runtime_checkable
 
 
-def _check(key, value=None) -> None:
-    """Keys and values are str. No implicit coercion: str(5) would make
+def _check_key(key) -> None:
+    """Keys are str. No implicit coercion: str(5) would make
     set(k, 5) followed by get(k) == 5 evaluate False, discovered in production."""
     if not isinstance(key, str):
         raise TypeError(f"KeyStore keys must be str, got {type(key).__name__}")
-    if value is not None and not isinstance(value, str):
+
+
+def _check_value(value) -> None:
+    """Values are str. None is a real value, not a sentinel for "no value
+    supplied" — it must be rejected the same as any other non-str value."""
+    if not isinstance(value, str):
         raise TypeError(f"KeyStore values must be str, got {type(value).__name__}. "
                         f"Serialize structured values yourself (json.dumps).")
 
@@ -30,7 +35,7 @@ class MemoryStore:
         self._data: dict[str, tuple[str, float | None]] = {}
 
     async def get(self, key):
-        _check(key)
+        _check_key(key)
         entry = self._data.get(key)
         if entry is None:
             return None
@@ -41,11 +46,12 @@ class MemoryStore:
         return value
 
     async def set(self, key, value, *, ttl=None):
-        _check(key, value)
+        _check_key(key)
+        _check_value(value)
         self._data[key] = (value, None if ttl is None else self._now() + ttl)
 
     async def delete(self, key):
-        _check(key)
+        _check_key(key)
         self._data.pop(key, None)
 
     def purge(self) -> int:
@@ -75,7 +81,7 @@ class SqliteStore:
         self._conn.execute("CREATE INDEX IF NOT EXISTS kv_expires ON kv (expires_at)")
 
     async def get(self, key):
-        _check(key)
+        _check_key(key)
         # Expiry is filtered in the read, so an expired row is invisible the
         # instant it expires regardless of when purge last ran.
         row = self._conn.execute(
@@ -84,14 +90,15 @@ class SqliteStore:
         return row[0] if row else None
 
     async def set(self, key, value, *, ttl=None):
-        _check(key, value)
+        _check_key(key)
+        _check_value(value)
         self._conn.execute(
             "INSERT INTO kv (key, value, expires_at) VALUES (?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at",
             (key, value, None if ttl is None else self._now() + ttl))
 
     async def delete(self, key):
-        _check(key)
+        _check_key(key)
         self._conn.execute("DELETE FROM kv WHERE key = ?", (key,))
 
     def purge(self) -> int:
@@ -112,13 +119,14 @@ class ScopedStore:
         self._inner, self._prefix = inner, prefix
 
     async def get(self, key):
-        _check(key)
+        _check_key(key)
         return await self._inner.get(self._prefix + key)
 
     async def set(self, key, value, *, ttl=None):
-        _check(key, value)
+        _check_key(key)
+        _check_value(value)
         await self._inner.set(self._prefix + key, value, ttl=ttl)
 
     async def delete(self, key):
-        _check(key)
+        _check_key(key)
         await self._inner.delete(self._prefix + key)

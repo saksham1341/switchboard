@@ -64,6 +64,9 @@ async def test_non_str_key_raises(store):
 async def test_non_str_value_raises(store):
     with pytest.raises(TypeError):
         await store.set("k", 5)
+    with pytest.raises(TypeError):
+        await store.set("k", None)          # None is a value, not "no value"
+    assert await store.get("k") is None     # nothing was stored by either attempt
 
 
 async def test_sqlite_survives_reopen(tmp_path):
@@ -76,15 +79,12 @@ async def test_sqlite_survives_reopen(tmp_path):
     s2.close()
 
 
-async def test_purge_removes_only_expired(tmp_path):
-    clock = _Clock()
-    s = SqliteStore(str(tmp_path / "kv.db"), time_fn=clock)
-    await s.set("keep", "v")
-    await s.set("gone", "v", ttl=10.0)
-    clock.t += 11.0
-    assert s.purge() == 1
-    assert await s.get("keep") == "v"
-    s.close()
+async def test_purge_removes_only_expired(store):
+    await store.set("keep", "v")
+    await store.set("gone", "v", ttl=10.0)
+    store.clock.t += 11.0
+    assert store.purge() == 1
+    assert await store.get("keep") == "v"
 
 
 async def test_scope_isolates_same_key(store):
@@ -110,3 +110,7 @@ async def test_scope_rejects_non_str_key(store):
     a = ScopedStore(store, "sensor/github/")
     with pytest.raises(TypeError):
         await a.get(1)
+    with pytest.raises(TypeError):
+        await a.set(1, "v")
+    with pytest.raises(TypeError):
+        await a.delete(1)
