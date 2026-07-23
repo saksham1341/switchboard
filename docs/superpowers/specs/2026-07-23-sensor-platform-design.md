@@ -406,6 +406,7 @@ No new environment variables. `SB_PORT` and `SB_DATA_DIR` now reach `HttpServer`
 | `var()` / per-key locks / `add()` | No sensor has two concurrent writers on one key. Purely additive later. |
 | Durable timers on `available_after` | The cursor already handles missed ticks; a durable timer would be a second mechanism solving the same problem. |
 | Backoff on repeated timer failures | The interval is the rate limit. |
+| Cron scheduling | Cron's step values (`*/7`) are wall-clock matching, not intervals — `*/7` fires at :00 :07 … :56 with a 4-minute gap at the hour, and only divisors of 60 behave interval-like. It also has no sub-minute resolution. So it does not subsume `every()`, and `every()` does not subsume it: cron alone expresses "3am daily". Nothing wants a wall-clock job yet, and adopting it now would import a parser dependency, a DST policy for the hour that repeats and the hour that does not exist, and a skip-if-running policy that fixed-delay currently makes unnecessary. Add later as a second verb, `at("0 9 * * 1-5", fn)`, decided against a real job. |
 | Non-exclusive HTTP routes | Decider fan-out already serves the use case without coupling failure domains. |
 | Cross-process coordination | mamamia is single-node by design. |
 | `LinearSensor` itself | The example the design is answerable to, not a deliverable here. |
