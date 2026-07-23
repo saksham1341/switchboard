@@ -11,3 +11,4 @@ data/
 
 # SDD controller scratch (briefs, reports, ledger)
 .superpowers/
+.devdata/
