@@ -322,7 +322,7 @@ class ScopedStore:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `./scripts/dev.sh test tests/test_store.py`
-Expected: PASS, 26 tests (13 parametrized × 2, plus the sqlite-only ones)
+Expected: PASS, 24 tests (11 parametrized × 2 backends, plus 2 sqlite-only)
 
 - [ ] **Step 5: Commit**
 
@@ -1151,14 +1151,16 @@ def test_only_provider_scoped_path_is_served():
     assert len(emitted) == 1
 
 
-def test_health_is_not_the_sensors_route():
+def test_health_is_served_but_the_sensor_did_not_register_it():
+    """/health answers because HttpServer owns it, not because GitHubSensor
+    added it. The sensor's only route is its webhook."""
     s, http, _ = _bound()
-    # /health answers because HttpServer owns it, not because GitHubSensor added it
     assert TestClient(http.app).get("/health").status_code == 200
-    assert "/health" not in getattr(s, "_paths", ["/health"]) or True
+    # HttpServer records an owner per registered path; /health has no sensor owner.
+    assert http._owners == {"/webhook/github": "github"}
 
 
-def test_dedup_records_after_emit_not_before():
+async def test_dedup_records_after_emit_not_before():
     """A failing emit must leave the delivery unrecorded, so a retry still lands."""
     from switchboard.sensors.github import GitHubSensor
     from switchboard.http import HttpServer
@@ -1166,10 +1168,9 @@ def test_dedup_records_after_emit_not_before():
     from switchboard.message import SensorCtx
     from switchboard.scheduler import Scheduler
 
-    store, calls = MemoryStore(), []
+    store = MemoryStore()
 
     async def emit(name, payload):
-        calls.append(name)
         raise RuntimeError("log unavailable")
 
     http = HttpServer(serve=False)
@@ -1179,20 +1180,10 @@ def test_dedup_records_after_emit_not_before():
     pr = _load("pull_request.opened.json")
     with pytest.raises(RuntimeError):
         _signed_post(TestClient(http.app), "s3cret", "pull_request", pr, "d-9")
-    assert await_sync(store.get("github:delivery:d-9")) is None
+    assert await store.get("github:delivery:d-9") is None
 ```
 
-Add at the top of `tests/test_sensor_github.py`:
-
-```python
-import asyncio
-import pytest
-
-def await_sync(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
-```
-
-If `run_until_complete` is awkward under `asyncio_mode = "auto"`, make `test_dedup_records_after_emit_not_before` an `async def` and `await store.get(...)` directly; `TestClient` calls are synchronous and safe inside it.
+`TestClient` calls are synchronous, so they are safe inside an `async def` test under `asyncio_mode = "auto"`. Add `import pytest` at the top of the file.
 
 ```python
 # tests/test_sensor_discord.py — the sensor now binds instead of taking emit
@@ -1551,25 +1542,52 @@ The rest of `build` is unchanged. Add the expired-key sweep after the roles are 
     bus.schedule_maintenance("store", 3600.0, store.purge)
 ```
 
-with, in `Bus`:
-
-```python
-    def schedule_maintenance(self, owner: str, seconds: float, fn) -> None:
-        """A timer not owned by any role — started and stopped with the bus."""
-        self._scheduler.for_owner(owner).every(seconds, _as_async(fn))
-        self._maintenance.append(owner)
-```
-
-`_as_async` wraps a sync callable so the scheduler can await it:
+In `switchboard/bus.py`, add the module-level helper:
 
 ```python
 def _as_async(fn):
+    """Wrap a sync callable so the scheduler, which awaits its callbacks, can
+    drive it. SqliteStore.purge is a plain method."""
     async def call():
         return fn()
     return call
 ```
 
-`Bus.start()` calls `self._scheduler.start(owner)` for each maintenance owner; `stop_all()` in `Bus.stop()` already cancels them.
+Add `self._maintenance: list[str] = []` to `Bus.__init__`, and the method:
+
+```python
+    def schedule_maintenance(self, owner: str, seconds: float, fn) -> None:
+        """A timer owned by the bus rather than by any role. Started with the
+        bus; cancelled by stop_all() in stop()."""
+        self._scheduler.for_owner(owner).every(seconds, _as_async(fn), name=owner)
+        self._maintenance.append(owner)
+```
+
+And in `Bus.start()`, after the sensor loop:
+
+```python
+        for owner in self._maintenance:
+            self._scheduler.start(owner)
+```
+
+`Bus.stop()` already calls `self._scheduler.stop_all()`, which cancels these along with everything else.
+
+Test it in `tests/test_app.py`:
+
+```python
+async def test_maintenance_timer_is_registered_and_started(tmp_path):
+    from switchboard.bus import Bus
+    calls = []
+    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus.schedule_maintenance("store", 0.02, lambda: calls.append(1))
+    await bus.start()
+    try:
+        await _wait(lambda: len(calls) >= 2)
+    finally:
+        await bus.stop()
+```
+
+with the same `_wait` helper `tests/test_bus.py` uses.
 
 - [ ] **Step 4: Delete the dedup module**
 
