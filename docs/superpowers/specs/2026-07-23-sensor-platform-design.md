@@ -1,0 +1,412 @@
+# Sensor Platform — Design
+
+**Goal:** Give sensors a platform to stand on. Today each sensor privately owns whatever infrastructure it needs — `GitHubSensor` binds its own port, serves `/health`, and keeps its own SQLite dedup table — so a second webhook sensor cannot exist and a polling sensor has nowhere to put a timer. Switchboard should hand a sensor the four capabilities it can't reasonably own itself, through one context object.
+
+**Status:** Approved design (co-designed in conversation). Additive plus one refactor of `GitHubSensor`; no change to the four-role model, the two logs, or the message schema.
+
+---
+
+## The observation that started it
+
+> "What DiscordSensor does is outbound, what GitHubSensor does is inbound. Switchboard needs to provide a couple of things from its side to the sensors."
+
+Deciders and actuators already receive a context — `DecideCtx` gives `command()`, `ActCtx` gives `result()` and the actuator's world handle. Sensors receive a bare `emit` callable and are left to improvise everything else. That asymmetry is the bug.
+
+A sensor is the only role that touches the outside world *inbound*. Everything it needs beyond emitting is about how it gets woken up and what it remembers between wakings:
+
+| capability | what it answers |
+|---|---|
+| `emit` | how do I put an observation on the log |
+| `http` | how does a remote platform push to me |
+| `schedule` | how do I wake myself up when nothing pushes |
+| `store` | what do I remember between wakings and restarts |
+
+Those four are `SensorCtx`.
+
+---
+
+## SensorCtx
+
+```python
+@dataclass
+class SensorCtx:
+    emit: Callable[[str, dict], Awaitable[int]]   # -> observation id
+    http: HttpServer                              # .route(path, handler, methods=)
+    store: KeyStore                               # .get / .set / .delete
+    schedule: OwnerSchedule                       # .every(seconds, fn)
+```
+
+Symmetric with `DecideCtx` and `ActCtx`: one object, constructed by the `Bus`, handed to the role, carrying exactly the authority that role is allowed to have. A sensor never constructs its own server, store, or timer.
+
+The `Sensor` protocol gains `bind` and loses the `emit` argument to `start`:
+
+```python
+class Sensor(Protocol):
+    name: str
+    def bind(self, ctx: SensorCtx) -> None: ...   # sync: declare routes and timers
+    async def start(self) -> None: ...            # long-running loop, or return
+    async def stop(self) -> None: ...
+```
+
+### Why the lifecycle splits
+
+`ctx.http.route(...)` must run before the shared server binds its port, and `ctx.schedule.every(...)` needs a running event loop. If both lived in `start()` — which for `DiscordSensor` blocks forever on the gateway — ordering against the shared server would be a race resolvable only by sleeps.
+
+Splitting gives a deterministic sequence with no timing assumptions:
+
+```python
+# Bus.start()
+for s in self._sensors:
+    s.bind(SensorCtx(emit=..., http=self._http, store=self._store,
+                     schedule=self._scheduler.for_owner(s.name)))
+await self._http.start()                    # every route is registered by now
+for s in self._sensors:
+    task = asyncio.create_task(s.start())
+    task.add_done_callback(lambda t, n=s.name: self._sensor_exited(n, t))
+    self._tasks.append(task)
+    self._scheduler.start(s.name)
+
+# Bus.stop()
+for s in self._sensors:
+    await self._scheduler.stop(s.name)      # timers first: no callback may fire
+    try:                                    # against a connection being torn down
+        await s.stop()
+    except Exception:
+        logger.exception("sensor %s failed to stop", s.name)
+```
+
+`bind` is not new machinery. `GitHubSensor` already has a `bind(emit)` method, added so tests could drive its app without binding a port — this formalizes a shape the code found on its own.
+
+A `start()` that returns immediately means "no loop of my own to supervise", not "finished". Route-driven and timer-driven sensors both return; their work happens on the server's and the scheduler's tasks.
+
+---
+
+## HttpServer
+
+One Starlette app and one uvicorn server, owned by the app, shared by every webhook sensor.
+
+```python
+class HttpServer:
+    def __init__(self, host="0.0.0.0", port=8080): ...
+    def route(self, path, handler, *, methods=("GET",)) -> None: ...
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+```
+
+It serves `/health` itself. That endpoint is not GitHub's — it is the deployment's liveness probe, gating `scripts/update.sh`, and it must answer in a build configured with no webhook sensor at all.
+
+### One owner per path
+
+Registering a path twice raises at bind time, before the server starts:
+
+```python
+raise ValueError(
+    f"{path} already registered by sensor {self._owners[path]!r}. "
+    f"An HTTP path has one response, so it has one owner. To have several "
+    f"consumers react to it, add deciders that subscribe to the observation "
+    f"it emits; to separate tenants, scope the path (e.g. {path}/<tenant>)."
+)
+```
+
+The underlying need — several interested parties, one inbound URL — is real, and it is already served one layer down. Fan-out is the log's job: one sensor emits, N deciders subscribe, and each settles, retries, and dead-letters independently.
+
+Sharing an HTTP path would instead couple those consumers through a single status code. If handler A returns 200 and handler B raises, the provider sees one response; a 500 makes GitHub redeliver, and **A processes the delivery twice**. Two sensors' failure domains fused through a status code, to buy something the obs log already gives for free.
+
+Relaxing this later is backwards-compatible, so choosing exclusivity now costs nothing.
+
+---
+
+## KeyStore
+
+A string-to-string key-value store with expiry. Replaces `SeenStore`, which was a dedup table with a dedup-shaped API (`record`, `prune(keep_last)`) usable only by the sensor that owned it.
+
+```python
+class KeyStore(Protocol):
+    async def get(self, key: str) -> str | None: ...
+    async def set(self, key: str, value: str, *, ttl: float | None = None) -> None: ...
+    async def delete(self, key: str) -> None: ...
+```
+
+**Async, though `MemoryStore` is a dict.** The only decision here that is expensive to reverse. Converting a sync interface to async later touches every call site in every sensor; paying the `await` now keeps a networked backend possible without a migration.
+
+**`str` → `str`, enforced, no coercion.**
+
+```python
+def _check(key, value=None):
+    if not isinstance(key, str):
+        raise TypeError(f"KeyStore keys must be str, got {type(key).__name__}")
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"KeyStore values must be str, got {type(value).__name__}. "
+                        f"Serialize structured values yourself (json.dumps).")
+```
+
+Implicit `str()` would make `set(k, 5)` followed by `get(k) == 5` evaluate `False`, discovered in production. Callers that want structure call `json.dumps` — visible, and their choice of format.
+
+### Two implementations, one test suite
+
+`MemoryStore` is written to the *stricter* contract, not the one a dict gives naturally: it implements expiry-on-read and the same type checks explicitly. Otherwise tests pass in memory and behavior diverges in production, which is worse than shipping only one implementation. One parametrized suite runs against both.
+
+`SqliteStore` keeps the durability `SeenStore` already had — dedup state on the Docker volume, surviving restarts — and reuses its sync-sqlite-on-the-loop-thread approach:
+
+```sql
+CREATE TABLE kv (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  expires_at REAL              -- NULL = never
+);
+CREATE INDEX kv_expires ON kv (expires_at);
+```
+
+Reads filter on expiry (`WHERE key = ? AND (expires_at IS NULL OR expires_at > ?)`), so an expired row is invisible the instant it expires regardless of when a sweep last ran. A `purge()` method deletes expired rows and is about disk, never correctness. The Bus schedules it by reusing the `Scheduler` with a non-sensor owner:
+
+```python
+self._scheduler.for_owner("store").every(3600, self._store.purge)
+self._scheduler.start("store")
+```
+
+### Semantics chosen, and the boundary accepted
+
+`set` is last-write-wins. There is no locking, no compare-and-set, no `add()`.
+
+Sensors dedup by `get` → `emit` → `set` — **emit first, record second**. A crash between the two costs a duplicate; the reverse order costs the event permanently, which is the exact bug `GitHubSensor` shipped once and had to be fixed for.
+
+That sequence has a theoretical race: `await emit` is a suspension point, so two concurrent writers on the same key could both pass `get` before either `set`. It does not occur for any current sensor — GitHub retries a delivery sequentially after a timeout, never concurrently, and a sweep cursor has exactly one writer because fixed-delay scheduling means a sweep never overlaps itself. Recorded here as a known boundary rather than left to be rediscovered.
+
+If a sensor ever does have two concurrent writers on one key, the fix is a `var()` context manager — a per-key async mutex yielding a handle that writes back on exit — which is purely additive and breaks no existing `get`/`set` caller. Deliberately not built now.
+
+Locks are process-local in any case. `SqliteStore` makes the *record* durable across restarts, but nothing coordinates across processes; consistent with mamamia being single-node by design.
+
+---
+
+## Scheduler
+
+A sensor with no inbound push needs a clock. Polling platforms are the driver; reconcile sweeps are the near-term use even for platforms that do push, since webhooks are at-least-once *delivery* but not guaranteed delivery — a delivery lost while the process is restarting is gone, and only a sweep recovers it.
+
+### The tick is stimulus, not a message
+
+An early alternative was to implement scheduling on mamamia's `available_after`: append a delayed observation and let a decider consume the tick. That breaks the role model. The tick observation is empty, and the actual work — fetch, diff, decide what is new — lands on a decider, which by construction has no world access. It would emit a command, an actuator would fetch, a result observation would come back, and another decider would need to diff it against state deciders do not hold. Four hops and two roles doing work they are defined not to do, to accomplish what a polling sensor does in one function.
+
+Nobody thinks "an HTTP request arrived" should be an observation; the *mapped event* is the observation and the request is how the sensor woke up. A timer is the same thing. So `schedule` is exactly symmetric with `http`:
+
+| capability | edge | who wakes the sensor |
+|---|---|---|
+| `http` | inbound push | the remote platform |
+| `schedule` | inbound pull | the clock |
+
+Both deliver stimulus. Neither produces a message. The sensor wakes, fetches, diffs against `ctx.store`, and emits observations indistinguishable from the ones its webhook path emits.
+
+### Durability is a cursor, not a durable timer
+
+A missed tick is not a lost message: the sensor sweeps *since the cursor in `ctx.store`*, so a tick missed while the process was down means the next sweep covers a wider window. The cursor is required regardless — a tick that is delivered and then crashes loses its work anyway — so a durable timer would add a second mechanism that solves nothing the cursor does not already solve.
+
+### Timers live and die with their sensor
+
+Declared at `bind`, launched when the sensor starts, cancelled when it stops. A timer must never fire before its sensor is running or after it has stopped.
+
+```python
+class Scheduler:
+    def for_owner(self, owner: str) -> OwnerSchedule: ...
+    def start(self, owner: str) -> None: ...          # launch declared timers
+    async def stop(self, owner: str) -> None: ...     # cancel and await them
+
+class OwnerSchedule:
+    def every(self, seconds, fn, *, first_after=None, name=None) -> None: ...
+```
+
+`_declare` launches a timer immediately when its owner is already running, which gives two meaningful declaration points:
+
+- **In `bind()`** — "tick from the moment I am started." Right for a sensor ready as soon as it exists.
+- **In `start()` or a readiness callback** — "tick from the moment I say I am ready." Right for a sensor that needs a live connection first. `DiscordSensor` declares in `on_ready`, not in `bind`, because its timers call the Discord API.
+
+The loop:
+
+```python
+async def _loop(self, seconds, first_delay, fn, label):
+    await asyncio.sleep(first_delay)
+    while True:
+        try:
+            await fn()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("scheduled callback %s failed", label)
+        # Fixed delay, not fixed rate: the next sleep starts when the callback
+        # finishes, so a slow tick can never stack up behind itself.
+        await asyncio.sleep(seconds)
+```
+
+Four decisions:
+
+- **Fixed delay, not fixed rate.** No overlap ever, so callbacks need no reentrancy guard and a cursor has exactly one writer.
+- **`first_after` defaults to `seconds`.** Nothing fires at t=0. Immediate-on-boot means a crash-looping container sweeps the remote API on every restart; delaying costs nothing because the first sweep reads from the cursor and covers whatever window elapsed. `first_after=0` opts in explicitly.
+- **A raising callback logs and the loop survives.** Same contract as `Bus._consume`.
+- **No backoff on consecutive failures.** The interval *is* the rate limit. A knob nobody needs yet.
+
+### A crashed sensor stops ticking
+
+"Only while started" has a third case beyond start and stop: a sensor whose `start()` raised. Its timers would otherwise keep sweeping against a dead connection forever.
+
+```python
+def _sensor_exited(self, name, task):
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("sensor %s died; stopping its timers", name, exc_info=exc)
+        asyncio.create_task(self._scheduler.stop(name))
+```
+
+Only on exception. A clean return is normal for a route-driven sensor, and those timers must survive.
+
+---
+
+## Migration
+
+### GitHubSensor
+
+Loses `host`, `port`, and `seen_db` — none of which were ever GitHub's business — and loses `/health`.
+
+```python
+class GitHubSensor:
+    name = "github"
+
+    def __init__(self, secret: str, *, dedup_ttl: float = 7 * 86_400.0):
+        self._secret = secret
+        self._dedup_ttl = dedup_ttl
+        self._ctx = None
+
+    def bind(self, ctx) -> None:
+        self._ctx = ctx
+        ctx.http.route("/webhook/github", self._webhook, methods=["POST"])
+
+    async def start(self) -> None:
+        return                       # route-driven: no loop to supervise
+
+    async def stop(self) -> None:
+        return
+
+    async def _webhook(self, request):
+        body = await request.body()
+        if not verify_signature(self._secret, body, request.headers.get("X-Hub-Signature-256")):
+            return JSONResponse({"error": "invalid signature"}, status_code=401)
+        try:
+            payload = _json.loads(body)
+        except ValueError:
+            return JSONResponse({"error": "malformed json"}, status_code=400)
+
+        mapped = map_event(request.headers.get("X-GitHub-Event", ""), payload)
+        if mapped is None:
+            return JSONResponse({"status": "ignored"}, status_code=200)
+        name, payload = mapped
+
+        delivery_id = request.headers.get("X-GitHub-Delivery")
+        key = f"github:delivery:{delivery_id}" if delivery_id else None
+        if key and await self._ctx.store.get(key) is not None:
+            return JSONResponse({"status": "duplicate"}, status_code=200)
+
+        # Emit first, record second: a crash in between costs a duplicate,
+        # the reverse order costs the event.
+        observation_id = await self._ctx.emit(name, payload)
+        if key:
+            await self._ctx.store.set(key, str(observation_id), ttl=self._dedup_ttl)
+        return JSONResponse({"status": "ok", "event_id": observation_id}, status_code=200)
+```
+
+`map_event` and `verify_signature` are unchanged.
+
+### DiscordSensor
+
+Keeps its blocking gateway loop. `bind` stores the ctx and declares nothing; the emit call inside the command callback becomes `self._ctx.emit(...)`.
+
+```python
+    def bind(self, ctx) -> None:
+        self._ctx = ctx              # no routes; timers wait for the gateway
+
+    async def start(self) -> None:
+        await self._client.start(self._token)
+
+    async def _on_ready(self) -> None:
+        first_connect = not self._synced
+        await self._sync_commands()
+        if first_connect:
+            # Any timer this sensor grows is declared here, not in bind(): it
+            # would call the Discord API and must not tick before the gateway is
+            # up. Guarded because on_ready refires on every reconnect and
+            # `every` is not idempotent.
+            pass
+```
+
+`DiscordSensor` declares no timers today, so the `if first_connect` block stays empty in this change. It is specified now so that whoever adds the first timer does not stack one per reconnect — a flapping gateway would otherwise accumulate a copy per connect.
+
+### Composite sensors
+
+The point of the platform is a sensor that uses several capabilities at once — real-time webhook plus a reconcile sweep, both funnelling through one emit path so an event arriving twice emits once:
+
+```python
+class LinearSensor:
+    name = "linear"
+
+    def bind(self, ctx):
+        self._ctx = ctx
+        ctx.http.route("/webhook/linear", self._webhook, methods=["POST"])
+        ctx.schedule.every(self._sweep_interval, self._sweep)
+
+    async def _emit_issue(self, issue) -> int | None:
+        # Keyed on (id, updatedAt), not on a webhook delivery id: the sweep has
+        # no delivery id, and a shared key is what makes the two paths dedup
+        # against each other rather than each against itself.
+        key = f"linear:seen:{issue['id']}:{issue['updatedAt']}"
+        if await self._ctx.store.get(key) is not None:
+            return None
+        observation_id = await self._ctx.emit(f"linear.issue.{issue['action']}", issue)
+        await self._ctx.store.set(key, str(observation_id), ttl=self._dedup_ttl)
+        return observation_id
+
+    async def _sweep(self):
+        cursor = await self._ctx.store.get("linear:cursor")
+        if cursor is None:
+            # First run, or a store that lost it. Start from now — defaulting to
+            # the epoch would replay all history into the log.
+            await self._ctx.store.set("linear:cursor", utcnow_iso())
+            return
+        newest = cursor
+        for issue in await self._api.issues_updated_since(cursor):
+            await self._emit_issue(issue)
+            newest = max(newest, issue["updatedAt"])
+        # Advance after the batch. A crash mid-sweep re-reads the window on the
+        # next tick, and dedup makes the replay a no-op.
+        if newest != cursor:
+            await self._ctx.store.set("linear:cursor", newest)
+```
+
+Not built in this change — included as the worked example the design is answerable to.
+
+---
+
+## Configuration
+
+No new environment variables. `SB_PORT` and `SB_DATA_DIR` now reach `HttpServer` and `SqliteStore` through `app.build()` instead of through `GitHubSensor`'s constructor. `switchboard.db` keeps its path and gains the `kv` table alongside the existing `seen` table, which is dropped once nothing reads it.
+
+---
+
+## Testing
+
+- `HttpServer` — routes registered by several fake sensors are all served; duplicate path raises at bind; `/health` answers with no sensors registered at all.
+- `KeyStore` — one parametrized suite over `MemoryStore` and `SqliteStore`: get/set/delete, overwrite, TTL expiry via an injected clock, non-`str` key and value both raise, `purge` removes only expired rows. `SqliteStore` additionally: values survive reopening the database.
+- `Scheduler` — a timer does not fire before `start(owner)`; fires after; stops firing after `stop(owner)`; a raising callback does not kill the loop; a slow callback does not overlap itself; `every` called while running launches immediately; a sensor whose `start()` raises has its timers stopped.
+- `GitHubSensor` — existing tests port to the new lifecycle: construct, `bind` with a fake ctx, drive `ctx.http`'s app with `TestClient`. Signature verification, event mapping, dedup, and the emit-then-record ordering assertions all carry over unchanged in intent.
+- `Bus` — bind happens before the server starts; timers stop before `stop()` is awaited.
+
+---
+
+## Deliberately not in scope
+
+| left out | why |
+|---|---|
+| `var()` / per-key locks / `add()` | No sensor has two concurrent writers on one key. Purely additive later. |
+| Durable timers on `available_after` | The cursor already handles missed ticks; a durable timer would be a second mechanism solving the same problem. |
+| Backoff on repeated timer failures | The interval is the rate limit. |
+| Non-exclusive HTTP routes | Decider fan-out already serves the use case without coupling failure domains. |
+| Cross-process coordination | mamamia is single-node by design. |
+| `LinearSensor` itself | The example the design is answerable to, not a deliverable here. |
+| `LoggerTap` payload redaction | Real outstanding issue — full payloads including `interaction_token` reach persistent logs — but orthogonal to this change. |
