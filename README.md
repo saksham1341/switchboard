@@ -26,16 +26,25 @@ python -m pytest -q
    ./scripts/vendor-mamamia.sh          # MAMAMIA_DIR=../mamamia by default
    ```
 2. `cp .env.example .env` and fill it in (`chmod 600 .env`).
-   `GITHUB_WEBHOOK_SECRET` and `TUNNEL_TOKEN` are required; the Discord block is
-   optional — see below.
+   `GITHUB_WEBHOOK_SECRET` is required; the Discord block is optional — see below.
 3. `docker compose up -d --build`
 4. Point the GitHub webhook at the tunnel hostname's `/webhook`, content-type
    `application/json`, with the same secret.
 
-The `switchboard` app port (8080) is internal-only and is not published to the
-host. In the Cloudflare Zero Trust dashboard, configure the tunnel's public
-hostname to route to the origin `http://switchboard:8080` (the compose service
-name/port); GitHub's webhook then points at that public hostname's `/webhook`.
+### Ingress
+
+This stack does **not** ship a tunnel. It publishes the app on **loopback only**
+(`127.0.0.1:8080` — never the LAN) and stops there; getting traffic to the host
+is the host's job.
+
+Point whatever you already run — cloudflared, nginx, caddy — at:
+
+```
+http://localhost:8080
+```
+
+GitHub's webhook then targets that public hostname's `/webhook`. Nothing in this
+repo needs tunnel credentials.
 
 ## Discord (optional)
 Leave `DISCORD_BOT_TOKEN` empty to run GitHub-only — no bot, no slash commands,
