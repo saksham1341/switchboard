@@ -19,15 +19,26 @@ services:
       # --- Tuning ---
       SB_MAX_LOG_MESSAGES: ${SB_MAX_LOG_MESSAGES:-10000}
       SB_PORT: ${SB_PORT:-8080}
-    expose:
-      - "8080"
+    # Published on loopback only, so a cloudflared running on the HOST can reach
+    # it. Not exposed on the LAN. If you instead run the bundled tunnel below,
+    # this publish is unnecessary but harmless.
+    ports:
+      - "127.0.0.1:${SB_HOST_PORT:-8080}:${SB_PORT:-8080}"
     volumes:
       - ./data:/data
 
-  # Cloudflare Tunnel — outbound-only ingress for the GitHub webhook.
+  # Bundled Cloudflare Tunnel — ONLY for hosts without their own cloudflared.
+  # Opt in with:  docker compose --profile tunnel up -d
+  # Skip it when cloudflared already runs as a host service (the usual case on a
+  # Pi); a second connector for the same tunnel is redundant.
+  #
+  # Origin depends on which one you use:
+  #   host cloudflared  -> http://localhost:8080
+  #   bundled tunnel    -> http://switchboard:8080   (compose network DNS)
   tunnel:
+    profiles: ["tunnel"]
     image: cloudflare/cloudflared:2024.12.2   # pinned; bump deliberately, never :latest
     restart: unless-stopped
     command: tunnel run
     environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}

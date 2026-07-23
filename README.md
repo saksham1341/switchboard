@@ -32,10 +32,20 @@ python -m pytest -q
 4. Point the GitHub webhook at the tunnel hostname's `/webhook`, content-type
    `application/json`, with the same secret.
 
-The `switchboard` app port (8080) is internal-only and is not published to the
-host. In the Cloudflare Zero Trust dashboard, configure the tunnel's public
-hostname to route to the origin `http://switchboard:8080` (the compose service
-name/port); GitHub's webhook then points at that public hostname's `/webhook`.
+### Ingress: two tunnel modes
+
+The app is published on **loopback only** (`127.0.0.1:8080`), never on the LAN.
+Pick whichever connector you already have — the Public Hostname origin differs:
+
+| mode | run with | origin to configure |
+|---|---|---|
+| **cloudflared already a host service** (typical on a Pi) | `docker compose up -d` | `http://localhost:8080` |
+| **no host cloudflared** — use the bundled container | `docker compose --profile tunnel up -d` (needs `TUNNEL_TOKEN`) | `http://switchboard:8080` |
+
+Don't run both: two connectors for one tunnel is redundant. The bundled service
+sits behind a compose profile so it stays off unless you ask for it.
+
+GitHub's webhook then points at that public hostname's `/webhook`.
 
 ## Discord (optional)
 Leave `DISCORD_BOT_TOKEN` empty to run GitHub-only — no bot, no slash commands,
