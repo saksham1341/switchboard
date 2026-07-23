@@ -46,6 +46,11 @@ class DeciderCtx:
 @dataclass
 class ActuatorCtx:
     store: KeyStore
+
+@dataclass
+class TapCtx:
+    store: KeyStore
+    http: HttpServer
 ```
 
 ```python
@@ -65,7 +70,19 @@ class Actuator(Protocol):
     name: str
     def bind(self, ctx: ActuatorCtx) -> None: ...  # replaces context()
     async def act(self, cmd: Command, ctx: ActCtx) -> None: ...
+
+class Tap(Protocol):
+    name: str
+    logs: tuple[str, ...]
+    def bind(self, ctx: TapCtx) -> None: ...
+    async def observe(self, log: str, view) -> None: ...
 ```
+
+All four roles bind. `LoggerTap` needs nothing from its ctx today, but a tap reads a log, so the projection rule applies to it as cleanly as to a decider — a metrics tap counting observations by name is exactly a read model. Leaving one role out is how the three-mechanism mess this section removes came about in the first place.
+
+`TapCtx` carries `http` as well as `store` because a live dashboard is exactly a tap: it reads both logs, keeps a projection, and serves a page. Giving taps a route lets that be built entirely on top of this platform, with no change to it. A tap's routes must stay read-only — a page with buttons that mutate state is not a tap, it is a decider reached through a sensor.
+
+`TapCtx` deliberately has no `emit`: a tap that could write to a log would stop being a tap.
 
 Each role stashes its ctx the way any Python object holds a dependency:
 
@@ -95,6 +112,8 @@ class DiscordPost:
 
 `ActCtx` correspondingly loses its `context: Any` field and carries only per-command state (`cmd`, `result()`).
 
+Moving client construction into `bind` also forces a teardown that is missing today: `DiscordSender` opens an `httpx.AsyncClient` that nothing ever closes, so every `Bus.start()`/`stop()` cycle leaks one. `Bus.stop()` calls `close()` on any actuator that defines it, alongside the existing sensor teardown.
+
 ### Deciders get memory, not world access
 
 Giving a decider a store looks like it weakens the role's defining constraint. It doesn't, because the constraint was never purity — nothing today stops a decider keeping `self._seen = set()`. Refusing it a store buys no determinism; it only makes decider state invisible, non-durable, and unreadable by any tap or CLI.
@@ -122,6 +141,8 @@ for d in self._deciders:
     d.bind(DeciderCtx(store=scoped("decider", d.name)))
 for a in self._actuators:
     a.bind(ActuatorCtx(store=scoped("actuator", a.name)))
+for t in self._taps:
+    t.bind(TapCtx(store=scoped("tap", t.name), http=self._http))
 for s in self._sensors:
     s.bind(SensorCtx(emit=..., http=self._http,
                      store=scoped("sensor", s.name),
@@ -522,7 +543,7 @@ No new environment variables. `SB_PORT` and `SB_DATA_DIR` now reach `HttpServer`
 - `HttpServer` — routes registered by several fake sensors are all served; duplicate path raises at bind; `/health` answers with no sensors registered at all.
 - `KeyStore` — one parametrized suite over `MemoryStore` and `SqliteStore`: get/set/delete, overwrite, `ttl=None` never expires, TTL expiry via an injected clock, non-`str` key and value both raise, `purge` removes only expired rows. `SqliteStore` additionally: values survive reopening the database.
 - `ScopedStore` — two scopes writing the same key do not see each other; the prefix never leaks back through `get`; a scoped `delete` leaves the other scope intact.
-- Role binding — `bind` is called on every sensor, decider, and actuator before any message is consumed; each receives a store scoped to its own `kind/name`.
+- Role binding — `bind` is called on every sensor, decider, actuator, and tap before any message is consumed; each receives a store scoped to its own `kind/name`.
 - `Scheduler` — a timer does not fire before `start(owner)`; fires after; stops firing after `stop(owner)`; a raising callback does not kill the loop; a slow callback does not overlap itself; `every` called while running launches immediately; a sensor whose `start()` raises has its timers stopped.
 - `GitHubSensor` — existing tests port to the new lifecycle: construct, `bind` with a fake ctx, drive `ctx.http`'s app with `TestClient`. Signature verification, event mapping, dedup, and the emit-then-record ordering assertions all carry over unchanged in intent.
 - `Bus` — bind happens before the server starts; timers stop before `stop()` is awaited.
@@ -542,3 +563,4 @@ No new environment variables. `SB_PORT` and `SB_DATA_DIR` now reach `HttpServer`
 | A global / unscoped store | Shared memory between roles is an out-of-band channel that bypasses the log. The data a role needs from another role arrives as an observation; each role projects its own copy. Additive later if a genuine case appears. |
 | `LinearSensor` itself | The example the design is answerable to, not a deliverable here. |
 | `LoggerTap` payload redaction | Real outstanding issue — full payloads including `interaction_token` reach persistent logs — but orthogonal to this change. |
+| A live dashboard | A product built on this platform, not part of it: a read-only tap that projects both logs, plus a streaming transport and a UI. `TapCtx.http` is here so it needs no platform change; it gets its own spec. Note that `max_log_messages` bounds the visible history to a rolling window. |
