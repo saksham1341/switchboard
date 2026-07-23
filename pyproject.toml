@@ -23,3 +23,8 @@ asyncio_mode = "auto"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+# Explicit, so setuptools never falls back to flat-layout auto-discovery and
+# trips over a sibling directory (vendor/, data/, docs/) in the project root.
+[tool.setuptools]
+packages = ["switchboard"]
