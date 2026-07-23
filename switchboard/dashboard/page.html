@@ -170,6 +170,12 @@
 // and costs no pixels crossing the forward flow.
 // ---------------------------------------------------------------------------
 let TOPO = { sensors: [], deciders: [], actuators: [] };
+
+// Everything from a frame — names, emitted_by — is rendered into innerHTML, so
+// it is escaped first. Constrained today, but the ingest endpoint is the seam a
+// future sensor's free-form text would arrive through.
+const ESC = { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" };
+function esc(v){ return String(v == null ? "" : v).replace(/[&<>"']/g, c => ESC[c]); }
 const DEAD = new Set();
 
 const JACK  = {};          // "kind/name" -> {x,y,el}
@@ -225,7 +231,7 @@ function layout(){
           ? '<div class="pair"><div class="sm"></div><div class="key"></div>' +
             '<div class="sm"></div></div>'
           : '<div class="bore"></div>')
-        + '<div class="lamp"></div><div class="plate">' + name + '</div>';
+        + '<div class="lamp"></div><div class="plate">' + esc(name) + '</div>';
       el.style.left = x + "px"; el.style.top = y + "px";
       deck.appendChild(el);
       // Plug points are measured from the rendered bores, not assumed from the
@@ -382,9 +388,10 @@ function renderFeed(){
   if (!document.getElementById("feed").classList.contains("open")) return;
   box.innerHTML = rows.slice(0, 150).map(r =>
     '<div class="frow' + (r.dead ? ' dead' : '') + '">' +
-      '<span class="tag ' + r.log + '">' + r.log + '</span><span>' + r.id + '</span>' +
-      '<span class="nm">' + r.name + '</span>' +
-      '<span class="by">' + (r.by || '') + '</span></div>').join("");
+      '<span class="tag ' + (r.log === "cmd" ? "cmd" : "obs") + '">' + esc(r.log) + '</span>' +
+      '<span>' + esc(r.id) + '</span>' +
+      '<span class="nm">' + esc(r.name) + '</span>' +
+      '<span class="by">' + esc(r.by) + '</span></div>').join("");
 }
 
 // ---------------------------------------------------------------------------

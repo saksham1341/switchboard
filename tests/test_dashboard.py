@@ -177,3 +177,19 @@ async def test_topology_lists_registered_roles(tmp_path):
     bus.add_sensor(_R("github")); bus.add_decider(_R("notify")); bus.add_actuator(_R("discord.post"))
     assert bus.topology() == {"sensors": ["github"], "deciders": ["notify"],
                               "actuators": ["discord.post"]}
+
+
+# --- ingest allowlist (defence in depth for the render seam) -----------------
+
+async def test_ingest_strips_unexpected_keys_before_broadcast(tmp_path):
+    dash = _dash(tmp_path)
+    seen = asyncio.Queue()
+    dash._clients.add(seen)
+    app = Starlette(routes=[Route("/dashboard/ingest", dash.ingest, methods=["POST"])])
+    TestClient(app).post("/dashboard/ingest",
+        json={"frames": [{"log": "obs", "id": 1, "name": "<script>x</script>",
+                          "evil": "<img onerror=1>", "seen_at": 0}]},
+        headers={"Authorization": "Bearer t0ken"})
+    frame = (await asyncio.wait_for(seen.get(), 1))["frame"]
+    assert set(frame) == set(FRAME_KEYS)          # no "evil" key survives
+    assert "evil" not in frame

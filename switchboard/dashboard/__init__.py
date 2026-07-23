@@ -24,6 +24,11 @@ from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from switchboard.dashboard.stats import FRAME_KEYS, backfill, dead_message_ids
 
+
+def _reframe(frame: dict) -> dict:
+    """Keep only the allowlisted keys. Defence in depth for the ingest seam."""
+    return {k: frame.get(k) for k in FRAME_KEYS}
+
 logger = logging.getLogger(__name__)
 
 QUEUE_MAX = 256          # tap-side buffer before the oldest frames are dropped
@@ -147,7 +152,9 @@ class Dashboard:
 
         self._dropped = body.get("dropped", self._dropped)
         for frame in body.get("frames", []):
-            self._broadcast({"type": "event", "frame": frame})
+            # Re-shape to the allowlist at the boundary too: the browser escapes
+            # on render, but a frame with unexpected keys should never reach it.
+            self._broadcast({"type": "event", "frame": _reframe(frame)})
         return JSONResponse({"status": "ok"}, status_code=202)
 
     async def stream(self, request):
