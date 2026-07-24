@@ -157,11 +157,17 @@ def test_messages_off_keeps_intents_none_and_registers_no_listener():
     s = _sensor()
     assert s._client.intents.value == discord.Intents.none().value
     assert not s.messages
+    # @client.event setattr's the coroutine onto the client, so the attribute's
+    # absence is the listener's absence. Asserting it matters more than it looks:
+    # message_content is privileged, and a listener registered without the flag
+    # would mean the gateway refuses login outright rather than degrading.
+    assert not hasattr(s._client, "on_message")
 
 
-def test_messages_on_requests_exactly_the_needed_intents():
+def test_messages_on_requests_exactly_the_needed_intents_and_listens():
     s = _sensor(messages=True)
     i = s._client.intents
     assert i.guilds and i.guild_messages and i.message_content
     assert not i.members and not i.presences
     assert s.messages
+    assert hasattr(s._client, "on_message")
