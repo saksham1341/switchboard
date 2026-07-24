@@ -79,8 +79,18 @@ class AgentDecider:
             if s is None:
                 return
 
-        s["buffer"].append({"rendered": render_message(payload),
-                            "is_mention": is_mention})
+        # At-least-once delivery (see bus.py's _consume, which marks a message
+        # processed only after the handler returns) means this same
+        # observation can arrive again after a retry. Keying each buffer
+        # entry on the source message id and skipping a repeat keeps the
+        # append idempotent instead of duplicating content into one turn.
+        message_id = payload.get("message_id")
+        already_buffered = message_id is not None and any(
+            b.get("message_id") == message_id for b in s["buffer"])
+        if not already_buffered:
+            s["buffer"].append({"rendered": render_message(payload),
+                                "is_mention": is_mention,
+                                "message_id": message_id})
         if is_mention and s["state"] == "idle":
             await self._advance(s, ctx)
         else:
@@ -106,9 +116,19 @@ class AgentDecider:
         if self._model:
             args["model"] = self._model
         cid = await ctx.command("llm", args)
-        await self._sessions.put_pending(cid, {"kind": "llm", "sid": s["sid"]})
+        # The store has no transactions, so these two writes can never be made
+        # atomic — a crash between them is possible either way. We choose the
+        # order that fails safe: save the session (turn incremented, buffer
+        # flushed, state busy) BEFORE recording the pending entry. If we crash
+        # after save() but before put_pending(), the session is stuck "busy"
+        # with no pending record — recoverable, and exactly what the Phase 5
+        # stuck-busy watchdog exists to catch. The reverse order (pending
+        # before save) risks a stale, un-flushed session receiving an assistant
+        # reply with no matching user turn: a structurally invalid transcript
+        # that no watchdog can repair.
         s["state"] = "busy"
         await self._sessions.save(s)
+        await self._sessions.put_pending(cid, {"kind": "llm", "sid": s["sid"]})
 
     async def _halt(self, s, why: str, ctx) -> None:
         """Stop without emitting another llm. Placeholder until Phase 5 gives
