@@ -72,3 +72,28 @@ async def test_not_kept_message_is_not_marked():
     await bus._consume(CMD_LOG, "actuator/boom", Command.from_message, lambda v: False, lambda v: None)
     assert await bus._already_processed("actuator/boom", 5) is False  # skipped, never handled
     assert orch.settled == [(5, Outcome.SUCCESS)]
+
+
+async def test_failed_handler_is_not_marked_processed():
+    """A message that will be RETRIED must never be marked processed — marking
+    it would make the redelivery skip, silently dropping the work forever.
+    This also pins the ordering: mark must come AFTER handle, not before."""
+    orch = _Orch(retry_count=0)
+    m = _Msg(21, "web_search")
+    bus = _drive([m], orch, max_retries=10)
+    async def handle(v): raise RuntimeError("boom")
+    await bus._consume(CMD_LOG, "actuator/web_search", Command.from_message, lambda v: True, handle)
+    assert orch.settled == [(21, Outcome.RETRY)]
+    assert await bus._already_processed("actuator/web_search", 21) is False
+
+
+async def test_permanent_error_is_not_marked_processed():
+    """A DEAD message is terminal, but marking it would still be wrong: the
+    mark belongs to the SUCCESS path alone."""
+    orch = _Orch()
+    m = _Msg(22, "discord.post")
+    bus = _drive([m], orch)
+    async def handle(v): raise PermanentError()
+    await bus._consume(CMD_LOG, "actuator/discord.post", Command.from_message, lambda v: True, handle)
+    assert orch.settled == [(22, Outcome.DEAD)]
+    assert await bus._already_processed("actuator/discord.post", 22) is False
