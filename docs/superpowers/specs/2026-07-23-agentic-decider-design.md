@@ -81,7 +81,7 @@ Everything the agent does is one of these messages. `emitted_by` is stamped by t
 | `llm.ok` | actuator/llm | `{stop_reason, content:[blocks], usage}` (has `command_id`) |
 | `<tool>.ok` | tool actuator | tool result payload (has `command_id`) |
 | `<tool>.error` | tool actuator | `{message}` — a *handled* failure (has `command_id`) |
-| `<cmd>.failed` | **the Bus** | dead-letter backstop (has `command_id`) — see §10 |
+| `switchboard.deadletter` | sensor/deadletter | `{log, group, message_id, name, reason}` — **no `command_id`** — see §10.2 |
 
 **Commands (cmd log):**
 
@@ -113,6 +113,10 @@ pending:<command_id> → { kind: "llm" | "tool", sid, tool_use_id?, turn_key? }
 ```
 decide(obs):
     if obs.name == "discord.message":  on_message(obs)          ; return
+    if obs.name == "switchboard.deadletter":                     # a command of ours died
+        p = pending.pop(obs.payload["message_id"])               # correlate from the PAYLOAD
+        if p: on_gather(p, obs, dead=True)
+        return
     p = pending.pop(obs.command_id)                              # None → not ours, ignore
     (kind=="llm")  → on_response(p.sid, obs)
     (kind=="tool") → on_gather(p, obs)
@@ -135,7 +139,7 @@ on_response(sid, obs):                 # the model spoke
 
 on_gather(p, obs):                     # a tool finished
     if p.tool_use_id in gather.results: return       # (redelivery handled by §11, belt anyway)
-    gather.results[p.tool_use_id] = outcome(obs)     # ok / error / failed
+    gather.results[p.tool_use_id] = outcome(obs)     # ok / error / dead-lettered
     gather.remaining--
     if gather.remaining == 0:
         append user(tool_result blocks in gather.order) to messages
@@ -215,13 +219,13 @@ Tool name **==** actuator name **==** command name — identity mapping, no regi
 
 ### 7.2 Result → tool_result
 
-The decider correlates by `command_id` (not name), so all three outcomes flow through one code path:
+The decider correlates by `command_id` (not name) for the first two. The third arrives as `switchboard.deadletter`, which deliberately carries **no** `command_id` — a sensor cannot forge a result — so the decider correlates it from `payload["message_id"]` instead:
 
 | actuator emits | decider produces |
 |---|---|
 | `result("ok", payload)` | `tool_result{content: json(payload), is_error: false}` |
 | `result("error", {message})` | `tool_result{content: message, is_error: true}` |
-| Bus `<cmd>.failed` (backstop) | `tool_result{content: "tool died", is_error: true}` |
+| `switchboard.deadletter` naming this command | `tool_result{content: "tool died", is_error: true}` |
 
 Convention: **the ok payload *is* the tool content** (json-serialized).
 
@@ -304,17 +308,33 @@ Storage: a small per-group processed-set in the Bus's own SQLite, pruned with th
 
 **Distinct from provider dedup:** the GitHub sensor's `github:delivery:<id>` guards against *GitHub* redelivering a webhook, upstream of the log entirely. Different layer, stays, untouched by this.
 
-### 10.2 `.failed` on dead-letter — close the result loop
+### 10.2 `switchboard.deadletter` — dead-letter visibility
 
-Invariant: **every command terminates in exactly one result observation carrying its `command_id`.**
+Invariant the agent needs: **a command that dies must eventually become an observation**, or the gather waits forever.
 
-- success → actuator emits `<cmd>.ok`
-- known failure → actuator emits `<cmd>.error` (fast, rich, the LLM can react)
-- crash / unhandled / retry-exhausted → the Bus, on settling a cmd `DEAD`, emits a synthetic `<cmd>.failed` obs with the command_id
+The obvious implementation — emit from `_consume` when the Bus settles `DEAD` — cannot deliver it. mamamia marks messages DEAD in places the Bus never sees: its own retry cap (the Bus settles `RETRY` and mamamia decides when that becomes `DEAD`), the reaper, and lease-expiry churn where a handler may never have run at all. Inline emission covers only the cases the Bus itself decides, so it is not an invariant.
 
-Without the backstop, a permanently-failing tool produces no result and the gather hangs forever. ~5 lines in the actuator-consume path, purely additive — existing deciders don't subscribe to `.failed`; no actuator consumes obs, so no loop. A generally useful property beyond the agent: commands that die announce it.
+So the **DEAD table is the source of truth**, and a scheduled sensor reads it:
 
----
+```
+sensor/deadletter, every ~10s:
+    for each DEAD row in message_state:
+        already seen?                     → skip
+        name == "switchboard.deadletter"? → skip        (cascade guard)
+        first run?                        → record, don't emit  (baseline)
+        else → emit switchboard.deadletter
+                 {log, group, message_id, name, reason}
+```
+
+Three consequences worth holding:
+
+- **There is no `<cmd>.failed`.** `SensorCtx.emit` takes no `command_id`, and a sensor should not be able to forge a result observation claiming to answer someone's command. One signal carries everything; the agent correlates from `payload["message_id"]` against its own `pending` map.
+- **Both logs are announced.** A decider or tap dying is a health fact exactly as a command dying is — the difference is only that nobody is waiting on the former. This is the self-observation idea landing: Switchboard senses itself through its own substrate.
+- **The core is untouched.** `_consume`'s failure branches stay `PermanentError → DEAD` / `RETRY` with backoff. No Bus-owned retry cap, no `.failed` emission, no DEAD query in the Bus. The behaviour is opt-in — don't register the sensor and it simply isn't there.
+
+Two guards live in the sensor: the **cascade guard** (never announce a dead `switchboard.deadletter`, or a consumer failing on one announces forever) and the **first-run baseline** (a fresh store must not replay up to `max_dead` historical rows as if they just happened).
+
+It is also the first real consumer of the `Scheduler`, and it lets the dashboard drop its own 5s `message_state` poll — one poller, many subscribers.
 
 ## 11. The at-least-once principle
 
@@ -328,7 +348,7 @@ The obs log is at-least-once, so **every handler must be safe to run twice on th
 |---|---|---|---|
 | 1 | **crash-window double** | crash between `on_response` finishing and `_consume` marking → redelivered `llm.ok` re-emits the tool command. A second `web_search` (wasted) or a second `discord.reply` (**double post**). | `done:<command_id>` on non-idempotent actuators. **Reply first** — it's user-visible. |
 | 2 | **unbounded conversation** | `session:messages` grows every turn and rides in each `llm` payload — token cost + cmd-log size climb with length | truncation / summarization pass |
-| 3 | **misconfig ≠ dead-letter** | a configured tool with no actuator → command sits unconsumed forever (never retried → never `.failed`); only the watchdog catches it | trusted config; watchdog is the net |
+| 3 | **misconfig ≠ dead-letter** | a configured tool with no actuator → command sits unconsumed forever (never retried → never DEAD → never announced); only the watchdog catches it | trusted config; watchdog is the net |
 | 4 | **tools re-sent every turn** | minor payload bloat | llm actuator holds defs; decider sends names |
 
 None are architectural. Each is "add a guard later."
@@ -340,7 +360,7 @@ None are architectural. Each is "add a guard later."
 | piece | kind | status |
 |---|---|---|
 | `_consume` `(group, msg.id)` dedup | framework | **prereq** |
-| Bus `.failed` on dead-letter | framework | **prereq** |
+| `sensor/deadletter` — scheduled DEAD-table sweep | sensor | **prereq** |
 | `Actuator.tool_spec` | contract | new |
 | `llm` actuator (generic executor) | actuator | new |
 | `kv` actuator (+ decider virtual memory tools) | actuator | new |
@@ -395,7 +415,7 @@ Episode = OBS 100–105, CMD 1–5. The entire reasoning is in the logs — repl
 | **mention while busy** | buffered with mention flag; `finish` sees it → advance, not idle |
 | **non-mention context** | buffered, no advance; flushed into the next combined user turn |
 | **tool error** | actuator `result("error")` → `<tool>.error` → gather resolves is_error → the LLM sees it and adapts |
-| **tool crash** | dead-letter → Bus `<tool>.failed` → gather resolves is_error; never hangs |
+| **tool crash** | dead-letter → `switchboard.deadletter` → gather resolves is_error (bounded by the sweep interval); never hangs |
 | **hallucinated tool** | not in configured set → instant is_error result, no command; never hangs |
 | **cap breach** | `advance` gate → `halt` (reply "step limit"), idle, no llm |
 | **memory isolation** | `scratchpad` → `session:<sid>:*`; another session can't address it |

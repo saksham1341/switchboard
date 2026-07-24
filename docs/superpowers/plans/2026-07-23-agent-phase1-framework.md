@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add the two substrate guarantees the agentic decider depends on — at-least-once dedup at the consume layer, and a dead-letter result observation so a failed command always produces a terminal result.
+**Goal:** Add the two substrate guarantees the agentic decider depends on — at-least-once dedup at the consume layer, and dead-letter visibility so a command that dies always becomes an observation.
 
-**Architecture:** Both changes live in `switchboard/bus.py`, inside `_consume` (the single loop every consumer — decider, actuator, tap — runs through). Task 1 adds a `(group_id, msg.id)` processed-guard backed by the Bus's own `KeyStore`. Task 2 routes every command dead-letter through one helper that emits a `<cmd>.failed` observation.
+**Architecture:** Task 1 lives in `switchboard/bus.py`, inside `_consume` (the single loop every consumer — decider, actuator, tap — runs through), adding a `(group_id, msg.id)` processed-guard backed by the Bus's own `KeyStore`. Task 2 is **not** Bus code: mamamia can mark a message DEAD without the Bus seeing it, so dead-letter announcement is a scheduled **sensor** that reads the DEAD table — the table is the source of truth, the core stays untouched, and the behaviour is opt-in.
 
 **Tech Stack:** Python 3.12, asyncio, mamamia (`Outcome`), the existing `KeyStore`. pytest with `asyncio_mode = "auto"` (bare `async def test_*`, no decorator). Run tests with `./scripts/dev.sh test`.
 
@@ -14,18 +14,22 @@
 
 - Dedup is keyed on `(group_id, msg.id)`, stored in the Bus's own `self._store` (unscoped) under the key `f"_processed:{group_id}:{msg.id}"`, value `"1"`, with a TTL (default `3600.0`s).
 - A message is marked processed **only on the SUCCESS path** — after `handle` returns, before `settle(SUCCESS)`. Never mark on RETRY, DEAD, or the not-kept path.
-- The `.failed` observation is emitted **only for `CMD_LOG` deaths.** `OBS_LOG` deaths settle DEAD with no synthetic observation, exactly as today.
-- The `.failed` observation: name `f"{command_name}.failed"` (command_name from `msg.metadata["name"]`), `command_id = msg.id`, payload `{"reason": <str>, "attempts": <int>}`, `emitted_by = group_id`.
-- Both dead-letter paths — `PermanentError` (immediate) and retries exhausted — route through one `_dead_letter` helper.
-- Existing DEAD-after-max-retries behaviour and the dead-letter CLI (`switchboard/cli.py`, reads `message_state` DEAD rows) must keep working. The retry cap becomes Bus-owned (`attempts >= self._max_retries → DEAD`) so every DEAD transition is Bus-visible.
+- There is **no `<cmd>.failed` observation.** `SensorCtx.emit` takes no `command_id` — a sensor cannot forge a result observation, and should not be able to. One signal only: `switchboard.deadletter`, payload `{log, group, message_id, name, reason}`. Consumers correlate from the payload.
+- `switchboard.deadletter` is emitted for **every** dead-letter, both logs — a decider or tap dying is a health fact exactly as a command dying is.
+- The sensor never announces a dead row whose own message name is `switchboard.deadletter` (cascade guard), and its first sweep baselines existing rows without emitting.
+- `_consume`'s failure branches are **unchanged**: `PermanentError → DEAD`, otherwise `RETRY` with backoff. No Bus-owned retry cap. mamamia may dead-letter however it likes; the sweep observes the result.
+- The dead-letter CLI (`switchboard/cli.py`, reads `message_state` DEAD rows) is untouched and keeps working.
 - The `switchboard.dashboard` and every existing role are unchanged. This is additive platform work.
 
 ## File Structure
 
-- **Modify:** `switchboard/bus.py` — the `_consume` loop, plus two small helpers (`_already_processed`/`_mark_processed`, `_dead_letter`) and one `__init__` field (`_processed_ttl`).
-- **Create:** `tests/test_bus_framework.py` — a shared fake-registry harness that drives `_consume` deterministically, plus the dedup and `.failed` tests.
+- **Modify:** `switchboard/bus.py` — the `_consume` loop, plus two helpers (`_already_processed`/`_mark_processed`) and one `__init__` field (`_processed_ttl`). Task 1 only.
+- **Create:** `tests/test_bus_framework.py` — a fake-registry harness that drives `_consume` deterministically, plus the dedup tests.
+- **Create:** `switchboard/sensors/deadletter.py` — the scheduled sweep. Reads mamamia's DEAD table read-only, same precedent as `switchboard/cli.py` and `switchboard/dashboard/stats.py`.
+- **Create:** `tests/test_sensor_deadletter.py`.
+- **Modify:** `switchboard/app.py` — register the sensor.
 
-`_consume` currently ends each success with `await settle(msg.id, Outcome.SUCCESS)` and handles failure with `except PermanentError: settle DEAD` / `except Exception: settle RETRY`. Both tasks edit this block; Task 2 builds on the block Task 1 leaves.
+The two tasks are independent: Task 1 touches only the Bus, Task 2 only adds a sensor. Either could ship alone.
 
 ---
 
@@ -205,128 +209,276 @@ git commit -m "feat(bus): at-least-once dedup at the consume layer"
 
 ---
 
-### Task 2: Dead-letter result observation
+### Task 2: DeadLetterSensor
 
 **Files:**
-- Modify: `switchboard/bus.py` — add `_dead_letter`, route both DEAD paths through it, make the retry cap Bus-owned.
-- Test: `tests/test_bus_framework.py` (extend).
+- Create: `switchboard/sensors/deadletter.py`
+- Test: `tests/test_sensor_deadletter.py`
+- Modify: `switchboard/app.py` — register the sensor in `build()`
 
 **Interfaces:**
-- Consumes: the `_consume` block from Task 1, `self.emit_observation(name, payload, command_id=, emitted_by=)`, `self._max_retries`, `Outcome`, `CMD_LOG`.
-- Produces: `Bus._dead_letter(log, group_id, msg, settle, reason, attempts) -> None`, and a `_consume` that emits `f"{cmd_name}.failed"` (command_id set) for every command that dead-letters. Consumed by Phase 4 (the agent decider correlates results by command_id, `.failed` included).
+- Consumes: `SensorCtx` (`emit(name, payload)`, `store`, `schedule.every(seconds, fn)`) from `switchboard.message`; `MessageState` from `mamamia.core.models`.
+- Produces: `DeadLetterSensor(db_path, *, interval=10.0)` with `name = "deadletter"`, emitting `switchboard.deadletter` observations with payload `{log, group, message_id, name, reason}`. Consumed by Phase 4 (the agent decider resolves a gather slot by looking up `pending:<payload["message_id"]>`) and eventually by the dashboard.
 
-- [ ] **Step 1: Write the failing tests**
+**Why a sensor and not Bus code:** mamamia can mark a message DEAD without the Bus ever seeing it — its own retry cap, the reaper, lease-expiry churn. Inline emission from `_consume` could only ever cover the cases the Bus itself decides, so it cannot make "every dead-letter is announced" an invariant. Reading the DEAD table makes the table the single source of truth, and a sensor is exactly the right shape for it: woken by a clock, it brings a fact into the log that was not already in it. It also keeps the core untouched and is opt-in — don't register it and the behaviour is simply absent.
 
-Append to `tests/test_bus_framework.py`:
+**Note on naming:** there is deliberately no `<cmd>.failed` observation. `SensorCtx.emit` takes no `command_id` — a sensor cannot forge a result observation, and should not be able to. One signal, `switchboard.deadletter`, carries everything; consumers correlate from its payload.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/test_sensor_deadletter.py`:
 
 ```python
-def _capture_emits(bus):
-    """Replace emit_observation with a recorder; return the record list."""
+import sqlite3
+
+from mamamia.core.models import MessageState
+
+from switchboard.sensors.deadletter import DeadLetterSensor
+from switchboard.message import SensorCtx
+from switchboard.store import MemoryStore
+from switchboard.http import HttpServer
+from switchboard.scheduler import Scheduler
+
+
+def _db(tmp_path, rows):
+    """A stand-in mamamia db with just the two tables the sweep reads."""
+    import msgpack
+    p = str(tmp_path / "mm.db")
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE message_state (log_id TEXT, group_id TEXT, "
+              "message_id INTEGER, state INTEGER)")
+    c.execute("CREATE TABLE messages (log_id TEXT, id INTEGER, metadata BLOB)")
+    for log, group, mid, name, state in rows:
+        c.execute("INSERT INTO message_state VALUES (?,?,?,?)", (log, group, mid, state))
+        c.execute("INSERT INTO messages VALUES (?,?,?)",
+                  (log, mid, msgpack.packb({"name": name})))
+    c.commit(); c.close()
+    return p
+
+
+def _bound(db_path, store=None):
     emitted = []
-    async def cap(name, payload, command_id=None, emitted_by=None):
-        emitted.append((name, command_id, emitted_by, payload)); return 1
-    bus.emit_observation = cap
-    return emitted
+    async def emit(name, payload):
+        emitted.append((name, payload)); return len(emitted)
+    s = DeadLetterSensor(db_path)
+    s.bind(SensorCtx(emit=emit, http=HttpServer(serve=False),
+                     store=store or MemoryStore(),
+                     schedule=Scheduler().for_owner("deadletter")))
+    return s, emitted
 
 
-async def test_permanent_error_emits_failed_for_a_command():
-    orch = _Orch()
-    m = _Msg(7, "discord.post")
-    bus = _drive([m], orch)
-    emitted = _capture_emits(bus)
-    async def handle(v): raise PermanentError()
-    await bus._consume(CMD_LOG, "actuator/discord.post", Command.from_message, lambda v: True, handle)
-    assert orch.settled == [(7, Outcome.DEAD)]
-    assert emitted[0][:3] == ("discord.post.failed", 7, "actuator/discord.post")
-    assert emitted[0][3]["reason"] == "permanent"
+async def test_first_sweep_baselines_without_emitting(tmp_path):
+    """A fresh store must not replay history as if it just happened."""
+    db = _db(tmp_path, [("cmd", "actuator/web_search", 42, "web_search",
+                         MessageState.DEAD.value)])
+    s, emitted = _bound(db)
+    await s.sweep()
+    assert emitted == []                       # baselined, not announced
 
 
-async def test_retry_exhaustion_emits_failed():
-    orch = _Orch(retry_count=3)                 # already at the cap
-    m = _Msg(9, "web_search")
-    bus = _drive([m], orch, max_retries=3)
-    emitted = _capture_emits(bus)
-    async def handle(v): raise RuntimeError("boom")
-    await bus._consume(CMD_LOG, "actuator/web_search", Command.from_message, lambda v: True, handle)
-    assert orch.settled == [(9, Outcome.DEAD)]  # not RETRY — cap reached
-    assert emitted[0][:2] == ("web_search.failed", 9)
-    assert emitted[0][3]["attempts"] == 3
+async def test_new_dead_row_is_announced(tmp_path):
+    db = _db(tmp_path, [])
+    store = MemoryStore()
+    s, emitted = _bound(db, store)
+    await s.sweep()                            # baseline on an empty table
+    c = sqlite3.connect(db)
+    import msgpack
+    c.execute("INSERT INTO message_state VALUES (?,?,?,?)",
+              ("cmd", "actuator/web_search", 42, MessageState.DEAD.value))
+    c.execute("INSERT INTO messages VALUES (?,?,?)",
+              ("cmd", 42, msgpack.packb({"name": "web_search"})))
+    c.commit(); c.close()
+    await s.sweep()
+    assert len(emitted) == 1
+    name, payload = emitted[0]
+    assert name == "switchboard.deadletter"
+    assert payload["log"] == "cmd"
+    assert payload["group"] == "actuator/web_search"
+    assert payload["message_id"] == 42
+    assert payload["name"] == "web_search"
 
 
-async def test_retry_below_cap_does_not_dead_letter():
-    orch = _Orch(retry_count=0)
-    m = _Msg(11, "web_search")
-    bus = _drive([m], orch, max_retries=3)
-    emitted = _capture_emits(bus)
-    async def handle(v): raise RuntimeError("boom")
-    await bus._consume(CMD_LOG, "actuator/web_search", Command.from_message, lambda v: True, handle)
-    assert orch.settled[0][1] == Outcome.RETRY   # retried, not dead
-    assert emitted == []                          # no .failed yet
+async def test_a_row_is_announced_only_once(tmp_path):
+    db = _db(tmp_path, [])
+    store = MemoryStore()
+    s, emitted = _bound(db, store)
+    await s.sweep()
+    import msgpack
+    c = sqlite3.connect(db)
+    c.execute("INSERT INTO message_state VALUES (?,?,?,?)",
+              ("obs", "decider/notify", 7, MessageState.DEAD.value))
+    c.execute("INSERT INTO messages VALUES (?,?,?)",
+              ("obs", 7, msgpack.packb({"name": "github.pr.opened"})))
+    c.commit(); c.close()
+    await s.sweep()
+    await s.sweep()                            # second pass must be silent
+    assert len(emitted) == 1
 
 
-async def test_observation_death_emits_no_failed():
-    orch = _Orch()
-    m = _Msg(3, "thing.happened")
-    bus = _drive([m], orch)
-    emitted = _capture_emits(bus)
-    async def handle(v): raise PermanentError()
-    await bus._consume(OBS_LOG, "decider/x", Observation.from_message, lambda v: True, handle)
-    assert orch.settled == [(3, Outcome.DEAD)]
-    assert emitted == []                          # obs deaths get no synthetic obs
+async def test_observation_deaths_are_announced_too(tmp_path):
+    """Deciders and taps dying is a health fact, same as a command dying."""
+    db = _db(tmp_path, [])
+    s, emitted = _bound(db)
+    await s.sweep()
+    import msgpack
+    c = sqlite3.connect(db)
+    c.execute("INSERT INTO message_state VALUES (?,?,?,?)",
+              ("obs", "decider/notify", 7, MessageState.DEAD.value))
+    c.execute("INSERT INTO messages VALUES (?,?,?)",
+              ("obs", 7, msgpack.packb({"name": "github.pr.opened"})))
+    c.commit(); c.close()
+    await s.sweep()
+    assert emitted[0][1]["log"] == "obs"
+
+
+async def test_cascade_guard(tmp_path):
+    """A consumer dying on switchboard.deadletter must not announce forever."""
+    db = _db(tmp_path, [])
+    s, emitted = _bound(db)
+    await s.sweep()
+    import msgpack
+    c = sqlite3.connect(db)
+    c.execute("INSERT INTO message_state VALUES (?,?,?,?)",
+              ("obs", "decider/x", 9, MessageState.DEAD.value))
+    c.execute("INSERT INTO messages VALUES (?,?,?)",
+              ("obs", 9, msgpack.packb({"name": "switchboard.deadletter"})))
+    c.commit(); c.close()
+    await s.sweep()
+    assert emitted == []                       # never announce our own kind
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
-Run: `./scripts/dev.sh test tests/test_bus_framework.py -q`
-Expected: FAIL — `test_permanent_error_emits_failed_for_a_command` and `test_retry_exhaustion_emits_failed` fail (no `.failed` emitted); `test_retry_exhaustion_emits_failed` also fails because the current code settles RETRY, not DEAD, at the cap.
+Run: `./scripts/dev.sh test tests/test_sensor_deadletter.py -q`
+Expected: FAIL — `ModuleNotFoundError: No module named 'switchboard.sensors.deadletter'`
 
-- [ ] **Step 3: Add the `_dead_letter` helper**
+- [ ] **Step 3: Write the sensor**
 
-In `switchboard/bus.py`, add to the `Bus` class (next to the dedup helpers from Task 1):
-
-```python
-    async def _dead_letter(self, log, group_id, msg, settle, reason, attempts) -> None:
-        """Settle a message DEAD and, for a command, emit a terminal result so a
-        consumer waiting on that command_id is never left hanging."""
-        await settle(msg.id, Outcome.DEAD)
-        if log == CMD_LOG:
-            name = (msg.metadata or {}).get("name", "")
-            await self.emit_observation(
-                f"{name}.failed", {"reason": reason, "attempts": attempts},
-                command_id=msg.id, emitted_by=group_id)
-```
-
-- [ ] **Step 4: Route both DEAD paths through it**
-
-In `_consume`, replace the `except PermanentError:` and `except Exception:` branches (from Task 1's block) with:
+Create `switchboard/sensors/deadletter.py`:
 
 ```python
-                except PermanentError:
-                    await self._dead_letter(log, group_id, msg, settle, "permanent", 0)
-                except Exception:
-                    attempts = await orch.state_store.get_retry_count(log, group_id, msg.id)
-                    if attempts >= self._max_retries:
-                        await self._dead_letter(log, group_id, msg, settle,
-                                                "retries exhausted", attempts)
-                    else:
-                        await settle(msg.id, Outcome.RETRY, retry_after=backoff(attempts))
+"""Announce dead-lettered messages as observations.
+
+mamamia can mark a message DEAD without the Bus seeing it — its own retry cap,
+the reaper, lease-expiry churn — so inline emission from the consume loop can
+never be complete. Reading the DEAD table makes the table the single source of
+truth, and this is exactly a sensor's job: bring a fact into the log that was
+not already in it.
+"""
+import logging
+import sqlite3
+
+from mamamia.core.models import MessageState
+
+logger = logging.getLogger(__name__)
+
+DEADLETTER = "switchboard.deadletter"
+
+
+def _decode(blob):
+    import msgpack
+    return msgpack.unpackb(blob, raw=False)
+
+
+class DeadLetterSensor:
+    name = "deadletter"
+
+    def __init__(self, db_path: str, *, interval: float = 10.0):
+        self._db = db_path
+        self._interval = interval
+        self.ctx = None
+
+    def bind(self, ctx) -> None:
+        self.ctx = ctx
+        ctx.schedule.every(self._interval, self.sweep, first_after=0.0)
+
+    async def start(self) -> None:
+        return                       # timer-driven: no loop to supervise
+
+    async def stop(self) -> None:
+        return
+
+    async def sweep(self) -> None:
+        try:
+            rows = self._dead_rows()
+        except Exception as exc:
+            logger.debug("dead-letter sweep skipped: %s", exc)
+            return
+
+        # First run establishes a baseline: existing DEAD rows are recorded as
+        # seen but not announced, so a fresh store never replays history.
+        baselined = await self.ctx.store.get("baselined") is not None
+
+        for log, group, mid, name in rows:
+            key = f"seen:{log}:{group}:{mid}"
+            if await self.ctx.store.get(key) is not None:
+                continue
+            await self.ctx.store.set(key, "1")
+            if not baselined:
+                continue
+            # Never announce our own kind: a consumer dying on a deadletter
+            # observation would otherwise announce that, forever.
+            if name == DEADLETTER:
+                continue
+            await self.ctx.emit(DEADLETTER, {
+                "log": log, "group": group, "message_id": mid,
+                "name": name, "reason": "dead-lettered",
+            })
+
+        if not baselined:
+            await self.ctx.store.set("baselined", "1")
+
+    def _dead_rows(self):
+        # uri=True + mode=ro so a bug here can never write to the relay's db.
+        conn = sqlite3.connect(f"file:{self._db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            dead = conn.execute(
+                "SELECT log_id, group_id, message_id FROM message_state WHERE state = ?",
+                (MessageState.DEAD.value,),
+            ).fetchall()
+            out = []
+            for log, group, mid in dead:
+                row = conn.execute(
+                    "SELECT metadata FROM messages WHERE log_id = ? AND id = ?",
+                    (log, mid),
+                ).fetchone()
+                md = _decode(row[0]) if row and row[0] else {}
+                out.append((log, group, mid, md.get("name", "")))
+            return out
+        finally:
+            conn.close()
 ```
 
-- [ ] **Step 5: Run to verify pass**
+- [ ] **Step 4: Run to verify pass**
 
-Run: `./scripts/dev.sh test tests/test_bus_framework.py -q`
-Expected: PASS, 7 tests total.
+Run: `./scripts/dev.sh test tests/test_sensor_deadletter.py -q`
+Expected: PASS, 5 tests.
 
-- [ ] **Step 6: Run the full suite (no regressions)**
+- [ ] **Step 5: Register it in the app**
+
+In `switchboard/app.py`, add the import beside the other sensors:
+
+```python
+from switchboard.sensors.deadletter import DeadLetterSensor
+```
+
+and in `build()`, extend the sensor list so it reads:
+
+```python
+    sensors = [GitHubSensor(secret=config["github_secret"]),
+               DeadLetterSensor(config["mamamia_db_path"])]
+```
+
+- [ ] **Step 6: Run the full suite**
 
 Run: `./scripts/dev.sh test`
-Expected: PASS. In particular `tests/test_cli.py` still lists dead letters — the `_Boom` decider there raises `PermanentError` on the **obs** log, which still settles DEAD and (correctly) emits no `.failed`. The dead-letter `message_state` rows the CLI reads are unchanged.
+Expected: PASS — existing count + 5. `tests/test_app.py` still passes; the extra sensor only adds a timer.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add switchboard/bus.py tests/test_bus_framework.py
-git commit -m "feat(bus): emit <cmd>.failed on command dead-letter"
+git add switchboard/sensors/deadletter.py tests/test_sensor_deadletter.py switchboard/app.py
+git commit -m "feat(sensors): announce dead-letters as switchboard.deadletter observations"
 ```
 
 ---
@@ -335,14 +487,16 @@ git commit -m "feat(bus): emit <cmd>.failed on command dead-letter"
 
 **Spec coverage (§10):**
 - §10.1 `_consume` `(group, msg.id)` dedup, marked after handle / before settle, in the Bus's own store, distinct from role scopes → Task 1. ✓
-- §10.2 `.failed` on dead-letter, `command_id` set, CMD_LOG only, both DEAD paths, additive → Task 2. ✓
-- The "not exactly-once, crash window remains" property is inherent (marking before settle) and needs no code — it is documented in the spec, not enforced here. ✓
+- §10.2 dead-letter visibility — reworked to a sensor emitting `switchboard.deadletter` for every DEAD row on both logs, with cascade guard and first-run baseline → Task 2. ✓
+- The "not exactly-once, crash window remains" property is inherent (marking before settle) and needs no code — documented in the spec, not enforced here. ✓
 
 **Placeholder scan:** No TBD/TODO; every code step shows complete code; every test has real assertions. ✓
 
-**Type consistency:** `_already_processed`/`_mark_processed`/`_dead_letter` signatures match between their definitions and their `_consume` call sites; `emit_observation(name, payload, command_id=, emitted_by=)` matches the existing signature in `bus.py:98`. ✓
+**Type consistency:** `_already_processed`/`_mark_processed` signatures match their `_consume` call sites. `DeadLetterSensor` implements the `Sensor` protocol (`name`, `bind`, `async start`, `async stop`) and uses only `ctx.emit`/`ctx.store`/`ctx.schedule` — no `command_id`, which `SensorCtx.emit` does not accept. ✓
 
-**One risk flagged for review, not a gap:** Task 2 makes the retry cap Bus-owned (`attempts >= self._max_retries → DEAD`) instead of relying on mamamia's internal cap. The full-suite run in Task 2 Step 6 is the check that this preserves existing dead-letter behaviour; the reviewer should confirm no test depended on mamamia performing the DEAD transition itself.
+**Risk removed:** the earlier draft made the retry cap Bus-owned so every DEAD transition would be Bus-visible. That rested on an unverified assumption about whether `get_retry_count` is pre- or post-increment, and still missed the reaper and lease-expiry churn. Reading the DEAD table removes both the assumption and the incompleteness — `_consume`'s failure branches are now untouched.
+
+**One thing for the reviewer:** `tests/test_sensor_deadletter.py` builds a stand-in sqlite db with the two columns the sweep reads (`message_state`, `messages`). If mamamia's real schema differs, these tests pass while the sweep fails in production — the reviewer should confirm the column names against the live `data/events.db` (or against `switchboard/cli.py:list_dead_letters`, which queries the same tables).
 
 ---
 
