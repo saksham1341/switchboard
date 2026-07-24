@@ -596,49 +596,34 @@ async def test_the_same_tool_result_delivered_twice_is_a_no_op():
     assert rec3.emitted == []                        # take_pending already consumed it
 
 
-async def test_the_turn_limit_stops_the_loop():
-    """Drives the real multi-turn loop -- mint, tool round-trip, next turn,
-    another tool round-trip -- until the cap is hit, and checks that the
-    loop actually stops (no third llm call) and the session lands idle
-    rather than stuck busy forever."""
-    a = _agent(max_turns=2)
-    cid = await _mint(a)                              # turn 1
-    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
-    tool_cid = rec1.emitted[0][2]
-    rec2 = await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=tool_cid))
-    assert [n for n, _, _ in rec2.emitted] == ["llm"]  # turn 2
-    cid2 = rec2.emitted[0][2]
-    rec3 = await _deliver(a, _llm_ok([_use("toolu_B")], oid=400, command_id=cid2))
-    tool_cid2 = rec3.emitted[0][2]
-    rec4 = await _deliver(a, _obs("discord.post.ok", {}, oid=500, command_id=tool_cid2))
-    assert rec4.emitted == []                          # turn 3 refused
+async def test_the_loop_has_no_turn_cap():
+    """There is deliberately no MAX_TURNS. Drive far past the old cap of 12 --
+    mint, then a long run of tool round-trips -- and every turn must still fire
+    an llm call. A session ends only when the model stops calling tools, never
+    on a counter."""
+    a = _agent()
+    cid = await _mint(a)                               # turn 1
+    for i in range(20):
+        rec = await _deliver(a, _llm_ok([_use(f"t{i}")], oid=300 + i, command_id=cid))
+        assert [n for n, _, _ in rec.emitted] == ["discord.post"], f"stalled at turn {i}"
+        tool_cid = rec.emitted[0][2]
+        rec = await _deliver(a, _obs("discord.post.ok", {}, oid=400 + i, command_id=tool_cid))
+        assert [n for n, _, _ in rec.emitted] == ["llm"], f"loop stopped at turn {i}"
+        cid = rec.emitted[0][2]
+    assert (await a._sessions.load(100))["turn"] > 12   # well past the removed cap
+
+
+async def test_a_response_with_no_tool_use_ends_the_session():
+    """The only terminator: the model ends its turn with no tool call, so the
+    decider delivers nothing and the session goes idle (text-blind by design)."""
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _obs("llm.ok",
+                                 {"stop_reason": "end_turn",
+                                  "content": [{"type": "text", "text": "done"}]},
+                                 oid=300, command_id=cid))
+    assert rec.emitted == []
     assert (await a._sessions.load(100))["state"] == "idle"
-
-
-async def test_a_halted_session_does_not_restart_on_a_fresh_mention():
-    """A session that is merely busy (mid-turn) buffers a fresh mention
-    without advancing regardless of the turn cap -- that's not the
-    interesting case. The interesting case is a session that has actually
-    hit the cap and landed idle via _halt: idle is also the state a session
-    is in when it is legitimately ready for its next turn, so the guard
-    must live in _advance itself, not be inferred from state. Drive a
-    session to the cap, confirm it halts idle, then confirm a brand new
-    mention -- which *would* call _advance because the session looks idle
-    -- still produces no llm call and leaves the turn counter exactly at
-    the cap."""
-    a = _agent(max_turns=1)
-    cid = await _mint(a)                               # turn 0 -> 1, busy
-    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
-    tool_cid = rec1.emitted[0][2]
-    rec2 = await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=tool_cid))
-    assert rec2.emitted == []                          # halted: cap hit closing the gather
-    assert (await a._sessions.load(100))["state"] == "idle"
-
-    rec3 = await _deliver(a, _obs("discord.message", _message(mid="2"), oid=101))
-    assert rec3.emitted == []                          # a fresh mention must not revive it
-    s = await a._sessions.load(100)
-    assert s["state"] == "idle"
-    assert s["turn"] == 1                              # never advances past the cap
 
 
 async def test_the_turn_counter_survives_a_reload():
@@ -649,46 +634,6 @@ async def test_the_turn_counter_survives_a_reload():
     await _mint(a)
     reloaded = Sessions(a.ctx.store)
     assert (await reloaded.load(100))["turn"] == 1
-
-
-async def test_after_halting_the_buffer_stops_growing_and_nothing_is_emitted():
-    """Once a session is halted, `turn` never resets, so without an explicit
-    stop signal every subsequent message would still be appended to `buffer`
-    and rewrite the whole record forever (O(n^2) in bytes written), with no
-    user-visible signal and no watchdog coverage (the session is idle, not
-    busy). Six further messages after the cap must leave the buffer exactly
-    as it was and emit nothing."""
-    a = _agent(max_turns=1)
-    cid = await _mint(a)                               # turn 0 -> 1, busy
-    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
-    tool_cid = rec1.emitted[0][2]
-    rec2 = await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=tool_cid))
-    assert rec2.emitted == []                           # halts closing the gather
-    s = await a._sessions.load(100)
-    assert s["halted"] is True
-    before = len(s["buffer"])
-
-    for i, mid in enumerate(["2", "3", "4", "5", "6", "7"]):
-        rec = await _deliver(a, _obs("discord.message",
-                                     _message(mid=mid, content=f"msg {mid}"), oid=101 + i))
-        assert rec.emitted == []
-
-    s = await a._sessions.load(100)
-    assert len(s["buffer"]) == before
-
-
-async def test_halted_survives_a_reload():
-    """`halted` must live in the store like every other piece of session
-    state: a fresh Sessions over the same underlying store must still see it
-    set after a reload."""
-    a = _agent(max_turns=1)
-    cid = await _mint(a)
-    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
-    tool_cid = rec1.emitted[0][2]
-    await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=tool_cid))
-
-    reloaded = Sessions(a.ctx.store)
-    assert (await reloaded.load(100))["halted"] is True
 
 
 async def test_a_non_string_message_id_appends_rather_than_deduping():

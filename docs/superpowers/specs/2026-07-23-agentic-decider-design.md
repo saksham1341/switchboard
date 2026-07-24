@@ -346,16 +346,15 @@ Anthropic still requires a result for *every* tool_use id, so the instant error 
 
 ## 9. Safety
 
-Every turn passes through `advance`, so it is the single chokepoint for loop safety:
+Every turn passes through `advance`, so it is the single chokepoint for loop safety. What passes through it changed once running:
 
-- **`MAX_TURNS`** — hard stop on the loop. The important one.
-- **`MAX_SPEND` per session** — the decider accumulates `usage` cost from each `llm.ok` into `session:<sid>:spent`. Suspenders.
-- **Global cost ledger** in `actuator/llm/` — a hard daily ceiling the `llm` actuator refuses past. Belt.
-- On breach, `halt(sid)` delivers a plain "I stopped because X" and idles — it does **not** emit another `llm`.
+- **No `MAX_TURNS`.** It was in Phase 4 as the one hard loop bound, but a *per-session lifetime* counter that never resets is the wrong shape: it does not stop a runaway turn, it kills a *long-lived* conversation — a session that answers many separate mentions over hours hits the cap and the bot goes permanently, silently dead. Observed live: a session halted at turn 12 mid-conversation and never spoke again. So it is **removed**. A session ends the honest way — when the model stops calling tools (`_on_response` with no `tool_use` → `finish` → idle). `turn` survives only as an observability counter.
+- **`MAX_SPEND` per session** — the real loop backstop, and the reason removing the turn cap is safe: the decider accumulates `usage` cost from each `llm.ok` into `session:<sid>:spent` and stops past a ceiling. A runaway tool-calling loop is bounded by *spend*, which is what actually matters, not by a turn count. Phase 5.
+- **Global cost ledger** in `actuator/llm/` — a hard daily ceiling the `llm` actuator refuses past. Belt. Phase 5.
 - **Isolation** — **memory** keys are decider-injected per session, so the agent cannot reach another session's memory (§7.3). **Destinations are not** isolated in v1: the reply defaults to the session's thread, but the agent may name any channel the bot can reach (§7.4, hole 4). Read the two together — the memory boundary is structural, the destination boundary is deferred.
-- **Watchdog** — halts stuck-busy sessions (§6.4).
+- **Watchdog** — halts stuck-busy sessions (§6.4). Phase 5.
 
-Because there is exactly one function the loop advances through, there is exactly one gate; nothing can leak past it.
+Until `MAX_SPEND` lands, there is **no automated spend backstop** — Phase 4 therefore runs *watched*, never unattended. That is the standing constraint the whole phase carries, and removing the turn cap sharpens rather than changes it: the only thing that was ever going to stop a determined loop is the spend ceiling, and it is not built yet.
 
 ---
 

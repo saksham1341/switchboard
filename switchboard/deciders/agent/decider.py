@@ -15,8 +15,6 @@ from switchboard.message import CMD_LOG
 
 logger = logging.getLogger(__name__)
 
-MAX_TURNS = 12
-
 
 def _tool_outcome(obs) -> tuple[str, bool]:
     """A result observation -> (tool_result content, is_error).
@@ -53,11 +51,9 @@ def _tool_outcome(obs) -> tuple[str, bool]:
 class AgentDecider:
     name = "agent"
 
-    def __init__(self, *, tools, model, system: str | None = None,
-                 max_turns: int = MAX_TURNS):
+    def __init__(self, *, tools, model, system: str | None = None):
         self._tools = list(tools)
         self._system = system if system is not None else SYSTEM
-        self._max_turns = max_turns
         self._model = model
 
     def bind(self, ctx) -> None:
@@ -147,14 +143,6 @@ class AgentDecider:
             if s is None:
                 return
 
-        if s.get("halted"):
-            # Once halted, a session never advances again (Phase 5 owns
-            # giving it a user-visible signal and/or reviving it). Returning
-            # here before touching `buffer` is what keeps every subsequent
-            # message in the channel from being appended and the whole
-            # record rewritten forever.
-            return
-
         # At-least-once delivery (see bus.py's _consume, which marks a message
         # processed only after the handler returns) means this same
         # observation can arrive again after a retry. Keying each buffer
@@ -180,9 +168,14 @@ class AgentDecider:
     # --- the turn --------------------------------------------------------
 
     async def _advance(self, s, ctx) -> None:
-        """The sole way a session takes a turn, and therefore the sole gate."""
-        if s["turn"] >= self._max_turns:
-            return await self._halt(s, "turn limit reached", ctx)
+        """The sole way a session takes a turn.
+
+        There is deliberately no turn cap: a session ends when the model stops
+        calling tools (`_on_response` -> `_finish`), not on a counter. `turn` is
+        kept as an observability counter only. The backstop against a runaway
+        tool-calling loop is Phase 5's spend ceiling, not a turn limit; until it
+        lands, Phase 4 runs watched, never unattended.
+        """
         s["turn"] += 1
 
         if s["buffer"]:
@@ -222,24 +215,6 @@ class AgentDecider:
         s["state"] = "busy"
         await self._sessions.save(s)
         await self._sessions.put_pending(cid, {"kind": "llm", "sid": s["sid"]})
-
-    async def _halt(self, s, why: str, ctx) -> None:
-        """Stop without emitting another llm. Placeholder until Phase 5 gives
-        halt a user-visible message; for now it idles and logs.
-
-        `halted` is explicit and sticky, unlike `state`: idle is also what a
-        session looks like when it is legitimately ready for its next turn, so
-        `_on_message` cannot infer "stopped for good" from state alone. Once
-        set, `_on_message` stops accumulating into `buffer` entirely — without
-        it, every subsequent message in the channel would still be appended
-        and the whole record rewritten forever (O(n^2) in bytes written, no
-        user-visible signal), since only Phase 5's watchdog/TTL would
-        eventually heal it and this session is never "busy" for that watchdog
-        to catch."""
-        logger.warning("session %s halted: %s", s["sid"], why)
-        s["state"] = "idle"
-        s["halted"] = True
-        await self._sessions.save(s)
 
     async def _on_response(self, s, obs, ctx) -> None:
         """The model spoke."""
