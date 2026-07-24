@@ -109,3 +109,29 @@ async def test_tool_spec_exposes_content_and_destination():
     assert spec is not None
     assert set(spec["input_schema"]["properties"]) == {"content", "channel_id"}
     assert spec["input_schema"]["required"] == ["content"]
+
+
+async def test_non_object_json_body_still_reports_ok():
+    """Valid JSON that isn't an object must not raise: a post we could not read
+    the id from is still a successful post."""
+    def h(req):
+        return httpx.Response(200, json=["unexpected"])
+    a = _bind(DiscordPost("bot", "app", channel_id="chan-9", client=_client(h)))
+    results = []
+    ctx = ActCtx(cmd=_cmd("discord.post", {"content": "hi"}),
+                 _emit_result=await _recorder(results))
+    await a.act(ctx.cmd, ctx)
+    assert results[0][0] == "discord.post.ok"
+    assert results[0][1] == {"channel_id": "chan-9", "message_id": None}
+
+
+async def test_non_json_body_still_reports_ok():
+    def h(req):
+        return httpx.Response(200, text="not json at all")
+    a = _bind(DiscordPost("bot", "app", channel_id="chan-9", client=_client(h)))
+    results = []
+    ctx = ActCtx(cmd=_cmd("discord.post", {"content": "hi"}),
+                 _emit_result=await _recorder(results))
+    await a.act(ctx.cmd, ctx)
+    assert results[0][0] == "discord.post.ok"
+    assert results[0][1]["message_id"] is None

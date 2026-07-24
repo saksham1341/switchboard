@@ -87,11 +87,15 @@ class DiscordPost:
                                        content=cmd.args.get("content"),
                                        embed=cmd.args.get("embed"),
                                        components=cmd.args.get("components"))
+        # Never trust the shape of the body, only that it parsed. A post we
+        # merely could not read the id from is still a successful post.
         message_id = None
         try:
-            message_id = resp.json().get("id")
-        except ValueError:
-            pass
+            body = resp.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            message_id = body.get("id")
         await ctx.result("ok", {"channel_id": channel, "message_id": message_id})
 
     async def close(self):
