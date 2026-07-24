@@ -5,6 +5,7 @@ from switchboard.bus import Bus
 from switchboard.http import HttpServer
 from switchboard.store import SqliteStore
 from switchboard.sensors.github import GitHubSensor
+from switchboard.sensors.deadletter import DeadLetterSensor
 from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
@@ -27,7 +28,8 @@ def build(config: dict):
               max_log_messages=int(config.get("max_log_messages", 10_000)))
     bus.add_tap(LoggerTap())
 
-    sensors = [GitHubSensor(secret=config["github_secret"])]
+    sensors = [GitHubSensor(secret=config["github_secret"]),
+               DeadLetterSensor(config["mamamia_db_path"])]
     for s in sensors:
         bus.add_sensor(s)
 
