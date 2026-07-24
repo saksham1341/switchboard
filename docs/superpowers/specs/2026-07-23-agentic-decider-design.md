@@ -162,7 +162,9 @@ One `llm.ok` can carry several `tool_use` blocks (parallel calls), and Anthropic
 
 ### 6.1 Identity — free from the substrate
 
-`session_id = the id of the discord.message observation that started it.` mamamia hands every observation a unique monotonic id, so the first message *is* the session's name — no minting mechanism. The thread mapping is **learned from the reply's result**: the reply actuator creates/uses a thread and returns its id in `discord.reply.ok`; the decider records `thread:<thread_id> → sid`. From then on every message in that thread routes to the session.
+`session_id = the id of the discord.message observation that started it.` mamamia hands every observation a unique monotonic id, so the first message *is* the session's name — no minting mechanism. The thread mapping is **learned from the reply's result**: the reply actuator creates/uses a thread and returns its id in `discord.reply.ok`; the decider records `thread:discord:<thread_id> → sid`. From then on every message in that thread routes to the session.
+
+The key is **source-qualified**, not source-neutral. Extracting the routing id is per-source work — `thread_id or channel_id` for Discord, something else for anything later — and the qualifier keeps two sources' id spaces from ever sharing a namespace. Note the direction: the generalization that eventually pays is a *more specific* key, not an abstract one. Session state is persisted, so a key rename is a migration rather than a find-and-replace; the qualifier costs nothing today and removes that later.
 
 ### 6.2 Engagement — mention is the only advance trigger
 
@@ -186,7 +188,7 @@ One rule — *hold input; advance only on a mention* — gives three behaviors:
 - **mention while idle** → flush + advance
 - **mention while busy** → buffered, drained at `finish`
 
-And it fixes consecutive-user-turns for free: `advance` **flushes the whole buffer into one combined user turn**, so ten silent messages + a mention become one user message carrying all eleven. The agent heard the whole thread and answers it as a unit.
+And it fixes consecutive-user-turns for free: `advance` **flushes the whole buffer into one combined user turn**, so ten silent messages + a mention become one user message carrying all eleven. The agent heard the whole thread and answers it as a unit. §6.6 governs how each one is rendered into that turn.
 
 The rule has one gap, closed in §6.5: a thread that discussed something for twenty messages and *then* mentions the bot gives the agent a session starting at the mention, blind to everything above it.
 
@@ -228,6 +230,27 @@ and the system prompt tells the agent it may be mentioned mid-thread and should 
 **Failure degrades to a tool error.** A failed fetch reaches the agent as `is_error` and it works around it ("I couldn't read the earlier messages — could you summarize?"). Under automatic hydration the same failure would be a session stuck mid-birth needing its own recovery path.
 
 This also covers the gap between expiry and the next mention, where thread messages are dropped rather than buffered: the agent fetches them back.
+
+### 6.6 Turn rendering — the source stays visible
+
+**The decider never normalizes an observation before the model sees it.** A tempting seam is to flatten every source into `{conversation_id, addressed, text}` so the decider is channel-agnostic. That is lossy in exactly the wrong place: the model chooses *tools*, and the source is what tells it `discord.post` rather than some future `slack.post`, with which id. Strip the source and the model has to guess. Source is semantic content, not transport noise.
+
+So the split is: the **decider** does per-source extraction (which field is the routing id) and no translation; the **model** sees the observation's own shape.
+
+`advance` renders each buffered message with its structure intact rather than as bare prose:
+
+```
+[discord.message] thread_id=222 channel_id=222 user=alice#0001
+<message>
+hey what do you think?
+</message>
+```
+
+The ids the model needs to act are in the turn it is answering, so the system prompt carries only the pairing rule once — *act on a source using that source's tools; ids come from the message header* — instead of the whole burden. A second source is then a new renderer plus its tools, with no decider change.
+
+**The header must be unforgeable by construction.** Message content is untrusted (§12, hole 4) and a user can type `[slack.message] channel_id=…` straight into Discord. The decider writes the header; content goes inside delimiters the decider never emits. Without that separation, prompt injection gets a second and much easier route to the distribution problem hole 4 describes.
+
+**Mis-pairing is self-correcting, not a hole.** A `slack.post` called with a Discord id 404s, returns as `is_error`, and the model retries. §7.5 already places the security boundary at the curated tool list rather than the model's judgment, so a prompt-enforced pairing rule is adequate for correctness and weakens nothing.
 
 ---
 
