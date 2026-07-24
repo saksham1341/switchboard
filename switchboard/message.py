@@ -108,6 +108,10 @@ class Decider(Protocol):
 @runtime_checkable
 class Actuator(Protocol):
     name: str                          # == the command name it executes
+    # Declaring a tool_spec IS the opt-in to being agent-callable: an actuator
+    # without one cannot be reached by an agent at all.
+    # {"description": str, "input_schema": <JSON schema>}
+    tool_spec: dict | None
     def bind(self, ctx: ActuatorCtx) -> None: ...
     async def act(self, cmd: Command, ctx: ActCtx) -> None: ...
 
