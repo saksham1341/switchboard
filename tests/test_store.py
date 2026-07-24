@@ -114,3 +114,23 @@ async def test_scope_rejects_non_str_key(store):
         await a.set(1, "v")
     with pytest.raises(TypeError):
         await a.delete(1)
+
+
+async def test_purge_is_not_part_of_the_contract():
+    """Whether expiry needs a periodic sweep is an implementation detail: sqlite
+    and memory reclaim by sweeping, a Redis-backed store expires natively and
+    would expose no purge. A store without one is still a KeyStore."""
+    from switchboard.store import KeyStore
+
+    class Minimal:
+        async def get(self, key): return None
+        async def set(self, key, value, *, ttl=None): pass
+        async def delete(self, key): pass
+
+    assert isinstance(Minimal(), KeyStore)      # satisfies the contract
+    assert not hasattr(Minimal(), "purge")      # without purge
+
+
+async def test_scoped_store_has_no_purge():
+    """Purging is a whole-store operation, never a per-scope one."""
+    assert not hasattr(ScopedStore(MemoryStore(), "sensor/x/"), "purge")

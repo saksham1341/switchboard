@@ -56,6 +56,9 @@ class Bus:
         self._maintenance: list[str] = []
 
         self._store = store if store is not None else MemoryStore()
+        # The Bus mints role views from the raw handle, and takes one for itself
+        # so its own machinery is namespaced the same way everything else is.
+        self._bus_store = ScopedStore(self._store, "_bus/")
         # serve=False by default so tests register routes and drive .app
         # without any of them binding a port.
         self._http = http if http is not None else HttpServer(serve=False)
@@ -213,12 +216,13 @@ class Bus:
             self._conn.close()
 
     # at-least-once dedup: the same (group, msg.id) delivered twice runs once.
-    # Uses the Bus's own store, unscoped, keyed to keep it off role scopes.
+    # Lives in the Bus's own "_bus/" scope — roles cannot name a key that reaches
+    # it, since every ScopedStore prepends its own "kind/name/".
     async def _already_processed(self, group_id, mid) -> bool:
-        return await self._store.get(f"_processed:{group_id}:{mid}") is not None
+        return await self._bus_store.get(f"processed:{group_id}:{mid}") is not None
 
     async def _mark_processed(self, group_id, mid) -> None:
-        await self._store.set(f"_processed:{group_id}:{mid}", "1", ttl=self._processed_ttl)
+        await self._bus_store.set(f"processed:{group_id}:{mid}", "1", ttl=self._processed_ttl)
 
     # generic consume loop shared by all consuming roles
     async def _consume(self, log, group_id, decode, keep, handle):

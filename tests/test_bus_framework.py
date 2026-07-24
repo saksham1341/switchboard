@@ -97,3 +97,16 @@ async def test_permanent_error_is_not_marked_processed():
     await bus._consume(CMD_LOG, "actuator/discord.post", Command.from_message, lambda v: True, handle)
     assert orch.settled == [(22, Outcome.DEAD)]
     assert await bus._already_processed("actuator/discord.post", 22) is False
+
+
+async def test_bus_dedup_lives_in_its_own_scope():
+    """Bus machinery is namespaced like every role's, and no role can name a key
+    that reaches it — every ScopedStore prepends its own "kind/name/"."""
+    from switchboard.store import MemoryStore, ScopedStore
+    store = MemoryStore()
+    bus = Bus(":memory:", store=store)
+    await bus._mark_processed("actuator/x", 5)
+    assert await store.get("_bus/processed:actuator/x:5") == "1"
+
+    role = ScopedStore(store, "actuator/x/")
+    assert await role.get("_bus/processed:actuator/x:5") is None   # unreachable

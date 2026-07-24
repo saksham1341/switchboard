@@ -48,8 +48,14 @@ def build(config: dict):
                 channel_id=config["discord_github_notify_channel_id"]))
             bus.add_actuator(DiscordPost(token, app_id))
 
-    # Expired keys are already invisible to reads; this is only about disk.
-    bus.schedule_maintenance("store", 3600.0, store.purge)
+    # Expired keys are already invisible to reads, so this is only about
+    # reclaiming disk — and only some backends need it. Sqlite and memory stores
+    # sweep; a Redis-backed store expires natively and exposes no purge at all.
+    # purge is deliberately not part of the KeyStore contract, so ask rather than
+    # assume.
+    purge = getattr(store, "purge", None)
+    if purge is not None:
+        bus.schedule_maintenance("store", 3600.0, purge)
 
     # No token, no dashboard: fail closed rather than serving an unauthenticated
     # ingest endpoint. There is deliberately no default token.
