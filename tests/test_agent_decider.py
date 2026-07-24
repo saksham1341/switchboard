@@ -383,3 +383,163 @@ async def test_a_redelivered_llm_result_is_a_no_op():
     await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
     rec = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
     assert rec.emitted == []             # take_pending already consumed it
+
+
+# --- CRITICAL 1: deadletter correlation must respect which log (Task 4) ------
+
+async def test_an_obs_log_deadletter_does_not_kill_a_live_tool_by_id_collision():
+    """obs and cmd are separate logs with independent id sequences. A
+    deadletter reporting a dead message in the *obs* log must never be
+    matched against our cmd-log pending table just because the numeric
+    message_id happens to collide with a live tool command id."""
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    tool_cid = rec1.emitted[0][2]
+
+    rec2 = await _deliver(a, _obs("switchboard.deadletter",
+                                  {"message_id": tool_cid, "log": "obs"}, oid=300))
+    assert rec2.emitted == []
+
+    # The pending entry must have survived, so the real result still closes
+    # the gather rather than being silently dropped.
+    rec3 = await _deliver(a, _obs("discord.post.ok", {"message_id": "9"},
+                                  oid=301, command_id=tool_cid))
+    assert [n for n, _, _ in rec3.emitted] == ["llm"]
+    s = await a._sessions.load(100)
+    assert s["gather"] is None
+
+
+# --- CRITICAL 2: a mid-gather mention must not produce two user turns -------
+
+async def test_mention_mid_gather_merges_into_the_tool_result_turn():
+    """session busy with a tool outstanding -> mention arrives and is
+    buffered -> tool result arrives -> the tool_result turn closes the
+    gather -> _advance must merge the drained buffer into that same user
+    turn, never append a second consecutive user message (the Messages API
+    rejects two in a row)."""
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    tool_cid = rec1.emitted[0][2]
+
+    await _deliver(a, _obs("discord.message", _message(mid="2"), oid=101))  # buffered mention
+
+    rec2 = await _deliver(a, _obs("discord.post.ok", {"message_id": "9"},
+                                  oid=300, command_id=tool_cid))
+    assert [n for n, _, _ in rec2.emitted] == ["llm"]
+
+    s = await a._sessions.load(100)
+    roles = [m["role"] for m in s["messages"]]
+    assert not any(roles[i] == "user" and roles[i + 1] == "user"
+                   for i in range(len(roles) - 1))
+
+    last = s["messages"][-1]
+    assert last["role"] == "user"
+    assert isinstance(last["content"], list)
+    assert last["content"][0]["type"] == "tool_result"     # tool_result leads
+    assert last["content"][-1]["type"] == "text"            # buffer trails
+
+
+# --- IMPORTANT 3: a duplicate tool_use id must not stick the session -------
+
+async def test_a_duplicate_tool_use_id_emits_one_command_and_still_advances():
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A"), _use("toolu_A")], command_id=cid))
+    assert [n for n, _, _ in rec1.emitted] == ["discord.post"]   # one command, not two
+    tool_cid = rec1.emitted[0][2]
+
+    rec2 = await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=tool_cid))
+    assert [n for n, _, _ in rec2.emitted] == ["llm"]            # advances, not stuck busy
+    s = await a._sessions.load(100)
+    assert s["gather"] is None
+
+
+# --- IMPORTANT 4: a non-string tool name must not raise --------------------
+
+async def test_a_non_string_tool_name_is_treated_as_unknown_and_advances():
+    a = _agent()
+    cid = await _mint(a)
+    block = {"type": "tool_use", "id": "toolu_A", "name": ["not", "a", "string"], "input": {}}
+    rec = await _deliver(a, _llm_ok([block], command_id=cid))
+    assert [n for n, _, _ in rec.emitted] == ["llm"]  # in-band error, no crash, advances
+    s = await a._sessions.load(100)
+    assert s["gather"] is None
+
+
+# --- IMPORTANT 5: a dead-lettered llm command must recover, not hang -------
+
+async def test_a_dead_lettered_llm_command_finishes_rather_than_hanging():
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _obs("switchboard.deadletter",
+                                 {"message_id": cid, "log": "cmd"}, oid=300))
+    assert rec.emitted == []
+    assert (await a._sessions.load(100))["state"] == "idle"
+
+
+# --- TEST GAPS -----------------------------------------------------------
+
+async def test_mixed_known_and_unknown_tools_assemble_in_block_order():
+    """Block order is A (known) then B (unknown). B's in-band error is
+    recorded immediately (synchronously, before A's real result ever
+    arrives) -- so completion/arrival order is B-then-A, but assembly must
+    still follow the model's original block order, A-then-B."""
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok(
+        [_use("toolu_A", name="discord.post"), _use("toolu_B", name="no.such.tool")],
+        command_id=cid))
+    assert [n for n, _, _ in rec1.emitted] == ["discord.post"]   # only A got a command
+    a_cid = rec1.emitted[0][2]
+
+    s = await a._sessions.load(100)
+    assert set(s["gather"]["results"].keys()) == {"toolu_B"}     # B already landed
+
+    rec2 = await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=a_cid))
+    assert [n for n, _, _ in rec2.emitted] == ["llm"]
+    s = await a._sessions.load(100)
+    results = s["messages"][-1]["content"]
+    assert [r["tool_use_id"] for r in results] == ["toolu_A", "toolu_B"]
+
+
+async def test_every_block_naming_an_unknown_tool_still_advances():
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok(
+        [_use("toolu_A", name="nope.one"), _use("toolu_B", name="nope.two")],
+        command_id=cid))
+    assert [n for n, _, _ in rec.emitted] == ["llm"]   # both answered in-band, advances
+    s = await a._sessions.load(100)
+    assert s["gather"] is None
+    assert s["state"] == "busy"
+
+
+async def test_the_same_tool_result_delivered_twice_is_a_no_op():
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    tool_cid = rec1.emitted[0][2]
+    result_obs = _obs("discord.post.ok", {"message_id": "9"}, oid=300, command_id=tool_cid)
+
+    rec2 = await _deliver(a, result_obs)
+    assert [n for n, _, _ in rec2.emitted] == ["llm"]
+
+    rec3 = await _deliver(a, result_obs)             # exact redelivery
+    assert rec3.emitted == []                        # take_pending already consumed it
+
+
+async def test_a_deadletter_after_the_real_result_already_landed_is_a_no_op():
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    tool_cid = rec1.emitted[0][2]
+
+    rec2 = await _deliver(a, _obs("discord.post.ok", {"message_id": "9"},
+                                  oid=300, command_id=tool_cid))
+    assert [n for n, _, _ in rec2.emitted] == ["llm"]
+
+    rec3 = await _deliver(a, _obs("switchboard.deadletter",
+                                  {"message_id": tool_cid, "log": "cmd"}, oid=301))
+    assert rec3.emitted == []                        # no double-count, no re-trigger
