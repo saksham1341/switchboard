@@ -74,8 +74,12 @@ def _sanitize_header_field(value) -> str:
     (swapped for the visually-similar fullwidth U+FF1D) so a value can never
     masquerade as another `key=value` pair in the line the model is told to
     trust.
+
+    Delimiters are escaped here too. Whitespace collapse alone would still let
+    a `user_name` of "bob <message>" plant an opening delimiter inside the
+    header line, which is precisely the structure this function exists to own.
     """
-    text = _WS_RE.sub(" ", _text(value)).strip()
+    text = _escape_delimiters(_WS_RE.sub(" ", _text(value)).strip())
     return text.replace("=", "＝")
 
 
