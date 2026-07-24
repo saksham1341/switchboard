@@ -33,6 +33,24 @@ class LlmActuator:
         # bind() runs inside Bus.start().
         self._http = self._client or httpx.AsyncClient(timeout=TIMEOUT)
 
+    @staticmethod
+    def _error_message(resp) -> str:
+        """Never trust the shape of an error body. The API returns
+        {"error": {"message": ...}}, but a gateway in front of it is under no
+        such obligation, and a failure we were meant to report must not become
+        one we raise."""
+        try:
+            body = resp.json()
+        except Exception:
+            return resp.text
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict) and isinstance(err.get("message"), str):
+                return err["message"]
+            if isinstance(err, str):
+                return err
+        return resp.text
+
     async def act(self, cmd, ctx) -> None:
         args = cmd.args or {}
         body = {
@@ -54,12 +72,8 @@ class LlmActuator:
         if resp.status_code >= 400:
             # Reported, not raised: the caller learns immediately instead of
             # after the full retry-backoff cycle.
-            try:
-                message = resp.json().get("error", {}).get("message", resp.text)
-            except ValueError:
-                message = resp.text
             return await ctx.result("error", {"status": resp.status_code,
-                                              "message": message})
+                                              "message": self._error_message(resp)})
 
         data = resp.json()
         await ctx.result("ok", {
