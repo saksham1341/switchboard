@@ -13,6 +13,7 @@ from switchboard.deciders.agent import AgentDecider
 from switchboard.actuators.discord import DiscordPost, DiscordReply, DiscordHistory
 from switchboard.actuators.kv import KvActuator
 from switchboard.actuators.llm import LlmActuator
+from switchboard.actuators.llm.backends.anthropic import AnthropicBackend
 from switchboard.taps.logger import LoggerTap
 from switchboard.dashboard import Dashboard, DashboardTap
 
@@ -88,7 +89,7 @@ def build(config: dict):
         # hangs, which is the one failure mode with no error to observe.
         if config.get("anthropic_api_key"):
             agent_post = _discord_post()
-            bus.add_actuator(LlmActuator(config["anthropic_api_key"]))
+            bus.add_actuator(LlmActuator(AnthropicBackend(config["anthropic_api_key"])))
             bus.add_decider(AgentDecider(tools=[
                 agent_post.tool_spec | {"name": agent_post.name},
                 history.tool_spec | {"name": history.name},
