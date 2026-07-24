@@ -14,6 +14,7 @@ from switchboard.actuators.discord import DiscordPost, DiscordReply, DiscordHist
 from switchboard.actuators.kv import KvActuator
 from switchboard.actuators.llm import LlmActuator
 from switchboard.actuators.llm.backends.anthropic import AnthropicBackend
+from switchboard.actuators.llm.backends.openai import OpenAiBackend
 from switchboard.taps.logger import LoggerTap
 from switchboard.dashboard import Dashboard, DashboardTap
 
@@ -22,6 +23,30 @@ DISCORD_COMMANDS = [
     CommandSpec("echo", "Echo a message back",
                 options=(Option("message", "Text to echo back", type=str, required=True),)),
 ]
+
+
+def _llm_backend(config):
+    """Construct the configured provider backend, or None if no key is set.
+
+    Fails loudly on a bad name or a missing model rather than returning None:
+    a typo that silently produced a Switchboard with no agent would be the
+    failure mode with no error to observe (spec §7.5).
+    """
+    key = config.get("llm_api_key")
+    if not key:
+        return None
+    name = (config.get("llm_backend") or "anthropic").lower()
+    model = config.get("llm_model")
+    if not model:
+        raise ValueError("llm_model is required when llm_api_key is set")
+    if name == "anthropic":
+        return AnthropicBackend(key)
+    if name == "openai":
+        base = config.get("llm_base_url")
+        if not base:
+            raise ValueError("llm_base_url is required for the openai backend")
+        return OpenAiBackend(key, base_url=base)
+    raise ValueError(f"unknown llm_backend: {name!r}")
 
 
 def build(config: dict):
@@ -38,6 +63,13 @@ def build(config: dict):
     # unwired: registering it would put an API key and real spend in the
     # deployment for a feature nothing drives yet.)
     bus.add_actuator(KvActuator())
+
+    # Validated unconditionally, before the Discord branch below even runs:
+    # an unknown llm_backend or a missing llm_model must raise here regardless
+    # of whether Discord is configured. Otherwise a GitHub-only deployment
+    # with a typo'd backend name would build fine and simply have no agent -
+    # the one failure mode with no error to observe.
+    backend = _llm_backend(config)
 
     sensors = [GitHubSensor(secret=config["github_secret"]),
                DeadLetterSensor(config["mamamia_db_path"])]
@@ -87,13 +119,13 @@ def build(config: dict):
         # the wiring is what keeps that promise. A key alone would hand it tools
         # that reach nothing - a command nobody consumes never fails, it simply
         # hangs, which is the one failure mode with no error to observe.
-        if config.get("anthropic_api_key"):
+        if backend is not None:
             agent_post = _discord_post()
-            bus.add_actuator(LlmActuator(AnthropicBackend(config["anthropic_api_key"])))
-            bus.add_decider(AgentDecider(tools=[
-                agent_post.tool_spec | {"name": agent_post.name},
-                history.tool_spec | {"name": history.name},
-            ]))
+            bus.add_actuator(LlmActuator(backend))
+            bus.add_decider(AgentDecider(
+                model=config["llm_model"],
+                tools=[agent_post.tool_spec | {"name": agent_post.name},
+                       history.tool_spec | {"name": history.name}]))
 
     # Expired keys are already invisible to reads, so this is only about
     # reclaiming disk — and only some backends need it. Sqlite and memory stores
@@ -133,7 +165,10 @@ async def run() -> None:
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
         "discord_github_notify_channel_id": os.environ.get("DISCORD_GITHUB_NOTIFY_CHANNEL_ID"),
-        "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY"),
+        "llm_backend": os.environ.get("SB_LLM_BACKEND", "anthropic"),
+        "llm_api_key": os.environ.get("SB_LLM_API_KEY"),
+        "llm_base_url": os.environ.get("SB_LLM_BASE_URL"),
+        "llm_model": os.environ.get("SB_LLM_MODEL"),
         "dashboard_token": os.environ.get("SB_DASHBOARD_TOKEN"),
         "dashboard_ingest_url": os.environ.get(
             "SB_DASHBOARD_INGEST_URL",

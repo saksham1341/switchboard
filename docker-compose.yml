@@ -20,8 +20,14 @@ services:
       DISCORD_GITHUB_NOTIFY_CHANNEL_ID: ${DISCORD_GITHUB_NOTIFY_CHANNEL_ID:-}
 
       # --- Agent ---
-      # The agentic decider is wired only when this AND Discord are set.
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # The agentic decider is wired only when SB_LLM_API_KEY and Discord are
+      # both set. SB_LLM_BACKEND picks the provider: "anthropic" (native), or
+      # "openai" for any OpenAI-compatible endpoint (Groq, Gemini, Cerebras,
+      # OpenRouter, Ollama), which also needs SB_LLM_BASE_URL.
+      SB_LLM_BACKEND: ${SB_LLM_BACKEND:-anthropic}
+      SB_LLM_API_KEY: ${SB_LLM_API_KEY:-}
+      SB_LLM_BASE_URL: ${SB_LLM_BASE_URL:-}
+      SB_LLM_MODEL: ${SB_LLM_MODEL:-}
 
       # --- Dashboard ---
       # Set a token to enable the live dashboard; unset = no dashboard at all.

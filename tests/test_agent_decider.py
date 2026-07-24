@@ -21,6 +21,7 @@ def _obs(name, payload, *, oid=100, command_id=None):
 
 
 def _agent(**kw):
+    kw.setdefault("model", "test-model")
     a = AgentDecider(tools=[TOOL], **kw)
     a.bind(DeciderCtx(store=MemoryStore()))
     return a
@@ -163,6 +164,15 @@ async def test_the_llm_command_carries_system_messages_and_tools():
     _, args, _ = rec.emitted[0]
     assert args["messages"] and isinstance(args["system"], str)
     assert TOOL in args["tools"]
+
+
+async def test_the_llm_command_always_carries_a_model():
+    # The command in the log is the record of what ran. A backend default
+    # would make that record a lie as soon as the default changed.
+    a = _agent(model="llama-3.3-70b-versatile")
+    rec = await _deliver(a, _obs("discord.message", _message()))
+    _, args, _ = rec.emitted[0]
+    assert args["model"] == "llama-3.3-70b-versatile"
 
 
 async def test_a_pending_entry_is_recorded_for_the_llm_command():

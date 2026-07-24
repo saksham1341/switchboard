@@ -1,3 +1,5 @@
+import pytest
+
 from switchboard.app import build
 from switchboard.sensors.github import GitHubSensor
 from switchboard.sensors.discord import DiscordSensor
@@ -7,6 +9,15 @@ def _base(tmp_path):
     return {"mamamia_db_path": str(tmp_path / "mm.db"),
             "switchboard_db_path": str(tmp_path / "sb.db"),
             "github_secret": "s"}
+
+
+def _cfg(tmp_path, port, **kw):
+    base = {"mamamia_db_path": str(tmp_path / "mm.db"),
+            "switchboard_db_path": str(tmp_path / "sb.db"),
+            "github_secret": "s", "port": port,
+            "discord_bot_token": "t", "discord_application_id": "1"}
+    base.update(kw)
+    return base
 
 
 def test_build_github_only(tmp_path):
@@ -172,7 +183,8 @@ def test_the_agent_is_wired_when_the_key_and_discord_are_present(tmp_path):
         "switchboard_db_path": str(tmp_path / "sb.db"),
         "github_secret": "s", "port": 8142,
         "discord_bot_token": "t", "discord_application_id": "1",
-        "anthropic_api_key": "sk-test",
+        "llm_backend": "anthropic", "llm_api_key": "sk-test",
+        "llm_model": "claude-sonnet-5",
     })
     assert "llm" in {a.name for a in bus._actuators}
     agent = next(d for d in bus._deciders if d.name == "agent")
@@ -189,7 +201,8 @@ def test_the_agent_needs_discord_not_just_a_key(tmp_path):
         "mamamia_db_path": str(tmp_path / "mm.db"),
         "switchboard_db_path": str(tmp_path / "sb.db"),
         "github_secret": "s", "port": 8143,
-        "anthropic_api_key": "sk-test",
+        "llm_backend": "anthropic", "llm_api_key": "sk-test",
+        "llm_model": "claude-sonnet-5",
     })
     assert "agent" not in {d.name for d in bus._deciders}
 
@@ -206,7 +219,8 @@ def test_discord_post_is_registered_once_even_with_notify_and_agent_both_set(tmp
         "github_secret": "s", "port": 8144,
         "discord_bot_token": "t", "discord_application_id": "1",
         "discord_github_notify_channel_id": "chan-9",
-        "anthropic_api_key": "sk-test",
+        "llm_backend": "anthropic", "llm_api_key": "sk-test",
+        "llm_model": "claude-sonnet-5",
     })
     names = [a.name for a in bus._actuators]
     assert names.count("discord.post") == 1
@@ -223,6 +237,57 @@ def test_agent_topology_lists_the_agent_decider(tmp_path):
         "switchboard_db_path": str(tmp_path / "sb.db"),
         "github_secret": "s", "port": 8145,
         "discord_bot_token": "t", "discord_application_id": "1",
-        "anthropic_api_key": "sk-test",
+        "llm_backend": "anthropic", "llm_api_key": "sk-test",
+        "llm_model": "claude-sonnet-5",
     })
     assert "agent" in bus.topology()["deciders"]
+
+
+def test_openai_backend_is_selected_and_carries_its_base_url(tmp_path):
+    from switchboard.app import build
+    from switchboard.actuators.llm.backends.openai import OpenAiBackend
+    bus, _ = build(_cfg(tmp_path, 8151, llm_backend="openai", llm_api_key="k",
+                        llm_base_url="https://api.groq.com/openai/v1",
+                        llm_model="llama-3.3-70b-versatile"))
+    llm = next(a for a in bus._actuators if a.name == "llm")
+    assert isinstance(llm._backend, OpenAiBackend)
+
+
+def test_anthropic_backend_is_selected(tmp_path):
+    from switchboard.app import build
+    from switchboard.actuators.llm.backends.anthropic import AnthropicBackend
+    bus, _ = build(_cfg(tmp_path, 8152, llm_backend="anthropic", llm_api_key="k",
+                        llm_model="claude-sonnet-5"))
+    llm = next(a for a in bus._actuators if a.name == "llm")
+    assert isinstance(llm._backend, AnthropicBackend)
+
+
+def test_the_agent_gets_the_configured_model(tmp_path):
+    from switchboard.app import build
+    bus, _ = build(_cfg(tmp_path, 8153, llm_backend="openai", llm_api_key="k",
+                        llm_base_url="http://x", llm_model="some-model"))
+    agent = next(d for d in bus._deciders if d.name == "agent")
+    assert agent._model == "some-model"
+
+
+def test_no_llm_key_means_no_agent_and_no_llm(tmp_path):
+    from switchboard.app import build
+    bus, _ = build(_cfg(tmp_path, 8154))
+    assert "llm" not in {a.name for a in bus._actuators}
+    assert "agent" not in {d.name for d in bus._deciders}
+
+
+def test_an_unknown_backend_fails_fast(tmp_path):
+    # A typo must not silently produce a Switchboard with no agent - that is
+    # the failure mode with no error to observe.
+    from switchboard.app import build
+    with pytest.raises(ValueError):
+        build(_cfg(tmp_path, 8155, llm_backend="gpt5", llm_api_key="k",
+                   llm_model="m"))
+
+
+def test_a_missing_model_fails_fast(tmp_path):
+    from switchboard.app import build
+    with pytest.raises(ValueError):
+        build(_cfg(tmp_path, 8156, llm_backend="openai", llm_api_key="k",
+                   llm_base_url="http://x"))

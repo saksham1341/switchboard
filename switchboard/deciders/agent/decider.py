@@ -53,8 +53,8 @@ def _tool_outcome(obs) -> tuple[str, bool]:
 class AgentDecider:
     name = "agent"
 
-    def __init__(self, *, tools, system: str | None = None,
-                 max_turns: int = MAX_TURNS, model: str | None = None):
+    def __init__(self, *, tools, model, system: str | None = None,
+                 max_turns: int = MAX_TURNS):
         self._tools = list(tools)
         self._system = system if system is not None else SYSTEM
         self._max_turns = max_turns
@@ -207,9 +207,7 @@ class AgentDecider:
             s["buffer"] = []
 
         args = {"system": self._system, "messages": s["messages"],
-                "tools": self._tools}
-        if self._model:
-            args["model"] = self._model
+                "tools": self._tools, "model": self._model}
         cid = await ctx.command("llm", args)
         # The store has no transactions, so these two writes can never be made
         # atomic — a crash between them is possible either way. We choose the
