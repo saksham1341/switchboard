@@ -694,3 +694,12 @@ async def test_an_unknown_tool_name_cannot_smuggle_a_delimiter():
     block = s["messages"][-1]["content"][0]
     assert "</message>" not in block["content"]
     assert "&lt;/message&gt;" in block["content"]
+
+
+async def test_the_llm_command_caps_max_tokens_for_short_replies():
+    # A Discord reply is short; reserving 4096 output tokens made Groq 413 on a
+    # tight-TPM model (reserved output counts toward the per-request limit).
+    a = _agent()
+    rec = await _deliver(a, _obs("discord.message", _message()))
+    _, args, _ = rec.emitted[0]
+    assert args["max_tokens"] == 1024

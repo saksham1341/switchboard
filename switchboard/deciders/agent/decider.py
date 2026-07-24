@@ -48,13 +48,23 @@ def _tool_outcome(obs) -> tuple[str, bool]:
         return escape_delimiters(str(payload)), False
 
 
+# A Discord message caps at ~2000 chars (~500 tokens), so an agent reply never
+# needs the generic 4096. Reserving that much is not free: providers count the
+# reserved output toward a request's rate-limit check (Groq 413'd a ~1.9k-token
+# call because 1.9k input + 4096 reserved = 6015 > the 6000 TPM). A tight cap
+# keeps requests small enough to pass and leaves headroom for the transcript.
+AGENT_MAX_TOKENS = 1024
+
+
 class AgentDecider:
     name = "agent"
 
-    def __init__(self, *, tools, model, system: str | None = None):
+    def __init__(self, *, tools, model, system: str | None = None,
+                 max_tokens: int = AGENT_MAX_TOKENS):
         self._tools = list(tools)
         self._system = system if system is not None else SYSTEM
         self._model = model
+        self._max_tokens = max_tokens
 
     def bind(self, ctx) -> None:
         self.ctx = ctx
@@ -200,7 +210,8 @@ class AgentDecider:
             s["buffer"] = []
 
         args = {"system": self._system, "messages": s["messages"],
-                "tools": self._tools, "model": self._model}
+                "tools": self._tools, "model": self._model,
+                "max_tokens": self._max_tokens}
         cid = await ctx.command("llm", args)
         # The store has no transactions, so these two writes can never be made
         # atomic — a crash between them is possible either way. We choose the
