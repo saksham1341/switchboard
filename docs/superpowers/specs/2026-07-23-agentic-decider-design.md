@@ -20,6 +20,16 @@ This follows from a single reframe:
 
 Because the non-determinism (the model) lives behind an actuator, its output *arrives as an observation the decider reacts to deterministically*. That is what preserves every substrate property: the agent decider is a decider like any other, replayable and shadowable, with no world access. A sandboxed Claude Code is a black box calling tools in a hidden loop; this is a control loop expressed in two logs.
 
+### 1.1 Authority moved; the properties did not
+
+The reframe splits a decider in two, and it is worth naming which half went where.
+
+**The LLM sits in an actuator slot but holds decider-nature.** It is where judgment actually happens — what to say, which tool to call. The `AgentDecider` decides nothing of substance; it routes. So the effective decider in this system is inside an actuator.
+
+**The properties stayed with the shell.** Determinism, replayability, shadowability, no world access — those belong to the routing decider, which still has all of them. What moved to the LLM is authority, not the guarantees. That asymmetry is the whole trick: the system keeps a replayable control loop even though the judgment inside it is not replayable.
+
+One rule follows directly, and §6.6 is only its application: **a decider sees the whole observation, unfiltered — so the effective decider must too.** Normalizing a payload before the model would hand the thing that actually decides a lossy view while the nominal decider, which decides nothing, keeps the full one. Backwards. Anywhere the two halves disagree about who needs fidelity, fidelity goes to the LLM.
+
 ---
 
 ## 2. Role mapping
@@ -233,7 +243,7 @@ This also covers the gap between expiry and the next mention, where thread messa
 
 ### 6.6 Turn rendering — the source stays visible
 
-**The decider never normalizes an observation before the model sees it.** A tempting seam is to flatten every source into `{conversation_id, addressed, text}` so the decider is channel-agnostic. That is lossy in exactly the wrong place: the model chooses *tools*, and the source is what tells it `discord.post` rather than some future `slack.post`, with which id. Strip the source and the model has to guess. Source is semantic content, not transport noise.
+**The decider never normalizes an observation before the model sees it.** This is §1.1 applied: the LLM is the effective decider, and a decider sees everything. A tempting seam is to flatten every source into `{conversation_id, addressed, text}` so the decider is channel-agnostic. That is lossy in exactly the wrong place: the model chooses *tools*, and the source is what tells it `discord.post` rather than some future `slack.post`, with which id. Strip the source and the model has to guess. Source is semantic content, not transport noise.
 
 So the split is: the **decider** does per-source extraction (which field is the routing id) and no translation; the **model** sees the observation's own shape.
 
@@ -418,6 +428,16 @@ The obs log is at-least-once, so **every handler must be safe to run twice on th
 | 5 | **tools re-sent every turn** | minor payload bloat | llm actuator holds defs; decider sends names |
 
 None are architectural. Each is "add a guard later."
+
+### 12.1 Framework limits untested by two sensors
+
+Not agent holes — platform assumptions that only two sensors have ever exercised, recorded so nobody mistakes "never failed" for "proven". The core is genuinely clean of source-specific shape (`bus.py`, `message.py`, `store.py`, `scheduler.py` name no product), and the reason is that GitHub and Discord stress opposite ends: inbound webhook over the shared port versus outbound persistent connection owning its own client. Discord uses *none* of `SensorCtx`'s transports, which is what established the general rule — `ctx` carries only what must be shared, everything private lives in the sensor. These three are where two was not enough:
+
+| # | limit | what would surface it | assessment |
+|---|---|---|---|
+| 1 | **`http.route` assumes one path per sensor** | a sensor needing a path *prefix* or many routes — ownership is keyed `(METHOD, path)` with no wildcard story | additive; leave until a sensor needs it |
+| 2 | **`emit` has no backpressure** | a high-rate source (firehose, queue consumer). Nothing ever pushed back because webhooks are low-rate, so the log would grow until `max_log_messages` trims it — **silently**, which is the actual defect | the silence matters more than the limit; a warning on trim is the cheap first move |
+| 3 | **sensors expose no health or config surface** | more than a handful of sensors, or one failing quietly. The dashboard knows names and nothing else | additive; `DeadLetterSensor`'s failure-transition logging is the pattern to generalize |
 
 ---
 
