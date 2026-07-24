@@ -22,7 +22,7 @@ def _command_observation(command: str, interaction, options: dict) -> tuple[str,
     })
 
 
-def _message_observation(message, bot_id: int) -> tuple[str, dict]:
+def _message_observation(message, bot_id: int, bot_role_ids=()) -> tuple[str, dict]:
     """Shape a gateway message into a `discord.message` observation.
 
     `channel_id` is always where the message *is* — the thread id when it is in
@@ -31,10 +31,20 @@ def _message_observation(message, bot_id: int) -> tuple[str, dict]:
     gives the agent a conversation starting at the mention, and it cannot ask
     for context it does not know exists. `message_count` tells it there is more
     above; `discord.history` is how it reads it.
+
+    `mentions_bot` is true for a direct user mention (`<@bot>`) OR a mention of
+    any role the bot holds (`<@&role>`). The role case matters because a bot
+    with a mentionable same-name role is very often pinged *by that role* — the
+    user types `@switchboard` and Discord resolves it to the role, not the user —
+    and discord.py keeps those in `role_mentions`, never in `mentions`. Missing
+    it is how a plain "@switchboard summarize" silently goes unanswered.
     """
     channel = message.channel
     is_thread = isinstance(channel, discord.Thread)
     mention_ids = [str(u.id) for u in message.mentions]
+    role_mention_ids = {str(r.id) for r in getattr(message, "role_mentions", [])}
+    bot_roles = {str(r) for r in bot_role_ids}
+    mentions_bot = str(bot_id) in mention_ids or bool(role_mention_ids & bot_roles)
     return ("discord.message", {
         "message_id": str(message.id),
         "channel_id": str(channel.id),
@@ -45,7 +55,7 @@ def _message_observation(message, bot_id: int) -> tuple[str, dict]:
         "user_name": str(message.author),
         "content": message.content,
         "mentions": mention_ids,
-        "mentions_bot": str(bot_id) in mention_ids,
+        "mentions_bot": mentions_bot,
         "thread": {"is_thread": is_thread,
                    "message_count": getattr(channel, "message_count", None) if is_thread else None},
     })
@@ -186,7 +196,14 @@ class DiscordSensor:
         if await self.ctx.store.get(key) is not None:
             return
 
-        name, payload = _message_observation(message, bot_id)
+        # The bot's roles in this guild, minus @everyone (the default role, which
+        # every member holds — treating it as "the bot's role" would make every
+        # @everyone ping wake the agent). `guild.me` is the bot's own member and
+        # needs no privileged intent to read.
+        me = message.guild.me if message.guild else None
+        bot_role_ids = [r.id for r in me.roles if not r.is_default()] if me else []
+
+        name, payload = _message_observation(message, bot_id, bot_role_ids)
         # Emit first, record second: a crash (or a failed emit) in between costs
         # a duplicate, the reverse order costs the event.
         try:

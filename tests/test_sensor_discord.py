@@ -81,18 +81,34 @@ class _FakeChannel:
         self.id = cid
 
 
+class _FakeRole:
+    def __init__(self, rid, default=False):
+        self.id, self._default = rid, default
+    def is_default(self): return self._default
+
+
+class _FakeMember:
+    def __init__(self, roles): self.roles = roles
+
+
 class _FakeGuild:
-    id = 9
+    def __init__(self, gid=9, bot_role_ids=()):
+        self.id = gid
+        # roles[0] is always @everyone (the default role, id == guild id).
+        self.me = _FakeMember([_FakeRole(gid, default=True)]
+                              + [_FakeRole(r) for r in bot_role_ids])
 
 
 class _FakeMessage:
-    def __init__(self, channel=None, mentions=(), author=None, content="hi", mid=1234567890):
+    def __init__(self, channel=None, mentions=(), author=None, content="hi",
+                 mid=1234567890, role_mentions=(), guild=None):
         self.id = mid
         self.channel = channel if channel is not None else _FakeChannel()
-        self.guild = _FakeGuild()
+        self.guild = _FakeGuild() if guild is None else guild
         self.author = author or _FakeAuthor()
         self.content = content
         self.mentions = list(mentions)
+        self.role_mentions = list(role_mentions)
 
 
 def test_message_observation_in_thread_carries_the_hint():
@@ -136,8 +152,61 @@ def test_message_observation_outside_a_guild_has_no_guild_id():
     assert payload["guild_id"] is None
 
 
+def test_message_observation_detects_a_mention_of_a_bot_role():
+    # `@switchboard` often resolves to the bot's same-name ROLE, which lands in
+    # role_mentions, never mentions. Missing it silently ignores the ping.
+    from switchboard.sensors.discord import _message_observation
+    _, payload = _message_observation(
+        _FakeMessage(role_mentions=[_FakeRole(777)],
+                     content="<@&777> summarize"),
+        bot_id=555, bot_role_ids=[777])
+    assert payload["mentions_bot"] is True
+    assert payload["mentions"] == []          # a role ping is not a user mention
+
+
+def test_message_observation_ignores_a_role_the_bot_does_not_hold():
+    from switchboard.sensors.discord import _message_observation
+    _, payload = _message_observation(
+        _FakeMessage(role_mentions=[_FakeRole(999)]),
+        bot_id=555, bot_role_ids=[777])
+    assert payload["mentions_bot"] is False
+
+
+def test_message_observation_still_detects_a_direct_user_mention_without_roles():
+    from switchboard.sensors.discord import _message_observation
+    bot = _FakeAuthor(uid=555, bot=True)
+    _, payload = _message_observation(_FakeMessage(mentions=[bot]), bot_id=555)
+    assert payload["mentions_bot"] is True
+
+
 def _ctx_with_store(emit):
     return type("C", (), {"emit": staticmethod(emit), "store": MemoryStore()})()
+
+
+async def test_on_message_wakes_on_a_role_ping():
+    # End to end through the sensor: the bot holds role 777, someone pings that
+    # role, and the emitted observation must carry mentions_bot=True so the
+    # agent actually advances.
+    emitted = []
+    s = _sensor()
+    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    msg = _FakeMessage(guild=_FakeGuild(bot_role_ids=[777]),
+                       role_mentions=[_FakeRole(777)], content="<@&777> yo")
+    await s._on_message(msg, bot_id=555)
+    assert emitted and emitted[0][1]["mentions_bot"] is True
+
+
+async def test_on_message_does_not_treat_everyone_as_a_bot_role():
+    # @everyone is the guild default role (id == guild id) and every member
+    # holds it. A ping of it must not wake the bot as if it were addressed.
+    emitted = []
+    s = _sensor()
+    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    g = _FakeGuild(gid=9, bot_role_ids=[])          # bot has only @everyone
+    msg = _FakeMessage(guild=g, role_mentions=[_FakeRole(9, default=True)],
+                       content="<@&9> hey all")
+    await s._on_message(msg, bot_id=555)
+    assert emitted and emitted[0][1]["mentions_bot"] is False
 
 
 async def test_on_message_emits_for_a_human():
