@@ -15,7 +15,7 @@ import json
 
 import httpx
 
-from switchboard.actuators.llm.actuator import LlmError
+from switchboard.actuators.llm.actuator import TRANSIENT_STATUS, LlmError
 
 DEFAULT_MAX_TOKENS = 4096
 TIMEOUT = 120.0                 # a long completion with tools is not fast
@@ -221,8 +221,11 @@ class OpenAiBackend:
             f"{self._base_url}/chat/completions", json=body,
             headers={"authorization": f"Bearer {self._key}",
                      "content-type": "application/json"})
-        if resp.status_code >= 500:
-            resp.raise_for_status()      # transient: let the Bus retry
+        if resp.status_code >= 500 or resp.status_code in TRANSIENT_STATUS:
+            # Transient: let it propagate so the Bus retries with backoff. A 429
+            # is a 4xx that the provider expects you to retry, so it cannot be
+            # lumped in with the permanent ones below.
+            resp.raise_for_status()
         if resp.status_code >= 400:
             raise LlmError(_error_message(resp), status=resp.status_code)
 

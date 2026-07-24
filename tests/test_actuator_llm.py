@@ -198,3 +198,17 @@ async def test_anthropic_unreadable_2xx_body_is_reported_not_crashed():
     with pytest.raises(LlmError):
         await b.complete({"model": "m", "messages": []})
     await b.close()
+
+
+@pytest.mark.parametrize("status", [429, 408])
+async def test_anthropic_transient_4xx_propagates_for_retry(status):
+    """A 429 is a 4xx the provider expects you to retry — Groq's own message
+    says "try again in 11.92s". Reporting it as permanent leaves the user's
+    message unanswered when a retry seconds later would have worked. Learned
+    from live traffic, not theory."""
+    def handler(request):
+        return httpx.Response(status, json={"error": {"message": "rate limited"}})
+    b = _anthropic(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        await b.complete({"model": "m", "messages": []})
+    await b.close()

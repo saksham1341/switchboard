@@ -7,7 +7,7 @@ to Discord, adds no dependency, and the Messages API is a single POST.
 """
 import httpx
 
-from switchboard.actuators.llm.actuator import LlmError
+from switchboard.actuators.llm.actuator import TRANSIENT_STATUS, LlmError
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -54,8 +54,11 @@ class AnthropicBackend:
             "anthropic-version": ANTHROPIC_VERSION,
             "content-type": "application/json",
         })
-        if resp.status_code >= 500:
-            resp.raise_for_status()      # transient: let the Bus retry
+        if resp.status_code >= 500 or resp.status_code in TRANSIENT_STATUS:
+            # Transient: let it propagate so the Bus retries with backoff. A 429
+            # is a 4xx that the provider expects you to retry, so it cannot be
+            # lumped in with the permanent ones below.
+            resp.raise_for_status()
         if resp.status_code >= 400:
             raise LlmError(_error_message(resp), status=resp.status_code)
 

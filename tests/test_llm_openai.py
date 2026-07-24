@@ -319,12 +319,14 @@ async def test_the_bearer_token_and_url_are_right():
 
 
 async def test_4xx_raises_llm_error_with_the_provider_message():
+    # 401 rather than 429 deliberately: a bad key is permanent, and retrying it
+    # only burns the retry budget. 429 is covered separately as a transient.
     def handler(request):
-        return httpx.Response(429, json={"error": {"message": "rate limited"}})
+        return httpx.Response(401, json={"error": {"message": "invalid api key"}})
     b = _backend(handler)
     with pytest.raises(LlmError) as e:
         await b.complete({"model": "m", "messages": []})
-    assert "rate limited" in str(e.value) and e.value.status == 429
+    assert "invalid api key" in str(e.value) and e.value.status == 401
     await b.close()
 
 
@@ -351,5 +353,17 @@ async def test_an_empty_choices_array_is_an_llm_error_not_an_index_error():
         return httpx.Response(200, json={"choices": [], "usage": {}})
     b = _backend(handler)
     with pytest.raises(LlmError):
+        await b.complete({"model": "m", "messages": []})
+    await b.close()
+
+
+@pytest.mark.parametrize("status", [429, 408])
+async def test_transient_4xx_propagates_for_retry(status):
+    # Same rule as the Anthropic backend: 429/408 are retryable 4xx and must
+    # reach the Bus rather than being reported to the agent as permanent.
+    def handler(request):
+        return httpx.Response(status, json={"error": {"message": "rate limited"}})
+    b = _backend(handler)
+    with pytest.raises(httpx.HTTPStatusError):
         await b.complete({"model": "m", "messages": []})
     await b.close()
