@@ -74,14 +74,177 @@ async def test_an_assistant_tool_use_becomes_a_tool_call_with_json_string_args()
 
 
 async def test_tool_results_fan_out_to_separate_tool_messages_in_order():
+    # ids are deliberately *not* already sorted (t9 before t2) so that a
+    # fan-out which secretly sorted by tool_use_id instead of preserving
+    # block order would fail this test.
     b, seen = _capture()
     await b.complete({"model": "m", "messages": [
         {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "t1", "content": "one"},
+            {"type": "tool_result", "tool_use_id": "t9", "content": "one"},
             {"type": "tool_result", "tool_use_id": "t2", "content": "two"}]}]})
     tools = [m for m in seen["messages"] if m["role"] == "tool"]
-    assert [t["tool_call_id"] for t in tools] == ["t1", "t2"]
+    assert [t["tool_call_id"] for t in tools] == ["t9", "t2"]
     assert [t["content"] for t in tools] == ["one", "two"]
+    await b.close()
+
+
+async def test_a_mention_merged_into_a_tool_result_turn_is_not_dropped():
+    # agent/decider.py's _advance merges a mention arriving mid-gather into
+    # the trailing user turn as a text block, producing
+    # [tool_result, tool_result, {"type": "text", ...}]. That text must
+    # survive translation as a trailing user message, in addition to the
+    # tool messages (which must come first, in block order).
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": [
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t9", "content": "one"},
+            {"type": "tool_result", "tool_use_id": "t2", "content": "two"},
+            {"type": "text", "text": "hey are you there"}]}]})
+    tail = seen["messages"]
+    tool_msgs = [m for m in tail if m["role"] == "tool"]
+    assert [t["tool_call_id"] for t in tool_msgs] == ["t9", "t2"]
+    # the tool messages come first, then exactly one trailing user message
+    assert [m["role"] for m in tail] == ["tool", "tool", "user"]
+    assert tail[-1]["content"] == "hey are you there"
+    await b.close()
+
+
+async def test_a_text_only_user_turn_with_list_content_is_not_dropped():
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]}]})
+    users = [m for m in seen["messages"] if m["role"] == "user"]
+    assert len(users) == 1
+    assert users[0]["content"] == "hello"
+    await b.close()
+
+
+async def test_is_error_prefixes_the_tool_message_content():
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": [
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "boom",
+             "is_error": True}]}]})
+    tool_msg = [m for m in seen["messages"] if m["role"] == "tool"][0]
+    assert tool_msg["content"] == "ERROR: boom"
+    await b.close()
+
+
+async def test_is_error_false_does_not_prefix():
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": [
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok",
+             "is_error": False}]}]})
+    tool_msg = [m for m in seen["messages"] if m["role"] == "tool"][0]
+    assert tool_msg["content"] == "ok"
+    await b.close()
+
+
+async def test_a_non_str_tool_result_content_is_json_dumped():
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": [
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": {"a": 1}}]}]})
+    tool_msg = [m for m in seen["messages"] if m["role"] == "tool"][0]
+    assert json.loads(tool_msg["content"]) == {"a": 1}
+    await b.close()
+
+
+async def test_max_tokens_is_forwarded():
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": [], "max_tokens": 777})
+    assert seen["max_tokens"] == 777
+    await b.close()
+
+
+async def test_max_tokens_defaults_when_absent():
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": []})
+    assert seen["max_tokens"] == 4096
+    await b.close()
+
+
+async def test_tool_calls_ordering_matches_block_order_not_name_sort():
+    # names chosen so a descending name-sort would swap the order.
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "a1", "name": "alpha", "input": {}},
+            {"type": "tool_use", "id": "b1", "name": "beta", "input": {}}]}]})
+    a = seen["messages"][-1]
+    assert [c["function"]["name"] for c in a["tool_calls"]] == ["alpha", "beta"]
+    await b.close()
+
+
+async def test_tool_call_missing_id_or_name_is_skipped_but_valid_ones_kept():
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{
+            "finish_reason": "tool_calls",
+            "message": {"tool_calls": [
+                {"id": None, "function": {"name": "p", "arguments": "{}"}},
+                {"id": "t1", "function": {"name": None, "arguments": "{}"}},
+                {"id": "t2", "function": {"name": "q", "arguments": "{}"}}]}}],
+            "usage": {}})
+    b = _backend(handler)
+    out = await b.complete({"model": "m", "messages": []})
+    assert [c["id"] for c in out["content"] if c["type"] == "tool_use"] == ["t2"]
+    await b.close()
+
+
+async def test_a_non_dict_message_does_not_crash():
+    def handler(request):
+        return httpx.Response(200, json={"choices": [
+            {"finish_reason": "stop", "message": "not-a-dict"}],
+            "usage": {}})
+    b = _backend(handler)
+    out = await b.complete({"model": "m", "messages": []})
+    assert out["content"] == []
+    await b.close()
+
+
+async def test_a_non_list_tool_calls_does_not_crash():
+    # tool_calls is a non-iterable (an int): without the isinstance guard,
+    # `for call in tool_calls` would raise TypeError instead of degrading.
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "hi", "tool_calls": 5}}],
+            "usage": {}})
+    b = _backend(handler)
+    out = await b.complete({"model": "m", "messages": []})
+    assert [c["type"] for c in out["content"]] == ["text"]
+    await b.close()
+
+
+async def test_a_non_dict_usage_does_not_crash():
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
+            "usage": "not-a-dict"})
+    b = _backend(handler)
+    out = await b.complete({"model": "m", "messages": []})
+    assert out["usage"] == {"input_tokens": None, "output_tokens": None}
+    await b.close()
+
+
+async def test_text_only_assistant_turn_has_no_tool_calls_key():
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": [
+        {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]})
+    a = seen["messages"][-1]
+    assert "tool_calls" not in a
+    await b.close()
+
+
+async def test_tool_only_assistant_turn_has_none_content_not_empty_string():
+    b, seen = _capture()
+    await b.complete({"model": "m", "messages": [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "p", "input": {}}]}]})
+    a = seen["messages"][-1]
+    assert a["content"] is None
     await b.close()
 
 

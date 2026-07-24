@@ -92,22 +92,43 @@ def _to_openai(req: dict) -> dict:
             continue
 
         # user turn with block content: tool_result blocks fan out into
-        # separate {"role": "tool"} messages, in order.
+        # separate {"role": "tool"} messages, in order, and must come first —
+        # OpenAI requires them to immediately follow the assistant message
+        # carrying the tool_calls. Any remaining non-tool_result blocks (e.g.
+        # a mention the decider merged into this turn as trailing text, per
+        # agent/decider.py's _advance) are collapsed into a single trailing
+        # {"role": "user"} message so that content is never silently dropped
+        # — a list-content user turn always yields at least one message.
+        texts = []
+        has_other = False
         for block in content:
             if not isinstance(block, dict):
                 continue
             if block.get("type") != "tool_result":
+                has_other = True
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    texts.append(block["text"])
                 continue
             result_content = block.get("content")
             if not isinstance(result_content, str):
                 result_content = json.dumps(result_content)
+            # OpenAI's tool message has no is_error slot. This ERROR: prefix
+            # is a lossy-but-visible encoding forced by the target format,
+            # not a stylistic preference -- without it a failed tool call is
+            # indistinguishable from a successful one to the model.
+            if block.get("is_error"):
+                result_content = f"ERROR: {result_content}"
             messages.append({
                 "role": "tool",
                 "tool_call_id": block.get("tool_use_id"),
                 "content": result_content,
             })
+        if has_other:
+            messages.append({"role": "user", "content": "".join(texts)})
 
-    body = {"model": req["model"], "messages": messages}
+    body = {"model": req["model"],
+             "max_tokens": req.get("max_tokens") or DEFAULT_MAX_TOKENS,
+             "messages": messages}
 
     tools = req.get("tools")
     if tools:
