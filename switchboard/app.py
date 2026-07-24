@@ -9,7 +9,7 @@ from switchboard.sensors.deadletter import DeadLetterSensor
 from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
-from switchboard.actuators.discord import DiscordPost, DiscordReply
+from switchboard.actuators.discord import DiscordPost, DiscordReply, DiscordHistory
 from switchboard.actuators.kv import KvActuator
 from switchboard.taps.logger import LoggerTap
 from switchboard.dashboard import Dashboard, DashboardTap
@@ -47,10 +47,15 @@ def build(config: dict):
         if not app_id:
             raise ValueError("discord_application_id is required when discord_bot_token is set")
         discord_sensor = DiscordSensor(token, commands=DISCORD_COMMANDS,
-                                       guild_id=config.get("discord_guild_id"))
+                                       guild_id=config.get("discord_guild_id"),
+                                       messages=bool(config.get("discord_messages")))
         bus.add_sensor(discord_sensor); sensors.append(discord_sensor)
         bus.add_decider(PingDecider()); bus.add_decider(EchoDecider())
         bus.add_actuator(DiscordReply(token, app_id))
+        # Registered whenever Discord is wired, not gated on messages=: it reads
+        # over REST and needs no intent, and Phase 4 hands its tool_spec to the
+        # agent. Idle until something emits the command.
+        bus.add_actuator(DiscordHistory(token, app_id))
         if config.get("discord_github_notify_channel_id"):
             bus.add_decider(GitHubNotifyDecider(
                 channel_id=config["discord_github_notify_channel_id"]))
@@ -94,6 +99,7 @@ async def run() -> None:
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
         "discord_github_notify_channel_id": os.environ.get("DISCORD_GITHUB_NOTIFY_CHANNEL_ID"),
+        "discord_messages": os.environ.get("DISCORD_MESSAGES", "").lower() in ("1", "true", "yes"),
         "dashboard_token": os.environ.get("SB_DASHBOARD_TOKEN"),
         "dashboard_ingest_url": os.environ.get(
             "SB_DASHBOARD_INGEST_URL",

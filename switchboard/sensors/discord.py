@@ -1,8 +1,11 @@
 import inspect
+import logging
 from dataclasses import dataclass
 
 import discord
 from discord import app_commands
+
+logger = logging.getLogger(__name__)
 
 
 def _command_observation(command: str, interaction, options: dict) -> tuple[str, dict]:
@@ -16,6 +19,35 @@ def _command_observation(command: str, interaction, options: dict) -> tuple[str,
         "user_id": str(interaction.user.id),
         "user_name": str(interaction.user),
         "options": dict(options),
+    })
+
+
+def _message_observation(message, bot_id: int) -> tuple[str, dict]:
+    """Shape a gateway message into a `discord.message` observation.
+
+    `channel_id` is always where the message *is* — the thread id when it is in
+    a thread — so replying to it lands in place without the reader knowing which
+    it got. The `thread` block is the hint from spec §6.5: a mid-thread mention
+    gives the agent a conversation starting at the mention, and it cannot ask
+    for context it does not know exists. `message_count` tells it there is more
+    above; `discord.history` is how it reads it.
+    """
+    channel = message.channel
+    is_thread = isinstance(channel, discord.Thread)
+    mention_ids = [str(u.id) for u in message.mentions]
+    return ("discord.message", {
+        "message_id": str(message.id),
+        "channel_id": str(channel.id),
+        "parent_id": str(channel.parent_id) if is_thread else None,
+        "thread_id": str(channel.id) if is_thread else None,
+        "guild_id": str(message.guild.id) if message.guild else None,
+        "user_id": str(message.author.id),
+        "user_name": str(message.author),
+        "content": message.content,
+        "mentions": mention_ids,
+        "mentions_bot": str(bot_id) in mention_ids,
+        "thread": {"is_thread": is_thread,
+                   "message_count": getattr(channel, "message_count", None) if is_thread else None},
     })
 
 
@@ -48,13 +80,28 @@ class DiscordSensor:
     name = "discord"
 
     def __init__(self, bot_token: str, *,
-                 commands: list[CommandSpec], guild_id: str | None = None):
+                 commands: list[CommandSpec], guild_id: str | None = None,
+                 messages: bool = False, dedup_ttl: float = 7 * 86_400.0):
         self._token = bot_token
         self._guild_id = guild_id
+        self.messages = messages
+        self._dedup_ttl = dedup_ttl
         self.ctx = None
         self._synced = False
 
-        self._client = discord.Client(intents=discord.Intents.none())
+        # message_content is a *privileged* intent: the gateway refuses the
+        # connection outright unless it is also enabled in the Developer Portal.
+        # So it is opt-in — a deployment that only wants slash commands keeps
+        # Intents.none() and needs no portal change.
+        if messages:
+            intents = discord.Intents.none()
+            intents.guilds = True
+            intents.guild_messages = True
+            intents.message_content = True
+        else:
+            intents = discord.Intents.none()
+
+        self._client = discord.Client(intents=intents)
         self._tree = app_commands.CommandTree(self._client)
         for spec in commands:
             self._tree.add_command(self._make_command(spec))
@@ -62,6 +109,11 @@ class DiscordSensor:
         @self._client.event
         async def on_ready():
             await self._on_ready()
+
+        if messages:
+            @self._client.event
+            async def on_message(message):
+                await self._on_message(message, bot_id=self._client.user.id)
 
     async def _on_ready(self) -> None:
         # Any timer this sensor grows is declared here, not in bind(): it would
@@ -119,6 +171,38 @@ class DiscordSensor:
 
         return app_commands.Command(
             name=spec.name, description=spec.description, callback=callback)
+
+    async def _on_message(self, message, *, bot_id: int) -> None:
+        # Every bot is ignored, ourselves included. Ignoring only ourselves would
+        # let two Switchboard-shaped bots talk each other into an endless loop,
+        # and the failure would be a live spend, not a test failure.
+        if message.author.bot:
+            return
+
+        # Discord replays gateway events on RESUME; the Bus's dedup keys on the
+        # *log's* message id and cannot catch a re-emitted gateway event, so we
+        # dedupe on the gateway's own id the same way GitHubSensor dedupes on
+        # X-GitHub-Delivery: via ctx.store, with a TTL.
+        key = f"discord:message:{message.id}"
+        if await self.ctx.store.get(key) is not None:
+            return
+
+        name, payload = _message_observation(message, bot_id)
+        # Emit first, record second: a crash (or a failed emit) in between costs
+        # a duplicate, the reverse order costs the event.
+        try:
+            await self.ctx.emit(name, payload)
+        except Exception:
+            # Nothing upstream can retry a gateway event: discord.py's dispatcher
+            # would otherwise swallow this into its default on_error (a bare
+            # traceback to stderr). Log it ourselves with the message id so a
+            # dropped message leaves a greppable, alertable trace, and do not
+            # mark it seen — a redelivered copy on the next RESUME gets another
+            # chance to succeed instead of being silently discarded forever.
+            logger.error("failed to emit discord.message for message_id=%s",
+                         message.id, exc_info=True)
+            return
+        await self.ctx.store.set(key, "1", ttl=self._dedup_ttl)
 
     def bind(self, ctx) -> None:
         self.ctx = ctx          # no routes; any timer waits for the gateway

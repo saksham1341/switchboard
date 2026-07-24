@@ -1,5 +1,7 @@
 import asyncio, json, httpx
+import pytest
 from switchboard.actuators.discord import DiscordPost, DiscordReply, DISCORD_API
+from switchboard.actuators.discord import DiscordHistory, HISTORY_DEFAULT, HISTORY_MAX
 from switchboard.message import Command, ActCtx, ActuatorCtx
 from switchboard.store import MemoryStore
 
@@ -135,3 +137,172 @@ async def test_non_json_body_still_reports_ok():
     await a.act(ctx.cmd, ctx)
     assert results[0][0] == "discord.post.ok"
     assert results[0][1]["message_id"] is None
+
+
+def _hcmd(args):
+    class M:
+        id = 1
+        payload = args
+        metadata = {"name": "discord.history", "observation_id": 7}
+    return Command.from_message(M())
+
+
+async def _run_history(act, args):
+    results = []
+    async def emit_result(name, payload, cmd_id):
+        results.append((name, payload)); return 0
+    cmd = _hcmd(args)
+    await act.act(cmd, ActCtx(cmd=cmd, _emit_result=emit_result))
+    return results[0]
+
+
+def _history_actuator(handler):
+    """Bind a DiscordHistory over a mock transport. `handler(request)` returns
+    the httpx.Response the Discord API would have."""
+    transport = httpx.MockTransport(handler)
+    a = DiscordHistory("bot-token", "app-id",
+                       client=httpx.AsyncClient(transport=transport))
+    a.bind(object())
+    return a
+
+
+def _discord_message(mid, name, content, bot=False):
+    return {"id": mid, "author": {"username": name, "bot": bot}, "content": content}
+
+
+async def test_history_returns_oldest_first():
+    # Discord returns newest-first; the agent reads a conversation forwards.
+    def handler(request):
+        return httpx.Response(200, json=[_discord_message("3", "carol", "third"),
+                                         _discord_message("2", "bob", "second"),
+                                         _discord_message("1", "alice", "first")])
+    name, payload = await _run_history(_history_actuator(handler), {"channel_id": "222"})
+    assert name == "discord.history.ok"
+    assert [m["content"] for m in payload["messages"]] == ["first", "second", "third"]
+    assert payload["count"] == 3
+    assert payload["channel_id"] == "222"
+
+
+async def test_history_defaults_to_fifty_and_passes_before_through():
+    seen = {}
+    def handler(request):
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json=[])
+    await _run_history(_history_actuator(handler),
+                       {"channel_id": "222", "before": "999"})
+    assert seen == {"limit": str(HISTORY_DEFAULT), "before": "999"}
+
+
+async def test_history_omits_before_when_not_given():
+    seen = {}
+    def handler(request):
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json=[])
+    await _run_history(_history_actuator(handler), {"channel_id": "222"})
+    assert "before" not in seen
+
+
+@pytest.mark.parametrize("asked,sent", [(500, HISTORY_MAX), (0, 1), (-5, 1), (10, 10)])
+async def test_history_clamps_the_limit(asked, sent):
+    seen = {}
+    def handler(request):
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json=[])
+    await _run_history(_history_actuator(handler),
+                       {"channel_id": "222", "limit": asked})
+    assert seen["limit"] == str(sent)
+
+
+async def test_history_without_a_channel_id_is_a_reported_error():
+    def handler(request):
+        raise AssertionError("must not call Discord without a channel_id")
+    name, payload = await _run_history(_history_actuator(handler), {})
+    assert name == "discord.history.error"
+    assert "channel_id" in payload["message"]
+
+
+async def test_history_rejects_a_non_integer_limit_without_calling_discord():
+    def handler(request):
+        raise AssertionError("must not call Discord with a bad limit")
+    name, payload = await _run_history(_history_actuator(handler),
+                                       {"channel_id": "222", "limit": "fifty"})
+    assert name == "discord.history.error"
+    assert "limit" in payload["message"]
+
+
+async def test_history_reports_a_permission_failure_rather_than_raising():
+    # 403 is permanent: retrying cannot fix it and the agent should be told.
+    def handler(request):
+        return httpx.Response(403, json={"message": "Missing Access", "code": 50001})
+    name, payload = await _run_history(_history_actuator(handler), {"channel_id": "222"})
+    assert name == "discord.history.error"
+    assert "Missing Access" in payload["message"]
+
+
+async def test_history_raises_on_a_server_error_so_the_bus_retries():
+    def handler(request):
+        return httpx.Response(500, text="upstream boom")
+    with pytest.raises(httpx.HTTPStatusError):
+        await _run_history(_history_actuator(handler), {"channel_id": "222"})
+
+
+async def test_history_survives_a_body_that_is_not_a_list():
+    def handler(request):
+        return httpx.Response(200, json={"unexpected": "shape"})
+    name, payload = await _run_history(_history_actuator(handler), {"channel_id": "222"})
+    assert name == "discord.history.error"
+
+
+async def test_history_error_body_that_is_not_an_object_still_reports():
+    # The Phase 2 defect class: a non-object body must not raise AttributeError.
+    def handler(request):
+        return httpx.Response(403, json=["nope"])
+    name, payload = await _run_history(_history_actuator(handler), {"channel_id": "222"})
+    assert name == "discord.history.error"
+    assert isinstance(payload["message"], str)
+
+
+async def test_history_skips_entries_that_are_not_objects():
+    def handler(request):
+        return httpx.Response(200, json=["junk", _discord_message("1", "alice", "hi")])
+    name, payload = await _run_history(_history_actuator(handler), {"channel_id": "222"})
+    assert name == "discord.history.ok"
+    assert payload["count"] == 1
+
+
+def test_history_declares_a_tool_spec_with_before_and_limit():
+    props = DiscordHistory.tool_spec["input_schema"]["properties"]
+    assert set(props) >= {"channel_id", "limit", "before"}
+    assert DiscordHistory.tool_spec["input_schema"]["required"] == ["channel_id"]
+    assert DiscordHistory.name == "discord.history"
+
+
+async def test_history_stringifies_an_integer_message_id():
+    # msgpack round-trips large ints lossily; ids must always come back as str.
+    def handler(request):
+        return httpx.Response(200, json=[{"id": 123456789012345678,
+                                          "author": {"username": "alice", "bot": False},
+                                          "content": "hi"}])
+    name, payload = await _run_history(_history_actuator(handler), {"channel_id": "222"})
+    assert name == "discord.history.ok"
+    assert payload["messages"][0]["id"] == "123456789012345678"
+    assert isinstance(payload["messages"][0]["id"], str)
+
+
+async def test_history_rejects_a_non_string_before_without_calling_discord():
+    def handler(request):
+        raise AssertionError("must not call Discord with a bad before")
+    name, payload = await _run_history(_history_actuator(handler),
+                                       {"channel_id": "222", "before": 999})
+    assert name == "discord.history.error"
+    assert "before" in payload["message"]
+
+
+async def test_history_rejects_a_bool_limit_without_calling_discord():
+    # bool is an int subclass; an unguarded clamp would silently turn True into 1.
+    def handler(request):
+        raise AssertionError("must not call Discord with a bool limit")
+    name, payload = await _run_history(_history_actuator(handler),
+                                       {"channel_id": "222", "limit": True})
+    assert name == "discord.history.error"
+    assert "limit" in payload["message"]
