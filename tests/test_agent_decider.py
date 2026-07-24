@@ -530,6 +530,61 @@ async def test_the_same_tool_result_delivered_twice_is_a_no_op():
     assert rec3.emitted == []                        # take_pending already consumed it
 
 
+async def test_the_turn_limit_stops_the_loop():
+    """Drives the real multi-turn loop -- mint, tool round-trip, next turn,
+    another tool round-trip -- until the cap is hit, and checks that the
+    loop actually stops (no third llm call) and the session lands idle
+    rather than stuck busy forever."""
+    a = _agent(max_turns=2)
+    cid = await _mint(a)                              # turn 1
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    tool_cid = rec1.emitted[0][2]
+    rec2 = await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=tool_cid))
+    assert [n for n, _, _ in rec2.emitted] == ["llm"]  # turn 2
+    cid2 = rec2.emitted[0][2]
+    rec3 = await _deliver(a, _llm_ok([_use("toolu_B")], oid=400, command_id=cid2))
+    tool_cid2 = rec3.emitted[0][2]
+    rec4 = await _deliver(a, _obs("discord.post.ok", {}, oid=500, command_id=tool_cid2))
+    assert rec4.emitted == []                          # turn 3 refused
+    assert (await a._sessions.load(100))["state"] == "idle"
+
+
+async def test_a_halted_session_does_not_restart_on_a_fresh_mention():
+    """A session that is merely busy (mid-turn) buffers a fresh mention
+    without advancing regardless of the turn cap -- that's not the
+    interesting case. The interesting case is a session that has actually
+    hit the cap and landed idle via _halt: idle is also the state a session
+    is in when it is legitimately ready for its next turn, so the guard
+    must live in _advance itself, not be inferred from state. Drive a
+    session to the cap, confirm it halts idle, then confirm a brand new
+    mention -- which *would* call _advance because the session looks idle
+    -- still produces no llm call and leaves the turn counter exactly at
+    the cap."""
+    a = _agent(max_turns=1)
+    cid = await _mint(a)                               # turn 0 -> 1, busy
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    tool_cid = rec1.emitted[0][2]
+    rec2 = await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=tool_cid))
+    assert rec2.emitted == []                          # halted: cap hit closing the gather
+    assert (await a._sessions.load(100))["state"] == "idle"
+
+    rec3 = await _deliver(a, _obs("discord.message", _message(mid="2"), oid=101))
+    assert rec3.emitted == []                          # a fresh mention must not revive it
+    s = await a._sessions.load(100)
+    assert s["state"] == "idle"
+    assert s["turn"] == 1                              # never advances past the cap
+
+
+async def test_the_turn_counter_survives_a_reload():
+    """The counter must live in the store, not in memory: a fresh Sessions
+    over the same underlying store (standing in for a process reload) must
+    see the same turn count the original instance wrote."""
+    a = _agent()
+    await _mint(a)
+    reloaded = Sessions(a.ctx.store)
+    assert (await reloaded.load(100))["turn"] == 1
+
+
 async def test_a_deadletter_after_the_real_result_already_landed_is_a_no_op():
     a = _agent()
     cid = await _mint(a)
