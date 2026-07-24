@@ -46,9 +46,13 @@ def _message_observation(message, bot_id: int, bot_role_ids=()) -> tuple[str, di
     mention_ids = [str(u.id) for u in message.mentions]
     role_mention_ids = {str(r.id) for r in getattr(message, "role_mentions", [])}
     bot_roles = {str(r) for r in bot_role_ids}
-    mentions_bot = (str(bot_id) in mention_ids
-                    or bool(role_mention_ids & bot_roles)
-                    or bool(getattr(message, "mention_everyone", False)))
+    everyone = bool(getattr(message, "mention_everyone", False))
+    # The specific ids in this message that refer to the bot — the renderer tags
+    # (never strips) these so the model can see it was addressed and where,
+    # while the raw <@id> survives so it can still mention itself.
+    bot_mention_ids = ([str(bot_id)] if str(bot_id) in mention_ids else []) \
+        + sorted(role_mention_ids & bot_roles)
+    mentions_bot = bool(bot_mention_ids) or everyone
     return ("discord.message", {
         "message_id": str(message.id),
         "channel_id": str(channel.id),
@@ -60,6 +64,8 @@ def _message_observation(message, bot_id: int, bot_role_ids=()) -> tuple[str, di
         "content": message.content,
         "mentions": mention_ids,
         "mentions_bot": mentions_bot,
+        "bot_mention_ids": bot_mention_ids,
+        "mention_everyone": everyone,
         "thread": {"is_thread": is_thread,
                    "message_count": getattr(channel, "message_count", None) if is_thread else None},
     })

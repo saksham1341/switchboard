@@ -124,6 +124,7 @@ def test_message_observation_in_thread_carries_the_hint():
         "thread_id": "222", "guild_id": "9", "user_id": "123",
         "user_name": "alice#0001", "content": "hey <@555> thoughts?",
         "mentions": ["555"], "mentions_bot": True,
+        "bot_mention_ids": ["555"], "mention_everyone": False,
         "thread": {"is_thread": True, "message_count": 23},
     }
 
@@ -303,3 +304,19 @@ def test_the_sensor_always_registers_the_message_listener():
     # @client.event setattr's the coroutine onto the client, so the attribute's
     # presence is the listener's presence.
     assert hasattr(_sensor()._client, "on_message")
+
+
+def test_message_observation_records_the_bot_role_mention_id_for_tagging():
+    from switchboard.sensors.discord import _message_observation
+    _, payload = _message_observation(
+        _FakeMessage(role_mentions=[_FakeRole(777)], content="<@&777> hi"),
+        bot_id=555, bot_role_ids=[777])
+    assert payload["bot_mention_ids"] == ["777"]
+
+
+def test_message_observation_records_everyone_for_tagging():
+    from switchboard.sensors.discord import _message_observation
+    _, payload = _message_observation(
+        _FakeMessage(mention_everyone=True), bot_id=555)
+    assert payload["mention_everyone"] is True
+    assert payload["bot_mention_ids"] == []

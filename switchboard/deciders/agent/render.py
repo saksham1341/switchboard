@@ -92,6 +92,25 @@ def _sanitize_header_field(value) -> str:
     return text.replace("=", "＝")
 
 
+def _tag_bot_mentions(content: str, payload: dict) -> str:
+    """Annotate — never remove — a mention of the bot inside message content.
+
+    The model must know *when and where* it was addressed, but the raw `<@id>`
+    stays so it can still mention itself and learn the id. Tag, don't replace.
+    The tag is an informational hint, not a trust boundary — the trusted signal
+    is `mentions_bot` from the sensor; a user forging "(you)" changes nothing.
+    """
+    for mid in payload.get("bot_mention_ids") or []:
+        # A given id is either a user or a role, so only one form is present;
+        # tagging both is a harmless no-op on the absent one.
+        content = content.replace(f"<@{mid}>", f"<@{mid}> (you)")
+        content = content.replace(f"<@&{mid}>", f"<@&{mid}> (you)")
+    if payload.get("mention_everyone"):
+        content = content.replace("@everyone", "@everyone (you are included)")
+        content = content.replace("@here", "@here (you are included)")
+    return content
+
+
 def render_message(payload: dict) -> str:
     payload = payload if isinstance(payload, dict) else {}
     thread = payload.get("thread")
@@ -111,5 +130,5 @@ def render_message(payload: dict) -> str:
         if isinstance(count, int):
             bits.append(f"thread_messages={count}")
 
-    body = escape_delimiters(_text(payload.get("content")))
+    body = _tag_bot_mentions(escape_delimiters(_text(payload.get("content"))), payload)
     return f"[discord.message] {' '.join(bits)}\n{OPEN}\n{body}\n{CLOSE}"

@@ -173,3 +173,26 @@ def test_header_carries_user_id_for_mentions():
     # display name, and the header is where it gets everything it acts on.
     out = render_message(_payload(user_id="669491511791976458"))
     assert "user_id=669491511791976458" in out.splitlines()[0]
+
+
+def test_a_bot_user_mention_is_tagged_not_stripped():
+    out = render_message(_payload(content="hey <@555> thoughts?",
+                                  bot_mention_ids=["555"]))
+    assert "<@555> (you)" in out          # raw id survives, tagged as self
+
+
+def test_a_bot_role_mention_is_tagged():
+    out = render_message(_payload(content="<@&777> summarize",
+                                  bot_mention_ids=["777"]))
+    assert "<@&777> (you)" in out
+
+
+def test_an_everyone_broadcast_is_tagged_as_including_the_bot():
+    out = render_message(_payload(content="@everyone deploy is live",
+                                  mention_everyone=True))
+    assert "@everyone (you are included)" in out
+
+
+def test_a_non_bot_mention_is_left_alone():
+    out = render_message(_payload(content="hey <@999> hi", bot_mention_ids=["555"]))
+    assert "<@999>" in out and "(you)" not in out
