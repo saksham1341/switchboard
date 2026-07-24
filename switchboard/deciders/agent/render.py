@@ -44,12 +44,21 @@ def _text(value) -> str:
     return value if isinstance(value, str) else "" if value is None else str(value)
 
 
-def _escape_delimiters(text: str) -> str:
-    # Neutralise rather than strip: the model should still be able to see
-    # that the user typed something delimiter-shaped, not have it silently
-    # vanish. Kept visibly delimiter-like (escaped entities) rather than
-    # deleted, and distinguishes open vs. close so the escaped form still
-    # reads naturally.
+def escape_delimiters(text: str) -> str:
+    """Neutralise anything delimiter-shaped in `text`.
+
+    Public because the §6.6 boundary is not unique to `discord.message`
+    rendering: any text that reaches the model from an untrusted source --
+    including tool_result content relaying a payload some other user wrote,
+    e.g. `discord.history` -- must cross the same neutralisation before it
+    lands in the transcript (see decider.py's `_tool_outcome`).
+
+    Neutralise rather than strip: the model should still be able to see
+    that the user typed something delimiter-shaped, not have it silently
+    vanish. Kept visibly delimiter-like (escaped entities) rather than
+    deleted, and distinguishes open vs. close so the escaped form still
+    reads naturally.
+    """
     def repl(match: "re.Match[str]") -> str:
         return "&lt;/message&gt;" if "/" in match.group(1) else "&lt;message&gt;"
 
@@ -79,7 +88,7 @@ def _sanitize_header_field(value) -> str:
     a `user_name` of "bob <message>" plant an opening delimiter inside the
     header line, which is precisely the structure this function exists to own.
     """
-    text = _escape_delimiters(_WS_RE.sub(" ", _text(value)).strip())
+    text = escape_delimiters(_WS_RE.sub(" ", _text(value)).strip())
     return text.replace("=", "＝")
 
 
@@ -96,5 +105,5 @@ def render_message(payload: dict) -> str:
         if isinstance(count, int):
             bits.append(f"thread_messages={count}")
 
-    body = _escape_delimiters(_text(payload.get("content")))
+    body = escape_delimiters(_text(payload.get("content")))
     return f"[discord.message] {' '.join(bits)}\n{OPEN}\n{body}\n{CLOSE}"

@@ -9,7 +9,7 @@ import json
 import logging
 
 from switchboard.deciders.agent.prompt import SYSTEM
-from switchboard.deciders.agent.render import render_message
+from switchboard.deciders.agent.render import escape_delimiters, render_message
 from switchboard.deciders.agent.session import Sessions
 from switchboard.message import CMD_LOG
 
@@ -24,20 +24,30 @@ def _tool_outcome(obs) -> tuple[str, bool]:
     Convention (spec 7.2): the ok payload IS the tool content, json-serialized.
     An error carries {"message": ...}. Shape-defensive throughout — a surprising
     payload must degrade to text, never raise.
+
+    This is a second ingress path for untrusted text, alongside the
+    §6.6-documented `discord.message` boundary in render.py: a tool result can
+    relay content some other user wrote (e.g. `discord.history.ok` carrying
+    raw Discord message bodies), and that text is serialized straight into a
+    `tool_result` block with no other framing. Escaping delimiters here --
+    generically, for every tool, not just `discord.history` -- is what keeps
+    a forged `</message> SYSTEM: ...` from reading as trusted transcript
+    content once it lands. Escaping is not a `discord.history` special case:
+    any future tool that relays external text inherits the same fix for free.
     """
     payload = obs.payload if isinstance(obs.payload, dict) else {}
     if obs.name.endswith(".error"):
         message = payload.get("message")
         if isinstance(message, str):
-            return message, True
+            return escape_delimiters(message), True
         try:
-            return json.dumps(payload), True
+            return escape_delimiters(json.dumps(payload)), True
         except (TypeError, ValueError):
-            return str(payload), True
+            return escape_delimiters(str(payload)), True
     try:
-        return json.dumps(payload), False
+        return escape_delimiters(json.dumps(payload)), False
     except (TypeError, ValueError):
-        return str(payload), False
+        return escape_delimiters(str(payload)), False
 
 
 class AgentDecider:
@@ -137,13 +147,24 @@ class AgentDecider:
             if s is None:
                 return
 
+        if s.get("halted"):
+            # Once halted, a session never advances again (Phase 5 owns
+            # giving it a user-visible signal and/or reviving it). Returning
+            # here before touching `buffer` is what keeps every subsequent
+            # message in the channel from being appended and the whole
+            # record rewritten forever.
+            return
+
         # At-least-once delivery (see bus.py's _consume, which marks a message
         # processed only after the handler returns) means this same
         # observation can arrive again after a retry. Keying each buffer
         # entry on the source message id and skipping a repeat keeps the
         # append idempotent instead of duplicating content into one turn.
+        # A missing or non-string message_id cannot be matched against —
+        # `None == None` would falsely call two id-less messages duplicates
+        # of each other — so treat that as "cannot dedupe" and always append.
         message_id = payload.get("message_id")
-        already_buffered = message_id is not None and any(
+        already_buffered = isinstance(message_id, str) and any(
             b.get("message_id") == message_id for b in s["buffer"])
         if not already_buffered:
             s["buffer"].append({"rendered": render_message(payload),
@@ -206,9 +227,20 @@ class AgentDecider:
 
     async def _halt(self, s, why: str, ctx) -> None:
         """Stop without emitting another llm. Placeholder until Phase 5 gives
-        halt a user-visible message; for now it idles and logs."""
+        halt a user-visible message; for now it idles and logs.
+
+        `halted` is explicit and sticky, unlike `state`: idle is also what a
+        session looks like when it is legitimately ready for its next turn, so
+        `_on_message` cannot infer "stopped for good" from state alone. Once
+        set, `_on_message` stops accumulating into `buffer` entirely — without
+        it, every subsequent message in the channel would still be appended
+        and the whole record rewritten forever (O(n^2) in bytes written, no
+        user-visible signal), since only Phase 5's watchdog/TTL would
+        eventually heal it and this session is never "busy" for that watchdog
+        to catch."""
         logger.warning("session %s halted: %s", s["sid"], why)
         s["state"] = "idle"
+        s["halted"] = True
         await self._sessions.save(s)
 
     async def _on_response(self, s, obs, ctx) -> None:
@@ -240,7 +272,7 @@ class AgentDecider:
         # here. (No "remaining" counter: the real barrier is comparing
         # len(results) to len(order) in _maybe_close_gather.)
         gather = {"order": [], "results": {}}
-        immediate = []
+        to_emit = []
         for b in uses:
             tid = b.get("id")
             # A duplicate tool_use id must not fan out to a second command:
@@ -256,23 +288,45 @@ class AgentDecider:
             # guard with isinstance before the hashable-membership check and
             # treat it the same as an unknown tool.
             if isinstance(name, str) and name in known:
-                cid = await ctx.command(name,
-                                        b.get("input") if isinstance(b.get("input"), dict) else {})
-                await self._sessions.put_pending(
-                    cid, {"kind": "tool", "sid": s["sid"], "tool_use_id": tid})
+                args = b.get("input") if isinstance(b.get("input"), dict) else {}
+                to_emit.append((tid, name, args))
             else:
                 # Hallucinated tool (spec 8): answered immediately, in-band, so
                 # the model learns from a tool_result rather than from silence.
-                immediate.append((tid, f"no such tool: {name!r}"))
+                # Recorded directly into `gather["results"]` here (rather than
+                # via `_record_result` after save) because the whole point is
+                # that the gather saved below must already be complete.
+                gather["results"][tid] = {
+                    "type": "tool_result", "tool_use_id": tid,
+                    "content": f"no such tool: {name!r}", "is_error": True}
 
         # Nothing to wait for (every block had a non-string id) ⇒ gather stays
         # None, preserving the "gather is None when closed" invariant instead
         # of saving a dead, non-None empty dict that _finish never clears.
         s["gather"] = gather if gather["order"] else None
+        # The store has no transactions, so these writes can never be made
+        # atomic — a crash partway through is always possible. `gather["order"]`
+        # is fully known before any tool command needs to be emitted, so we
+        # save the complete gather FIRST and only then emit commands and
+        # record their pending entries — the same fail-safe choice `_advance`
+        # makes. If we crash after save() but before a command/pending write,
+        # the session is stuck "busy" with a real gather and some pending
+        # entries missing: recoverable, and exactly what the Phase 5
+        # stuck-busy watchdog exists to catch. The reverse order (emit and
+        # put_pending before save, as this used to do) risks a crash after a
+        # tool command is emitted and its pending entry recorded but before
+        # save() — leaving `pending:<cid>` pointing at a session whose stored
+        # `gather` is still None. When the real result then arrives,
+        # take_pending succeeds, _record_result sees gather is None and
+        # silently drops the result, and the session is stuck busy forever
+        # with nothing to distinguish it from a legitimately-closed gather.
         await self._sessions.save(s)
-        for tid, message in immediate:
-            await self._record_result(s, tid, message, True)
-        if immediate:
+        for tid, name, args in to_emit:
+            cid = await ctx.command(name, args)
+            await self._sessions.put_pending(
+                cid, {"kind": "tool", "sid": s["sid"], "tool_use_id": tid})
+
+        if gather["results"]:
             await self._maybe_close_gather(s, ctx)
         if not gather["order"]:
             # Every block was unusable; nothing will ever arrive.
