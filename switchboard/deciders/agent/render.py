@@ -20,7 +20,19 @@ OPEN, CLOSE = "<message>", "</message>"
 # spelling we wrote -- an LLM reader will very plausibly still honour
 # `</MESSAGE>`, `</Message >` or `</message foo>` as a closing tag, so the
 # match has to be this loose to close the actual gap.
-_DELIM_RE = re.compile(r"<\s*(/?)\s*message\s*[^>]*>", re.IGNORECASE)
+#
+# The single `[\s/]*` class is load-bearing, not style. The obvious spelling
+# -- `<\s*(/?)\s*message\s*[^>]*>` -- puts two `\s*` either side of `/?`, and
+# another `\s*` immediately before `[^>]*`; each pair can match the same
+# whitespace, so the engine backtracks them against each other. On
+# `"<" + " "*n + "message" + " "*n` that is super-quadratic (~7x per doubling
+# of n, measured), and this input arrives straight from an untrusted Discord
+# message. A synchronous regex blocks the event loop, so `_consume`'s
+# asyncio.timeout cannot preempt it -- one crafted message would freeze the
+# whole process, not merely this turn. Collapsing to one character class,
+# anchored by the literal `message`, removes both ambiguities and makes the
+# match linear (200k chars in ~2ms).
+_DELIM_RE = re.compile(r"<([\s/]*)message[^>]*>", re.IGNORECASE)
 
 # Collapses whitespace runs anywhere in a header field, including the
 # newline/tab that a byte-for-byte check on the closing delimiter alone would
@@ -39,7 +51,7 @@ def _escape_delimiters(text: str) -> str:
     # deleted, and distinguishes open vs. close so the escaped form still
     # reads naturally.
     def repl(match: "re.Match[str]") -> str:
-        return "&lt;/message&gt;" if match.group(1) else "&lt;message&gt;"
+        return "&lt;/message&gt;" if "/" in match.group(1) else "&lt;message&gt;"
 
     return _DELIM_RE.sub(repl, text)
 
