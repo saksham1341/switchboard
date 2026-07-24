@@ -9,11 +9,10 @@ from switchboard.http import HttpServer
 from switchboard.scheduler import Scheduler
 
 
-def _db(tmp_path, rows):
-    """A stand-in mamamia db with just the two tables the sweep reads."""
+def _db_at(path, rows):
+    """A stand-in mamamia db with just the two tables the sweep reads, at path."""
     import msgpack
-    p = str(tmp_path / "mm.db")
-    c = sqlite3.connect(p)
+    c = sqlite3.connect(path)
     c.execute("CREATE TABLE message_state (log_id TEXT, group_id TEXT, "
               "message_id INTEGER, state INTEGER)")
     c.execute("CREATE TABLE messages (log_id TEXT, id INTEGER, metadata BLOB)")
@@ -22,7 +21,12 @@ def _db(tmp_path, rows):
         c.execute("INSERT INTO messages VALUES (?,?,?)",
                   (log, mid, msgpack.packb({"name": name})))
     c.commit(); c.close()
-    return p
+    return path
+
+
+def _db(tmp_path, rows):
+    """A stand-in mamamia db with just the two tables the sweep reads."""
+    return _db_at(str(tmp_path / "mm.db"), rows)
 
 
 def _bound(db_path, store=None):
@@ -114,3 +118,38 @@ async def test_cascade_guard(tmp_path):
     c.commit(); c.close()
     await s.sweep()
     assert emitted == []                       # never announce our own kind
+
+
+async def test_emit_failure_leaves_the_row_unannounced_for_retry():
+    """Emit-before-mark: if the emit fails, the row must NOT be marked seen, so
+    the next sweep tries again rather than losing the announcement forever."""
+    import msgpack, sqlite3, tempfile, os
+    from mamamia.core.models import MessageState
+    tmp = tempfile.mkdtemp()
+    db = _db_at(os.path.join(tmp, "mm.db"), [])
+    store = MemoryStore()
+    boom = {"n": 0}
+    async def emit(name, payload):
+        boom["n"] += 1
+        raise RuntimeError("log unavailable")
+    s = DeadLetterSensor(db)
+    s.bind(SensorCtx(emit=emit, http=HttpServer(serve=False), store=store,
+                     schedule=Scheduler().for_owner("deadletter")))
+    await s.sweep()                                    # baseline on empty table
+    c = sqlite3.connect(db)
+    c.execute("INSERT INTO message_state VALUES (?,?,?,?)",
+              ("cmd", "actuator/web_search", 42, MessageState.DEAD.value))
+    c.execute("INSERT INTO messages VALUES (?,?,?)",
+              ("cmd", 42, msgpack.packb({"name": "web_search"})))
+    c.commit(); c.close()
+    try:
+        await s.sweep()
+    except RuntimeError:
+        pass
+    assert await store.get("seen:cmd:actuator/web_search:42") is None   # not marked
+
+
+async def test_missing_database_degrades_without_raising():
+    s, emitted = _bound("/nonexistent/path/mm.db")
+    await s.sweep()          # must not raise
+    assert emitted == []

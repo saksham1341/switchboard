@@ -28,6 +28,7 @@ class DeadLetterSensor:
         self._db = db_path
         self._interval = interval
         self.ctx = None
+        self._failing = False
 
     def bind(self, ctx) -> None:
         self.ctx = ctx
@@ -43,8 +44,15 @@ class DeadLetterSensor:
         try:
             rows = self._dead_rows()
         except Exception as exc:
-            logger.debug("dead-letter sweep skipped: %s", exc)
+            if not self._failing:
+                self._failing = True
+                logger.warning("dead-letter sweep failing: %s", exc)
+            else:
+                logger.debug("dead-letter sweep still failing: %s", exc)
             return
+        if self._failing:
+            self._failing = False
+            logger.info("dead-letter sweep recovered")
 
         # First run establishes a baseline: existing DEAD rows are recorded as
         # seen but not announced, so a fresh store never replays history.
@@ -54,17 +62,20 @@ class DeadLetterSensor:
             key = f"seen:{log}:{group}:{mid}"
             if await self.ctx.store.get(key) is not None:
                 continue
-            await self.ctx.store.set(key, "1")
-            if not baselined:
+            # Baseline (first run) and our own kind (cascade guard) are recorded
+            # but never announced.
+            if not baselined or name == DEADLETTER:
+                await self.ctx.store.set(key, "1")
                 continue
-            # Never announce our own kind: a consumer dying on a deadletter
-            # observation would otherwise announce that, forever.
-            if name == DEADLETTER:
-                continue
+            # Emit BEFORE marking. A crash between the two costs a duplicate
+            # announcement, which consumers dedupe; marking first would lose the
+            # announcement forever, which is the one failure this sensor exists
+            # to prevent.
             await self.ctx.emit(DEADLETTER, {
                 "log": log, "group": group, "message_id": mid,
                 "name": name, "reason": "dead-lettered",
             })
+            await self.ctx.store.set(key, "1")
 
         if not baselined:
             await self.ctx.store.set("baselined", "1")
