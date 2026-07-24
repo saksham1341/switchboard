@@ -296,9 +296,14 @@ class AgentDecider:
                 # Recorded directly into `gather["results"]` here (rather than
                 # via `_record_result` after save) because the whole point is
                 # that the gather saved below must already be complete.
+                # Escaped like any other tool_result content: `name` is chosen
+                # by the model, which may itself be echoing text an untrusted
+                # user wrote, and this lands in a user-role block. repr() alone
+                # is not the boundary -- escape_delimiters is.
                 gather["results"][tid] = {
                     "type": "tool_result", "tool_use_id": tid,
-                    "content": f"no such tool: {name!r}", "is_error": True}
+                    "content": escape_delimiters(f"no such tool: {name!r}"),
+                    "is_error": True}
 
         # Nothing to wait for (every block had a non-string id) ⇒ gather stays
         # None, preserving the "gather is None when closed" invariant instead
