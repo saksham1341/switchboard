@@ -26,17 +26,25 @@ def _agent(**kw):
     return a
 
 
+_next_command_id = [500]    # module-level: a real Bus hands out globally unique,
+                            # monotonic command ids across the process's whole
+                            # lifetime, never just within one decide() call. A
+                            # counter reset per _Recorder would let two separate
+                            # _deliver() calls mint the same numeric id, which is
+                            # a scenario the real system cannot produce.
+
+
 class _Recorder:
     """Captures the commands a decide() call emits."""
     def __init__(self, obs):
         self.emitted = []
-        self._next_id = 500
         self.ctx = DecideCtx(obs=obs, _emit_command=self._emit)
 
     async def _emit(self, name, args, observation_id):
-        self._next_id += 1
-        self.emitted.append((name, args, self._next_id))
-        return self._next_id
+        _next_command_id[0] += 1
+        cid = _next_command_id[0]
+        self.emitted.append((name, args, cid))
+        return cid
 
 
 def _message(content="hello", *, mentions_bot=True, mid="1", thread="222",
@@ -220,3 +228,158 @@ async def test_redelivering_the_same_message_while_busy_buffers_it_once():
     s = await a._sessions.load(100)
     assert len(s["buffer"]) == 1
     assert s["buffer"][0]["message_id"] == "2"
+
+
+# --- on_response, gather, finish (Task 4) -------------------------------------
+
+def _llm_ok(blocks, oid=200, command_id=501):
+    return _obs("llm.ok", {"stop_reason": "tool_use", "content": blocks,
+                           "usage": {"input_tokens": 10, "output_tokens": 5}},
+                oid=oid, command_id=command_id)
+
+
+def _use(tid, name="discord.post", args=None):
+    return {"type": "tool_use", "id": tid, "name": name, "input": args or {}}
+
+
+async def _mint(a):
+    """Mint a session and return the llm command id it emitted."""
+    rec = await _deliver(a, _obs("discord.message", _message()))
+    return rec.emitted[0][2]
+
+
+async def test_a_tool_use_becomes_a_command():
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    assert [n for n, _, _ in rec.emitted] == ["discord.post"]
+
+
+async def test_the_tool_command_carries_the_models_input_verbatim():
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok(
+        [_use("toolu_A", args={"content": "hi", "channel_id": "222"})], command_id=cid))
+    assert rec.emitted[0][1] == {"content": "hi", "channel_id": "222"}
+
+
+async def test_a_response_with_no_tool_use_finishes_the_session():
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _obs("llm.ok",
+                                 {"stop_reason": "end_turn",
+                                  "content": [{"type": "text", "text": "hello!"}]},
+                                 oid=200, command_id=cid))
+    assert rec.emitted == []                       # text-blind: nothing delivered
+    assert (await a._sessions.load(100))["state"] == "idle"
+
+
+async def test_the_assistant_turn_is_appended_before_the_tool_commands():
+    a = _agent()
+    cid = await _mint(a)
+    await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    s = await a._sessions.load(100)
+    assert s["messages"][-1]["role"] == "assistant"
+
+
+async def test_a_single_tool_result_closes_the_gather_and_advances():
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    tool_cid = rec1.emitted[0][2]
+    rec2 = await _deliver(a, _obs("discord.post.ok", {"message_id": "9"},
+                                  oid=300, command_id=tool_cid))
+    assert [n for n, _, _ in rec2.emitted] == ["llm"]        # next turn fired
+    s = await a._sessions.load(100)
+    assert s["gather"] is None
+    assert s["messages"][-1]["role"] == "user"               # the tool_result turn
+
+
+async def test_two_tool_uses_wait_for_both_results():
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A"), _use("toolu_B")], command_id=cid))
+    a_cid, b_cid = rec1.emitted[0][2], rec1.emitted[1][2]
+    rec2 = await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=a_cid))
+    assert rec2.emitted == []                                # still waiting on B
+    rec3 = await _deliver(a, _obs("discord.post.ok", {}, oid=301, command_id=b_cid))
+    assert [n for n, _, _ in rec3.emitted] == ["llm"]
+
+
+async def test_tool_results_are_assembled_in_the_models_original_order():
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A"), _use("toolu_B")], command_id=cid))
+    a_cid, b_cid = rec1.emitted[0][2], rec1.emitted[1][2]
+    await _deliver(a, _obs("discord.post.ok", {}, oid=300, command_id=b_cid))   # B first
+    await _deliver(a, _obs("discord.post.ok", {}, oid=301, command_id=a_cid))
+    s = await a._sessions.load(100)
+    results = s["messages"][-1]["content"]
+    assert [r["tool_use_id"] for r in results] == ["toolu_A", "toolu_B"]
+
+
+async def test_a_tool_error_becomes_an_is_error_tool_result():
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    tool_cid = rec1.emitted[0][2]
+    await _deliver(a, _obs("discord.post.error", {"message": "nope"},
+                           oid=300, command_id=tool_cid))
+    s = await a._sessions.load(100)
+    block = s["messages"][-1]["content"][0]
+    assert block["is_error"] is True and "nope" in block["content"]
+
+
+async def test_a_dead_lettered_command_becomes_an_is_error_tool_result():
+    # A dead command emits no result observation. The deadletter sensor is the
+    # only signal, and it deliberately carries no command_id (a sensor cannot
+    # forge a result), so correlation comes from the payload.
+    a = _agent()
+    cid = await _mint(a)
+    rec1 = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    tool_cid = rec1.emitted[0][2]
+    rec2 = await _deliver(a, _obs("switchboard.deadletter",
+                                  {"message_id": tool_cid, "log": "cmd"}, oid=300))
+    assert [n for n, _, _ in rec2.emitted] == ["llm"]
+    s = await a._sessions.load(100)
+    assert s["messages"][-1]["content"][0]["is_error"] is True
+
+
+async def test_a_mention_that_landed_while_busy_advances_at_finish():
+    a = _agent()
+    cid = await _mint(a)
+    await _deliver(a, _obs("discord.message", _message(mid="2"), oid=101))  # buffered
+    rec = await _deliver(a, _obs("llm.ok",
+                                 {"stop_reason": "end_turn", "content": []},
+                                 oid=200, command_id=cid))
+    assert [n for n, _, _ in rec.emitted] == ["llm"]         # drained the buffer
+
+
+async def test_non_mention_context_alone_does_not_advance_at_finish():
+    a = _agent()
+    cid = await _mint(a)
+    await _deliver(a, _obs("discord.message",
+                           _message(mentions_bot=False), oid=101))
+    rec = await _deliver(a, _obs("llm.ok",
+                                 {"stop_reason": "end_turn", "content": []},
+                                 oid=200, command_id=cid))
+    assert rec.emitted == []
+    s = await a._sessions.load(100)
+    assert s["state"] == "idle" and len(s["buffer"]) == 1    # kept as context
+
+
+async def test_an_llm_error_finishes_rather_than_looping():
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _obs("llm.error", {"message": "overloaded"},
+                                 oid=200, command_id=cid))
+    assert rec.emitted == []
+    assert (await a._sessions.load(100))["state"] == "idle"
+
+
+async def test_a_redelivered_llm_result_is_a_no_op():
+    a = _agent()
+    cid = await _mint(a)
+    await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    rec = await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    assert rec.emitted == []             # take_pending already consumed it

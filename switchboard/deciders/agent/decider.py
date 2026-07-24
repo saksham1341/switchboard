@@ -5,6 +5,7 @@ model's answer arrives later as a fresh observation and re-enters `decide()`.
 That is what keeps this a decider like any other — deterministic, replayable,
 no world access — even though the judgment inside the loop is none of those.
 """
+import json
 import logging
 
 from switchboard.deciders.agent.prompt import SYSTEM
@@ -14,6 +15,23 @@ from switchboard.deciders.agent.session import Sessions
 logger = logging.getLogger(__name__)
 
 MAX_TURNS = 12
+
+
+def _tool_outcome(obs) -> tuple[str, bool]:
+    """A result observation -> (tool_result content, is_error).
+
+    Convention (spec 7.2): the ok payload IS the tool content, json-serialized.
+    An error carries {"message": ...}. Shape-defensive throughout — a surprising
+    payload must degrade to text, never raise.
+    """
+    payload = obs.payload if isinstance(obs.payload, dict) else {}
+    if obs.name.endswith(".error"):
+        message = payload.get("message")
+        return (message if isinstance(message, str) else json.dumps(payload)), True
+    try:
+        return json.dumps(payload), False
+    except (TypeError, ValueError):
+        return str(payload), False
 
 
 class AgentDecider:
@@ -43,6 +61,23 @@ class AgentDecider:
     async def decide(self, obs, ctx) -> None:
         if obs.name == "discord.message":
             return await self._on_message(obs, ctx)
+
+        if obs.name == "switchboard.deadletter":
+            # A dead command emits no result. The sensor is the only signal and
+            # it carries no command_id — a sensor cannot forge a result — so we
+            # correlate from the payload instead.
+            payload = obs.payload if isinstance(obs.payload, dict) else {}
+            mid = payload.get("message_id")
+            if mid is None:
+                return
+            p = await self._sessions.take_pending(mid)
+            if p is None or p["kind"] != "tool":
+                return
+            s = await self._sessions.load(p["sid"])
+            if s is None:
+                return
+            return await self._on_gather(s, p, "the tool died", True, ctx)
+
         if obs.command_id is None:
             return
         p = await self._sessions.take_pending(obs.command_id)
@@ -53,7 +88,9 @@ class AgentDecider:
             logger.warning("result for a session that no longer exists: %s", p["sid"])
             return
         if p["kind"] == "llm":
-            await self._on_response(s, obs, ctx)
+            return await self._on_response(s, obs, ctx)
+        content, is_error = _tool_outcome(obs)
+        await self._on_gather(s, p, content, is_error, ctx)
 
     # --- input -----------------------------------------------------------
 
@@ -138,4 +175,90 @@ class AgentDecider:
         await self._sessions.save(s)
 
     async def _on_response(self, s, obs, ctx) -> None:
-        raise NotImplementedError          # Task 4
+        """The model spoke."""
+        if obs.name.endswith(".error"):
+            # The call itself failed. Do not retry here: the Bus already retried
+            # what was retryable, and looping on a hard failure burns spend.
+            payload = obs.payload if isinstance(obs.payload, dict) else {}
+            logger.warning("llm call failed for session %s: %s",
+                           s["sid"], payload.get("message"))
+            return await self._finish(s, ctx)
+
+        payload = obs.payload if isinstance(obs.payload, dict) else {}
+        blocks = payload.get("content")
+        blocks = blocks if isinstance(blocks, list) else []
+        s["messages"].append({"role": "assistant", "content": blocks})
+
+        uses = [b for b in blocks
+                if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if not uses:
+            # end_turn. The decider is text-blind by design: it delivers
+            # nothing. A reply reaches the user only via a reply tool.
+            return await self._finish(s, ctx)
+
+        known = {t["name"] for t in self._tools}
+        # Only one gather is ever open per session: a session is "busy" from
+        # advance until finish and emits one llm at a time, so the session
+        # record itself is the gather key. The spec's turn_key is unnecessary
+        # here.
+        gather = {"order": [], "remaining": 0, "results": {}}
+        immediate = []
+        for b in uses:
+            tid = b.get("id")
+            if not isinstance(tid, str):
+                continue
+            gather["order"].append(tid)
+            if b.get("name") in known:
+                cid = await ctx.command(b["name"],
+                                        b.get("input") if isinstance(b.get("input"), dict) else {})
+                await self._sessions.put_pending(
+                    cid, {"kind": "tool", "sid": s["sid"], "tool_use_id": tid})
+                gather["remaining"] += 1
+            else:
+                # Hallucinated tool (spec 8): answered immediately, in-band, so
+                # the model learns from a tool_result rather than from silence.
+                immediate.append((tid, f"no such tool: {b.get('name')!r}"))
+
+        s["gather"] = gather
+        await self._sessions.save(s)
+        for tid, message in immediate:
+            await self._record_result(s, tid, message, True)
+        if immediate:
+            await self._maybe_close_gather(s, ctx)
+        if gather["remaining"] == 0 and not immediate:
+            # Every block was unusable; nothing will ever arrive.
+            await self._finish(s, ctx)
+
+    async def _record_result(self, s, tool_use_id, content, is_error) -> None:
+        gather = s["gather"]
+        if gather is None or tool_use_id in gather["results"]:
+            return
+        gather["results"][tool_use_id] = {"type": "tool_result",
+                                          "tool_use_id": tool_use_id,
+                                          "content": content,
+                                          "is_error": is_error}
+        gather["remaining"] = max(0, gather["remaining"] - 1)
+
+    async def _on_gather(self, s, p, content, is_error, ctx) -> None:
+        """A tool finished."""
+        await self._record_result(s, p["tool_use_id"], content, is_error)
+        await self._maybe_close_gather(s, ctx)
+
+    async def _maybe_close_gather(self, s, ctx) -> None:
+        gather = s["gather"]
+        if gather is None:
+            return
+        if len(gather["results"]) < len(gather["order"]):
+            return await self._sessions.save(s)
+        # Anthropic requires one tool_result for every tool_use, together and in
+        # the model's original order.
+        s["messages"].append({"role": "user",
+                              "content": [gather["results"][t] for t in gather["order"]]})
+        s["gather"] = None
+        await self._advance(s, ctx)
+
+    async def _finish(self, s, ctx) -> None:
+        if any(b["is_mention"] for b in s["buffer"]):
+            return await self._advance(s, ctx)      # a mention landed while busy
+        s["state"] = "idle"                          # keep non-mention context buffered
+        await self._sessions.save(s)
