@@ -159,3 +159,42 @@ async def test_anthropic_survives_an_error_body_that_is_not_an_object():
     with pytest.raises(LlmError):
         await b.complete({"model": "m", "messages": []})
     await b.close()
+
+
+# --- the 5xx/4xx split, driven through the CONCRETE backend ------------------
+# The fake-backend propagation test above never reaches these branches, so it
+# would still pass with the branch order swapped. These would not.
+
+async def test_anthropic_5xx_propagates_rather_than_becoming_an_llm_error():
+    # A 5xx is transient. Turning it into a reported LlmError would tell the
+    # agent a permanent failure happened and burn the turn, instead of letting
+    # the Bus retry with backoff.
+    def handler(request):
+        return httpx.Response(503, text="overloaded")
+    b = _anthropic(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        await b.complete({"model": "m", "messages": []})
+    await b.close()
+
+
+async def test_anthropic_499_is_still_a_reported_error():
+    # Pins the boundary from the other side: everything below 500 reports.
+    def handler(request):
+        return httpx.Response(499, json={"error": {"message": "client closed"}})
+    b = _anthropic(handler)
+    with pytest.raises(LlmError) as e:
+        await b.complete({"model": "m", "messages": []})
+    assert e.value.status == 499
+    await b.close()
+
+
+async def test_anthropic_unreadable_2xx_body_is_reported_not_crashed():
+    # A 200 whose body is not an object used to reach .get() and raise an
+    # uncaught AttributeError - the fifth instance of this project's most
+    # repeated defect. It must be a reported failure instead.
+    def handler(request):
+        return httpx.Response(200, json=["not", "an", "object"])
+    b = _anthropic(handler)
+    with pytest.raises(LlmError):
+        await b.complete({"model": "m", "messages": []})
+    await b.close()
