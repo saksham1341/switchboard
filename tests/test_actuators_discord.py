@@ -109,8 +109,11 @@ async def test_explicit_channel_id_wins_over_the_default():
 async def test_tool_spec_exposes_content_and_destination():
     spec = DiscordPost.tool_spec
     assert spec is not None
-    assert set(spec["input_schema"]["properties"]) == {"content", "channel_id"}
-    assert spec["input_schema"]["required"] == ["content"]
+    assert set(spec["input_schema"]["properties"]) == {
+        "content", "channel_id", "reply_to_message_id"}
+    # channel_id is required for the agent: it is constructed with no default
+    # channel, so an omitted channel_id would post to /channels/None/messages.
+    assert spec["input_schema"]["required"] == ["content", "channel_id"]
 
 
 async def test_non_object_json_body_still_reports_ok():
@@ -306,3 +309,36 @@ async def test_history_rejects_a_bool_limit_without_calling_discord():
                                        {"channel_id": "222", "limit": True})
     assert name == "discord.history.error"
     assert "limit" in payload["message"]
+
+
+async def test_discord_post_reply_reference_when_asked():
+    seen = {}
+    def h(req):
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"id": "m-9"})
+    a = _bind(DiscordPost("bot", "app", channel_id="chan-9", client=_client(h)))
+    results = []
+    ctx = ActCtx(cmd=_cmd("discord.post",
+                          {"content": "answering you", "reply_to_message_id": "src-42"}),
+                 _emit_result=await _recorder(results))
+    await a.act(ctx.cmd, ctx)
+    assert seen["body"]["message_reference"] == {
+        "message_id": "src-42", "fail_if_not_exists": False}
+    assert results[0][0] == "discord.post.ok"
+
+
+async def test_discord_post_has_no_reference_when_not_replying():
+    seen = {}
+    def h(req):
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"id": "m-1"})
+    a = _bind(DiscordPost("bot", "app", channel_id="chan-9", client=_client(h)))
+    ctx = ActCtx(cmd=_cmd("discord.post", {"content": "hi"}),
+                 _emit_result=await _recorder([]))
+    await a.act(ctx.cmd, ctx)
+    assert "message_reference" not in seen["body"]
+
+
+def test_reply_to_is_in_the_tool_spec():
+    props = DiscordPost.tool_spec["input_schema"]["properties"]
+    assert "reply_to_message_id" in props

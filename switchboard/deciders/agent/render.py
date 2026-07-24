@@ -98,6 +98,7 @@ def render_message(payload: dict) -> str:
     thread = thread if isinstance(thread, dict) else {}
 
     bits = [f"channel_id={_sanitize_header_field(payload.get('channel_id'))}",
+            f"message_id={_sanitize_header_field(payload.get('message_id'))}",
             f"user={_sanitize_header_field(payload.get('user_name'))}"]
     if payload.get("thread_id"):
         bits.insert(1, f"thread_id={_sanitize_header_field(payload.get('thread_id'))}")

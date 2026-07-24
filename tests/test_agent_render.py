@@ -159,3 +159,10 @@ def test_a_delimiter_in_a_header_field_cannot_reach_the_header_line():
     header = out.splitlines()[0]
     assert "<message>" not in header
     assert "&lt;message&gt;" in header
+
+
+def test_header_carries_the_message_id_for_replies():
+    # reply_to_message_id needs a source id, and the header is where the model
+    # gets everything it acts on.
+    out = render_message(_payload(message_id="789"))
+    assert "message_id=789" in out.splitlines()[0]

@@ -29,7 +29,8 @@ class DiscordSender:
 
     async def send(self, channel_id: str, content: str | None = None, *,
                    embed: dict | None = None,
-                   components: list | None = None) -> httpx.Response:
+                   components: list | None = None,
+                   reply_to_message_id: str | None = None) -> httpx.Response:
         payload: dict = {}
         if content is not None:
             payload["content"] = content
@@ -37,6 +38,14 @@ class DiscordSender:
             payload["embeds"] = [embed]
         if components is not None:
             payload["components"] = components
+        if reply_to_message_id is not None:
+            # fail_if_not_exists=False so replying to a since-deleted message
+            # posts a normal message instead of hard-400ing. A reply the user
+            # cannot see the parent of still beats no reply.
+            payload["message_reference"] = {
+                "message_id": str(reply_to_message_id),
+                "fail_if_not_exists": False,
+            }
         resp = await self._client.post(
             f"{DISCORD_API}/channels/{channel_id}/messages",
             headers={"Authorization": f"Bot {self._bot_token}"},
@@ -80,16 +89,36 @@ class DiscordPost:
     """
     name = "discord.post"
     tool_spec = {
-        "description": "Send a message to Discord.",
+        "description": (
+            "Send a message to Discord. A Discord channel carries many people's "
+            "conversations at once and you are shown all of them as context, so "
+            "only post when a message is actually addressed to you — a mention, a "
+            "direct question, or a request that follows from one. When people are "
+            "talking among themselves, do not call this tool at all; read their "
+            "messages as context and stay silent. Posting a reply to something "
+            "not meant for you is worse than saying nothing."),
         "input_schema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "The message text."},
-                "channel_id": {"type": "string",
-                               "description": "Where to post. Omit for the "
-                                              "current conversation."},
+                "channel_id": {
+                    "type": "string",
+                    "description": "The channel or thread to post to. Use the "
+                                   "channel_id from the header of the message you "
+                                   "are answering, which is where that "
+                                   "conversation lives.",
+                },
+                "reply_to_message_id": {
+                    "type": "string",
+                    "description": "Optional. Attach your message as a reply "
+                                   "under a specific message: pass the message_id "
+                                   "from the header of the message you are "
+                                   "answering. In a busy channel this makes clear "
+                                   "who you are addressing; omit it for a "
+                                   "standalone message.",
+                },
             },
-            "required": ["content"],
+            "required": ["content", "channel_id"],
         },
     }
 
@@ -108,7 +137,8 @@ class DiscordPost:
         resp = await self._sender.send(channel,
                                        content=cmd.args.get("content"),
                                        embed=cmd.args.get("embed"),
-                                       components=cmd.args.get("components"))
+                                       components=cmd.args.get("components"),
+                                       reply_to_message_id=cmd.args.get("reply_to_message_id"))
         # Never trust the shape of the body, only that it parsed. A post we
         # merely could not read the id from is still a successful post.
         message_id = None
@@ -183,20 +213,32 @@ class DiscordHistory:
     tool_spec = {
         "description": (
             "Read earlier messages from a Discord channel or thread, oldest "
-            "first. Use this when you are mentioned partway into a thread and "
-            "the request refers to something you cannot see."),
+            "first. You are often brought into a conversation partway through "
+            "and shown only the message that summoned you. When the request "
+            "refers to something you cannot see — the header shows a "
+            "thread_messages count higher than what you were given, or the "
+            "message points back at earlier discussion — call this to read what "
+            "came before, then answer with that context. If the request stands "
+            "on its own, you do not need it."),
         "input_schema": {
             "type": "object",
             "properties": {
-                "channel_id": {"type": "string",
-                               "description": "The channel or thread to read."},
+                "channel_id": {
+                    "type": "string",
+                    "description": "The channel or thread to read. Use the "
+                                   "channel_id from the message header.",
+                },
                 "limit": {"type": "integer",
-                          "description": f"How many messages, 1-{HISTORY_MAX}. "
-                                         f"Defaults to {HISTORY_DEFAULT}."},
-                "before": {"type": "string",
-                           "description": "Only messages older than this message "
-                                          "id. Use it to skip messages you have "
-                                          "already seen."},
+                          "description": f"How many messages to read, 1-{HISTORY_MAX}. "
+                                         f"Defaults to {HISTORY_DEFAULT}, which "
+                                         f"covers most conversations."},
+                "before": {
+                    "type": "string",
+                    "description": "Optional. Read only messages older than this "
+                                   "message id — pass the message_id you are "
+                                   "answering to fetch the lead-up without "
+                                   "re-reading messages you already have.",
+                },
             },
             "required": ["channel_id"],
         },
