@@ -50,8 +50,26 @@ class DiscordSender:
 
 
 class DiscordPost:
-    """Actuator for the `discord.post` command: post a channel message."""
+    """Actuator for the `discord.post` command: post a channel or thread message.
+
+    The tool exposes the destination, so an agent may post wherever the bot can
+    reach. Deliberate for v1 (one private guild, trusted members); masking ids
+    behind configured names is a recorded, purely additive follow-up.
+    """
     name = "discord.post"
+    tool_spec = {
+        "description": "Send a message to Discord.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "The message text."},
+                "channel_id": {"type": "string",
+                               "description": "Where to post. Omit for the "
+                                              "current conversation."},
+            },
+            "required": ["content"],
+        },
+    }
 
     def __init__(self, bot_token, application_id, *, channel_id=None, client=None):
         self._token, self._app_id = bot_token, application_id
@@ -65,9 +83,16 @@ class DiscordPost:
 
     async def act(self, cmd, ctx):
         channel = cmd.args.get("channel_id") or self._default_channel
-        await self._sender.send(channel, embed=cmd.args.get("embed"),
-                                components=cmd.args.get("components"))
-        await ctx.result("ok", {"channel_id": channel})
+        resp = await self._sender.send(channel,
+                                       content=cmd.args.get("content"),
+                                       embed=cmd.args.get("embed"),
+                                       components=cmd.args.get("components"))
+        message_id = None
+        try:
+            message_id = resp.json().get("id")
+        except ValueError:
+            pass
+        await ctx.result("ok", {"channel_id": channel, "message_id": message_id})
 
     async def close(self):
         if self._sender is not None:
