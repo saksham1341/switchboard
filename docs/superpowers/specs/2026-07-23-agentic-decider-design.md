@@ -256,6 +256,10 @@ AgentDecider(tools=[web_search.tool_spec, reply.tool_spec, …], system=…)
 
 The agent's reachable surface = exactly the tools passed + the two memory tools it injects. **What the agent can touch is a config decision, not an emergent one.**
 
+**This is a correctness boundary as well as a security one, and it is trusted.** The wiring is responsible for binding an actuator for every tool it declares. Nothing verifies it at runtime, and nothing can cheaply: a command whose actuator was never registered is not *failing*, it is simply unconsumed — never retried, so never DEAD, so never announced by `sensor/deadletter`. There is no error to observe, only an absence.
+
+We accept that rather than defend against it. Verifying the claim would mean the decider inspecting live consumer groups, which couples it to the cmd log's membership and buys protection against a class of bug — mis-wiring in one function — that a single startup run surfaces immediately. So: **Switchboard is trusted to bind honestly.** The stuck-busy watchdog (§6.4) is the operational net if it ever does not.
+
 ---
 
 ## 8. Hallucinated tools
@@ -350,7 +354,7 @@ The obs log is at-least-once, so **every handler must be safe to run twice on th
 |---|---|---|---|
 | 1 | **crash-window double** | crash between `on_response` finishing and `_consume` marking → redelivered `llm.ok` re-emits the tool command. A second `web_search` (wasted) or a second `discord.reply` (**double post**). | `done:<command_id>` on non-idempotent actuators. **Reply first** — it's user-visible. |
 | 2 | **unbounded conversation** | `session:messages` grows every turn and rides in each `llm` payload — token cost + cmd-log size climb with length | truncation / summarization pass |
-| 3 | **misconfig ≠ dead-letter** | a configured tool with no actuator → command sits unconsumed forever (never retried → never DEAD → never announced); only the watchdog catches it | trusted config; watchdog is the net |
+| 3 | **a declared tool with no actuator** | the command is unconsumed, not failed — never retried, never DEAD, never announced. Not a defect to close: the wiring is **trusted to bind honestly** (§7.5). Listed so nobody mistakes the silence for a bug in the sensor. | not fixed — by design; watchdog is the net |
 | 4 | **tools re-sent every turn** | minor payload bloat | llm actuator holds defs; decider sends names |
 
 None are architectural. Each is "add a guard later."
