@@ -34,7 +34,8 @@ def _as_async(fn):
 class Bus:
     def __init__(self, mamamia_db_path, *, store=None, http=None,
                  default_timeout_s=30.0, wait_ms=30_000, reaper_interval=60.0,
-                 max_retries=10, max_log_messages=10_000, max_dead=500):
+                 max_retries=10, max_log_messages=10_000, max_dead=500,
+                 processed_ttl=3600.0):
         self._db = mamamia_db_path
         self._default_timeout_s = default_timeout_s
         self._wait_ms = wait_ms
@@ -42,6 +43,7 @@ class Bus:
         self._max_retries = max_retries
         self._max_log_messages = max_log_messages
         self._max_dead = max_dead
+        self._processed_ttl = processed_ttl
 
         self._instance = f"sb-{uuid.uuid4().hex}"
         self._sensors, self._deciders, self._actuators, self._taps = [], [], [], []
@@ -210,6 +212,14 @@ class Bus:
         if self._conn is not None:
             self._conn.close()
 
+    # at-least-once dedup: the same (group, msg.id) delivered twice runs once.
+    # Uses the Bus's own store, unscoped, keyed to keep it off role scopes.
+    async def _already_processed(self, group_id, mid) -> bool:
+        return await self._store.get(f"_processed:{group_id}:{mid}") is not None
+
+    async def _mark_processed(self, group_id, mid) -> None:
+        await self._store.set(f"_processed:{group_id}:{mid}", "1", ttl=self._processed_ttl)
+
     # generic consume loop shared by all consuming roles
     async def _consume(self, log, group_id, decode, keep, handle):
         orch = self._registry.get_orchestrator(log)
@@ -227,6 +237,9 @@ class Bus:
                     log, group_id, self._instance, duration=lease_s, wait_ms=self._wait_ms)
                 if msg is None:
                     continue
+                if await self._already_processed(group_id, msg.id):
+                    await settle(msg.id, Outcome.SUCCESS)   # redelivery of handled work
+                    continue
                 view = decode(msg)
                 if not keep(view):
                     await settle(msg.id, Outcome.SUCCESS)
@@ -234,6 +247,7 @@ class Bus:
                 try:
                     async with asyncio.timeout(timeout_s):
                         await handle(view)
+                    await self._mark_processed(group_id, msg.id)   # mark BEFORE settle
                     await settle(msg.id, Outcome.SUCCESS)
                 except asyncio.CancelledError:
                     raise
