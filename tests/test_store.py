@@ -126,6 +126,7 @@ async def test_purge_is_not_part_of_the_contract():
         async def get(self, key): return None
         async def set(self, key, value, *, ttl=None): pass
         async def delete(self, key): pass
+        async def keys(self, prefix=""): return []
 
     assert isinstance(Minimal(), KeyStore)      # satisfies the contract
     assert not hasattr(Minimal(), "purge")      # without purge
@@ -134,3 +135,30 @@ async def test_purge_is_not_part_of_the_contract():
 async def test_scoped_store_has_no_purge():
     """Purging is a whole-store operation, never a per-scope one."""
     assert not hasattr(ScopedStore(MemoryStore(), "sensor/x/"), "purge")
+
+
+async def test_keys_lists_under_a_prefix(store):
+    await store.set("a:1", "x"); await store.set("a:2", "y"); await store.set("b:1", "z")
+    assert sorted(await store.keys("a:")) == ["a:1", "a:2"]
+    assert sorted(await store.keys()) == ["a:1", "a:2", "b:1"]
+
+
+async def test_keys_omits_expired(store):
+    await store.set("k", "v", ttl=60.0)
+    store.clock.t += 61.0
+    assert await store.keys() == []
+
+
+async def test_keys_treats_sql_wildcards_literally(store):
+    """A key containing % or _ must not widen the match."""
+    await store.set("a%b", "1"); await store.set("axb", "2")
+    assert await store.keys("a%") == ["a%b"]
+
+
+async def test_scoped_keys_strip_the_scope():
+    """A role asks for keys and gets its own — never the scope prefix."""
+    inner = MemoryStore()
+    a = ScopedStore(inner, "actuator/kv/")
+    await a.set("draft", "x")
+    await inner.set("decider/other/secret", "y")
+    assert await a.keys() == ["draft"]          # not "actuator/kv/draft", not the sibling

@@ -20,16 +20,19 @@ def _check_value(value) -> None:
 
 @runtime_checkable
 class KeyStore(Protocol):
-    """get / set / delete, and nothing else.
+    """get / set / delete / keys, and nothing else.
 
     `purge` is deliberately absent: whether expiry needs a periodic sweep is an
     implementation detail. Sqlite and memory reclaim by sweeping; a Redis-backed
     store expires natively and would expose no purge. Callers ask for it, they
-    do not assume it.
+    do not assume it. `keys`, unlike purge, belongs on the contract: every
+    backend can list by prefix (dict iteration, sqlite LIKE, Redis SCAN), and
+    callers need it — an agent's memory has to be enumerable to be useful.
     """
     async def get(self, key: str) -> str | None: ...
     async def set(self, key: str, value: str, *, ttl: float | None = None) -> None: ...
     async def delete(self, key: str) -> None: ...
+    async def keys(self, prefix: str = "") -> list[str]: ...
 
 
 class MemoryStore:
@@ -60,6 +63,12 @@ class MemoryStore:
     async def delete(self, key):
         _check_key(key)
         self._data.pop(key, None)
+
+    async def keys(self, prefix: str = "") -> list[str]:
+        _check_key(prefix)
+        now = self._now()
+        return [k for k, (_, exp) in self._data.items()
+                if k.startswith(prefix) and (exp is None or exp > now)]
 
     def purge(self) -> int:
         now = self._now()
@@ -108,6 +117,15 @@ class SqliteStore:
         _check_key(key)
         self._conn.execute("DELETE FROM kv WHERE key = ?", (key,))
 
+    async def keys(self, prefix: str = "") -> list[str]:
+        _check_key(prefix)
+        like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        rows = self._conn.execute(
+            "SELECT key FROM kv WHERE key LIKE ? ESCAPE '\\' "
+            "AND (expires_at IS NULL OR expires_at > ?)",
+            (like, self._now())).fetchall()
+        return [r[0] for r in rows]
+
     def purge(self) -> int:
         """Delete expired rows. About disk, never about correctness."""
         return self._conn.execute(
@@ -137,3 +155,8 @@ class ScopedStore:
     async def delete(self, key):
         _check_key(key)
         await self._inner.delete(self._prefix + key)
+
+    async def keys(self, prefix: str = "") -> list[str]:
+        _check_key(prefix)
+        n = len(self._prefix)
+        return [k[n:] for k in await self._inner.keys(self._prefix + prefix)]

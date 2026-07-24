@@ -92,3 +92,25 @@ async def test_maintenance_timer_is_registered_and_started(tmp_path):
         await _wait(lambda: len(calls) >= 2)
     finally:
         await bus.stop()
+
+
+def test_kv_actuator_is_always_wired(tmp_path):
+    """Memory needs no key and no external call, so it ships with the platform
+    rather than waiting for the decider that will use it."""
+    bus, _ = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s", "port": 8131,
+    })
+    assert "kv" in bus.topology()["actuators"]
+
+
+def test_llm_actuator_is_not_wired(tmp_path):
+    """Registering it would put an API key and real spend in the deployment for
+    a feature nothing drives yet."""
+    bus, _ = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s", "port": 8132,
+    })
+    assert "llm" not in bus.topology()["actuators"]

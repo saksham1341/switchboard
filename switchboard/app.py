@@ -10,6 +10,7 @@ from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
 from switchboard.actuators.discord import DiscordPost, DiscordReply
+from switchboard.actuators.kv import KvActuator
 from switchboard.taps.logger import LoggerTap
 from switchboard.dashboard import Dashboard, DashboardTap
 
@@ -27,6 +28,13 @@ def build(config: dict):
     bus = Bus(config["mamamia_db_path"], store=store, http=http,
               max_log_messages=int(config.get("max_log_messages", 10_000)))
     bus.add_tap(LoggerTap())
+    # Memory, always available. No key, no cost, no external call — it is local
+    # storage over the store the Bus already holds, and it sits idle until
+    # something emits kv commands. Wired now so the backend is proven live
+    # before the decider that depends on it arrives. (The llm actuator stays
+    # unwired: registering it would put an API key and real spend in the
+    # deployment for a feature nothing drives yet.)
+    bus.add_actuator(KvActuator())
 
     sensors = [GitHubSensor(secret=config["github_secret"]),
                DeadLetterSensor(config["mamamia_db_path"])]
