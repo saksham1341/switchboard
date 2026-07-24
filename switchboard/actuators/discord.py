@@ -100,12 +100,13 @@ class DiscordPost:
         "input_schema": {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "The message text."},
+                "content": {"type": "string",
+                            "description": "Required. The message text."},
                 "channel_id": {
                     "type": "string",
-                    "description": "The channel or thread to post to. Use the "
-                                   "channel_id from the header of the message you "
-                                   "are answering, which is where that "
+                    "description": "Required. The channel or thread to post to. Use "
+                                   "the channel_id from the header of the message "
+                                   "you are answering, which is where that "
                                    "conversation lives.",
                 },
                 "reply_to_message_id": {
@@ -225,13 +226,14 @@ class DiscordHistory:
             "properties": {
                 "channel_id": {
                     "type": "string",
-                    "description": "The channel or thread to read. Use the "
-                                   "channel_id from the message header.",
+                    "description": "Required. The channel or thread to read. Use "
+                                   "the channel_id from the message header.",
                 },
                 "limit": {"type": "integer",
-                          "description": f"How many messages to read, 1-{HISTORY_MAX}. "
-                                         f"Defaults to {HISTORY_DEFAULT}, which "
-                                         f"covers most conversations."},
+                          "description": f"Optional. How many messages to read, "
+                                         f"1-{HISTORY_MAX}, as a bare integer (not "
+                                         f"a string). Defaults to {HISTORY_DEFAULT}, "
+                                         f"which covers most conversations."},
                 "before": {
                     "type": "string",
                     "description": "Optional. Read only messages older than this "
