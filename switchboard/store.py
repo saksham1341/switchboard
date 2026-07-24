@@ -20,6 +20,13 @@ def _check_value(value) -> None:
 
 @runtime_checkable
 class KeyStore(Protocol):
+    """get / set / delete, and nothing else.
+
+    `purge` is deliberately absent: whether expiry needs a periodic sweep is an
+    implementation detail. Sqlite and memory reclaim by sweeping; a Redis-backed
+    store expires natively and would expose no purge. Callers ask for it, they
+    do not assume it.
+    """
     async def get(self, key: str) -> str | None: ...
     async def set(self, key: str, value: str, *, ttl: float | None = None) -> None: ...
     async def delete(self, key: str) -> None: ...

@@ -5,6 +5,7 @@ from switchboard.bus import Bus
 from switchboard.http import HttpServer
 from switchboard.store import SqliteStore
 from switchboard.sensors.github import GitHubSensor
+from switchboard.sensors.deadletter import DeadLetterSensor
 from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
@@ -27,7 +28,8 @@ def build(config: dict):
               max_log_messages=int(config.get("max_log_messages", 10_000)))
     bus.add_tap(LoggerTap())
 
-    sensors = [GitHubSensor(secret=config["github_secret"])]
+    sensors = [GitHubSensor(secret=config["github_secret"]),
+               DeadLetterSensor(config["mamamia_db_path"])]
     for s in sensors:
         bus.add_sensor(s)
 
@@ -46,8 +48,14 @@ def build(config: dict):
                 channel_id=config["discord_github_notify_channel_id"]))
             bus.add_actuator(DiscordPost(token, app_id))
 
-    # Expired keys are already invisible to reads; this is only about disk.
-    bus.schedule_maintenance("store", 3600.0, store.purge)
+    # Expired keys are already invisible to reads, so this is only about
+    # reclaiming disk — and only some backends need it. Sqlite and memory stores
+    # sweep; a Redis-backed store expires natively and exposes no purge at all.
+    # purge is deliberately not part of the KeyStore contract, so ask rather than
+    # assume.
+    purge = getattr(store, "purge", None)
+    if purge is not None:
+        bus.schedule_maintenance("store", 3600.0, purge)
 
     # No token, no dashboard: fail closed rather than serving an unauthenticated
     # ingest endpoint. There is deliberately no default token.
