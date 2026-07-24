@@ -51,8 +51,12 @@ class DiscordSender:
         unraised — the caller decides which statuses are worth a retry, because
         a 403 is a fact to report to the agent while a 502 is worth retrying.
 
-        No gateway intent is involved: message_content gates gateway *events*,
-        not the REST API, which needs only Read Message History on the channel.
+        The REST endpoint is gated by the Read Message History permission on
+        the channel, not by a gateway intent — message_content only gates
+        gateway *events*. Beyond that permission check we have not verified
+        what a slash-commands-only deployment (no message_content) actually
+        gets back in `content` here; treat that as unconfirmed rather than
+        assumed-safe.
         """
         params: dict = {"limit": limit}
         if before is not None:

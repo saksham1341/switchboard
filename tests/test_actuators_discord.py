@@ -242,7 +242,7 @@ async def test_history_reports_a_permission_failure_rather_than_raising():
 async def test_history_raises_on_a_server_error_so_the_bus_retries():
     def handler(request):
         return httpx.Response(500, text="upstream boom")
-    with pytest.raises(Exception):
+    with pytest.raises(httpx.HTTPStatusError):
         await _run_history(_history_actuator(handler), {"channel_id": "222"})
 
 
@@ -275,3 +275,34 @@ def test_history_declares_a_tool_spec_with_before_and_limit():
     assert set(props) >= {"channel_id", "limit", "before"}
     assert DiscordHistory.tool_spec["input_schema"]["required"] == ["channel_id"]
     assert DiscordHistory.name == "discord.history"
+
+
+async def test_history_stringifies_an_integer_message_id():
+    # msgpack round-trips large ints lossily; ids must always come back as str.
+    def handler(request):
+        return httpx.Response(200, json=[{"id": 123456789012345678,
+                                          "author": {"username": "alice", "bot": False},
+                                          "content": "hi"}])
+    name, payload = await _run_history(_history_actuator(handler), {"channel_id": "222"})
+    assert name == "discord.history.ok"
+    assert payload["messages"][0]["id"] == "123456789012345678"
+    assert isinstance(payload["messages"][0]["id"], str)
+
+
+async def test_history_rejects_a_non_string_before_without_calling_discord():
+    def handler(request):
+        raise AssertionError("must not call Discord with a bad before")
+    name, payload = await _run_history(_history_actuator(handler),
+                                       {"channel_id": "222", "before": 999})
+    assert name == "discord.history.error"
+    assert "before" in payload["message"]
+
+
+async def test_history_rejects_a_bool_limit_without_calling_discord():
+    # bool is an int subclass; an unguarded clamp would silently turn True into 1.
+    def handler(request):
+        raise AssertionError("must not call Discord with a bool limit")
+    name, payload = await _run_history(_history_actuator(handler),
+                                       {"channel_id": "222", "limit": True})
+    assert name == "discord.history.error"
+    assert "limit" in payload["message"]

@@ -1,6 +1,8 @@
 import inspect, discord
+import pytest
 from starlette.testclient import TestClient
 from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
+from switchboard.store import MemoryStore
 
 
 async def _done():
@@ -134,11 +136,14 @@ def test_message_observation_outside_a_guild_has_no_guild_id():
     assert payload["guild_id"] is None
 
 
+def _ctx_with_store(emit):
+    return type("C", (), {"emit": staticmethod(emit), "store": MemoryStore()})()
+
+
 async def test_on_message_emits_for_a_human():
     emitted = []
     s = _sensor(messages=True)
-    s.ctx = type("C", (), {"emit": staticmethod(
-        lambda n, p: emitted.append((n, p)) or _done())})()
+    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
     await s._on_message(_FakeMessage(), bot_id=555)
     assert emitted and emitted[0][0] == "discord.message"
 
@@ -146,11 +151,60 @@ async def test_on_message_emits_for_a_human():
 async def test_on_message_ignores_bots_including_itself():
     emitted = []
     s = _sensor(messages=True)
-    s.ctx = type("C", (), {"emit": staticmethod(
-        lambda n, p: emitted.append((n, p)) or _done())})()
+    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
     await s._on_message(_FakeMessage(author=_FakeAuthor(uid=555, bot=True)), bot_id=555)
     await s._on_message(_FakeMessage(author=_FakeAuthor(uid=777, bot=True)), bot_id=555)
     assert emitted == []
+
+
+async def test_on_message_dedupes_a_replayed_message_id():
+    # Discord replays gateway events on RESUME; the same message id must not
+    # become a second observation.
+    emitted = []
+    s = _sensor(messages=True)
+    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    msg = _FakeMessage(mid=42)
+    await s._on_message(msg, bot_id=555)
+    await s._on_message(msg, bot_id=555)          # replay: same message id
+    assert len(emitted) == 1
+
+
+async def test_on_message_still_emits_a_different_message_id():
+    emitted = []
+    s = _sensor(messages=True)
+    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    await s._on_message(_FakeMessage(mid=1), bot_id=555)
+    await s._on_message(_FakeMessage(mid=2), bot_id=555)
+    assert len(emitted) == 2
+
+
+async def test_on_message_does_not_mark_seen_when_emit_raises():
+    # The invariant whose failure loses events silently: a failed emit must
+    # not write the seen-key, so a redelivered copy gets another chance.
+    calls = {"n": 0}
+
+    async def flaky_emit(n, p):
+        calls["n"] += 1
+        raise RuntimeError("boom")
+
+    s = _sensor(messages=True)
+    s.ctx = _ctx_with_store(flaky_emit)
+    msg = _FakeMessage(mid=99)
+    await s._on_message(msg, bot_id=555)           # swallowed, logged
+    assert await s.ctx.store.get("discord:message:99") is None
+    await s._on_message(msg, bot_id=555)           # not marked seen: tries again
+    assert calls["n"] == 2
+
+
+async def test_on_message_emit_failure_is_logged_at_error_level(caplog):
+    async def flaky_emit(n, p):
+        raise RuntimeError("boom")
+
+    s = _sensor(messages=True)
+    s.ctx = _ctx_with_store(flaky_emit)
+    with caplog.at_level("ERROR", logger="switchboard.sensors.discord"):
+        await s._on_message(_FakeMessage(mid=7), bot_id=555)
+    assert any("7" in r.message and r.levelname == "ERROR" for r in caplog.records)
 
 
 def test_messages_off_keeps_intents_none_and_registers_no_listener():

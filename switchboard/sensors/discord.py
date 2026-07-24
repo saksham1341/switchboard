@@ -1,8 +1,11 @@
 import inspect
+import logging
 from dataclasses import dataclass
 
 import discord
 from discord import app_commands
+
+logger = logging.getLogger(__name__)
 
 
 def _command_observation(command: str, interaction, options: dict) -> tuple[str, dict]:
@@ -78,10 +81,11 @@ class DiscordSensor:
 
     def __init__(self, bot_token: str, *,
                  commands: list[CommandSpec], guild_id: str | None = None,
-                 messages: bool = False):
+                 messages: bool = False, dedup_ttl: float = 7 * 86_400.0):
         self._token = bot_token
         self._guild_id = guild_id
         self.messages = messages
+        self._dedup_ttl = dedup_ttl
         self.ctx = None
         self._synced = False
 
@@ -174,8 +178,31 @@ class DiscordSensor:
         # and the failure would be a live spend, not a test failure.
         if message.author.bot:
             return
+
+        # Discord replays gateway events on RESUME; the Bus's dedup keys on the
+        # *log's* message id and cannot catch a re-emitted gateway event, so we
+        # dedupe on the gateway's own id the same way GitHubSensor dedupes on
+        # X-GitHub-Delivery: via ctx.store, with a TTL.
+        key = f"discord:message:{message.id}"
+        if await self.ctx.store.get(key) is not None:
+            return
+
         name, payload = _message_observation(message, bot_id)
-        await self.ctx.emit(name, payload)
+        # Emit first, record second: a crash (or a failed emit) in between costs
+        # a duplicate, the reverse order costs the event.
+        try:
+            await self.ctx.emit(name, payload)
+        except Exception:
+            # Nothing upstream can retry a gateway event: discord.py's dispatcher
+            # would otherwise swallow this into its default on_error (a bare
+            # traceback to stderr). Log it ourselves with the message id so a
+            # dropped message leaves a greppable, alertable trace, and do not
+            # mark it seen — a redelivered copy on the next RESUME gets another
+            # chance to succeed instead of being silently discarded forever.
+            logger.error("failed to emit discord.message for message_id=%s",
+                         message.id, exc_info=True)
+            return
+        await self.ctx.store.set(key, "1", ttl=self._dedup_ttl)
 
     def bind(self, ctx) -> None:
         self.ctx = ctx          # no routes; any timer waits for the gateway
