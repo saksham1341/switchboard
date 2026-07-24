@@ -46,14 +46,14 @@ async def test_ping_and_echo_emit_reply():
     obs = _obs("discord.command.ping", {"interaction_token": "tok"})
     assert p.subscribes(obs)
     await p.decide(obs, _ctx(obs, rec))
-    assert rec.cmds == [("discord.reply", {"interaction_token": "tok", "content": "pong (via the durable path)"})]
+    assert rec.cmds == [("discord.reply_to_command", {"interaction_token": "tok", "content": "pong (via the durable path)"})]
 
     rec2 = _Rec()
     e = EchoDecider()
     e.bind(DeciderCtx(store=MemoryStore()))
     obs2 = _obs("discord.command.echo", {"interaction_token": "t2", "options": {"message": "hi"}})
     await e.decide(obs2, _ctx(obs2, rec2))
-    assert rec2.cmds == [("discord.reply", {"interaction_token": "t2", "content": "hi"})]
+    assert rec2.cmds == [("discord.reply_to_command", {"interaction_token": "t2", "content": "hi"})]
 
 
 async def test_decider_ctx_store_is_scoped_and_usable():

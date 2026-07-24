@@ -1,6 +1,6 @@
 import asyncio, json, httpx
 import pytest
-from switchboard.actuators.discord import DiscordPost, DiscordReply, DISCORD_API
+from switchboard.actuators.discord import DiscordPost, DiscordReplyToCommand, DISCORD_API
 from switchboard.actuators.discord import DiscordHistory, HISTORY_DEFAULT, HISTORY_MAX
 from switchboard.message import Command, ActCtx, ActuatorCtx
 from switchboard.store import MemoryStore
@@ -45,24 +45,24 @@ async def test_discord_post_sends_embed_and_reports_result():
     assert results and results[0][0] == "discord.post.ok"
 
 
-async def test_discord_reply_uses_followup_and_reports_result():
+async def test_reply_to_command_uses_interaction_followup():
     seen, results = {}, []
     def h(req):
         seen["url"] = str(req.url); seen["body"] = json.loads(req.content)
         seen["auth"] = req.headers.get("authorization")
         return httpx.Response(200, json={})
-    a = _bind(DiscordReply("bot", "app", client=_client(h)))
-    ctx = ActCtx(cmd=_cmd("discord.reply", {"interaction_token": "tok", "content": "pong"}),
+    a = _bind(DiscordReplyToCommand("bot", "app", client=_client(h)))
+    ctx = ActCtx(cmd=_cmd("discord.reply_to_command", {"interaction_token": "tok", "content": "pong"}),
                  _emit_result=await _recorder(results))
     await a.act(ctx.cmd, ctx)
     assert seen["url"] == f"{DISCORD_API}/webhooks/app/tok"
     assert seen["body"] == {"content": "pong"}
     assert seen["auth"] is None
-    assert results and results[0][0] == "discord.reply.ok"
+    assert results and results[0][0] == "discord.reply_to_command.ok"
 
 
 async def test_actuator_ctx_store_is_available_after_bind():
-    a = _bind(DiscordReply("bot", "app", client=_client(lambda r: httpx.Response(200, json={}))))
+    a = _bind(DiscordReplyToCommand("bot", "app", client=_client(lambda r: httpx.Response(200, json={}))))
     await a.ctx.store.set("idem:cmd-1", "sent")
     assert await a.ctx.store.get("idem:cmd-1") == "sent"
 

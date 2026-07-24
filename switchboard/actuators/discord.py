@@ -4,13 +4,16 @@ DISCORD_API = "https://discord.com/api/v10"
 
 
 class DiscordSender:
-    """The Discord connector's two send paths, both plain HTTP (no gateway):
+    """The Discord connector's HTTP send paths (no gateway). Two of them, and
+    the names matter because they are easy to confuse:
 
-    - reply(): an interaction *followup* — POST to the interaction webhook, which
-      needs only the application id + interaction token (no bot auth) and is valid
-      for 15 minutes. This is how a slash command's result reaches the user.
-    - send(): a channel message via the bot REST API (Bot-token auth), with no
-      time window — for work that outlives the interaction, and for notifications.
+    - interaction_followup(): the reply to a slash-*command* interaction — POST
+      to the interaction webhook, which needs only the application id +
+      interaction token (no bot auth) and is valid for 15 minutes. NOT a reply
+      to a message; it is how a slash command's result reaches the user.
+    - send(): an ordinary channel message via the bot REST API (Bot-token auth),
+      with no time window — for work that outlives the interaction, for
+      notifications, and (with reply_to_message_id) for replying to a message.
     """
 
     def __init__(self, bot_token: str, application_id: str, *,
@@ -19,7 +22,7 @@ class DiscordSender:
         self._application_id = str(application_id)
         self._client = client or httpx.AsyncClient(timeout=10.0)
 
-    async def reply(self, interaction_token: str, content: str) -> httpx.Response:
+    async def interaction_followup(self, interaction_token: str, content: str) -> httpx.Response:
         resp = await self._client.post(
             f"{DISCORD_API}/webhooks/{self._application_id}/{interaction_token}",
             json={"content": content},
@@ -156,9 +159,17 @@ class DiscordPost:
             await self._sender.close()
 
 
-class DiscordReply:
-    """Actuator for the `discord.reply` command: interaction followup (model A)."""
-    name = "discord.reply"
+class DiscordReplyToCommand:
+    """Actuator for the `discord.reply_to_command` command: the response to a
+    slash-command interaction, delivered as an interaction followup.
+
+    Named for what it does. It is NOT the agent's message-reply — that is
+    `discord.post` with `reply_to_message_id`. This one answers a `/ping` or
+    `/echo`, keyed by the interaction token the slash-command sensor captured,
+    and carries no `tool_spec`: only the command deciders emit it, never the
+    agent.
+    """
+    name = "discord.reply_to_command"
 
     def __init__(self, bot_token, application_id, *, client=None):
         self._token, self._app_id = bot_token, application_id
@@ -170,7 +181,8 @@ class DiscordReply:
         self._sender = DiscordSender(self._token, self._app_id, client=self._client)
 
     async def act(self, cmd, ctx):
-        await self._sender.reply(cmd.args["interaction_token"], cmd.args["content"])
+        await self._sender.interaction_followup(
+            cmd.args["interaction_token"], cmd.args["content"])
         await ctx.result("ok")
 
     async def close(self):

@@ -10,7 +10,7 @@ from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
 from switchboard.deciders.agent import AgentDecider
-from switchboard.actuators.discord import DiscordPost, DiscordReply, DiscordHistory
+from switchboard.actuators.discord import DiscordPost, DiscordReplyToCommand, DiscordHistory
 from switchboard.actuators.kv import KvActuator
 from switchboard.actuators.llm import LlmActuator
 from switchboard.actuators.llm.backends.anthropic import AnthropicBackend
@@ -85,7 +85,7 @@ def build(config: dict):
                                        guild_id=config.get("discord_guild_id"))
         bus.add_sensor(discord_sensor); sensors.append(discord_sensor)
         bus.add_decider(PingDecider()); bus.add_decider(EchoDecider())
-        bus.add_actuator(DiscordReply(token, app_id))
+        bus.add_actuator(DiscordReplyToCommand(token, app_id))
         # Registered whenever Discord is wired: it reads
         # over REST and needs no intent, and Phase 4 hands its tool_spec to the
         # agent. Idle until something emits the command.

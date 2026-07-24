@@ -1,4 +1,4 @@
-"""Deciders for Discord slash commands: observation (discord.command.*) -> command (discord.reply)."""
+"""Deciders for Discord slash commands: observation (discord.command.*) -> command (discord.reply_to_command)."""
 from switchboard.message import DecideCtx, Observation
 
 
@@ -12,7 +12,7 @@ class PingDecider:
         return obs.name == "discord.command.ping"
 
     async def decide(self, obs: Observation, ctx: DecideCtx) -> None:
-        await ctx.command("discord.reply", {
+        await ctx.command("discord.reply_to_command", {
             "interaction_token": obs.payload["interaction_token"],
             "content": "pong (via the durable path)",
         })
@@ -28,7 +28,7 @@ class EchoDecider:
         return obs.name == "discord.command.echo"
 
     async def decide(self, obs: Observation, ctx: DecideCtx) -> None:
-        await ctx.command("discord.reply", {
+        await ctx.command("discord.reply_to_command", {
             "interaction_token": obs.payload["interaction_token"],
             "content": obs.payload.get("options", {}).get("message", ""),
         })

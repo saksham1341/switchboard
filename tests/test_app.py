@@ -25,7 +25,7 @@ def test_build_github_only(tmp_path):
     assert any(isinstance(s, GitHubSensor) for s in sensors)
     assert not any(isinstance(s, DiscordSensor) for s in sensors)
     names = {a.name for a in bus._actuators}
-    assert "discord.post" not in names and "discord.reply" not in names
+    assert "discord.post" not in names and "discord.reply_to_command" not in names
     assert any(t.name == "logger" for t in bus._taps)
 
 
@@ -34,7 +34,7 @@ def test_build_wires_discord_and_relay(tmp_path):
                              "discord_github_notify_channel_id": "chan-9"}
     bus, sensors = build(cfg)
     assert any(isinstance(s, DiscordSensor) for s in sensors)
-    assert {"discord.post", "discord.reply"} <= {a.name for a in bus._actuators}
+    assert {"discord.post", "discord.reply_to_command"} <= {a.name for a in bus._actuators}
     assert {"ping", "echo", "github-notify"} <= {d.name for d in bus._deciders}
 
 
@@ -50,7 +50,7 @@ def test_relay_decider_absent_without_notify_channel(tmp_path):
     bus, _ = build(cfg)
     dnames = {d.name for d in bus._deciders}
     assert "ping" in dnames and "github-notify" not in dnames
-    assert "discord.reply" in {a.name for a in bus._actuators}
+    assert "discord.reply_to_command" in {a.name for a in bus._actuators}
     assert "discord.post" not in {a.name for a in bus._actuators}
 
 
@@ -225,7 +225,7 @@ def test_discord_post_is_registered_once_even_with_notify_and_agent_both_set(tmp
     names = [a.name for a in bus._actuators]
     assert names.count("discord.post") == 1
     assert names.count("discord.history") == 1
-    assert names.count("discord.reply") == 1
+    assert names.count("discord.reply_to_command") == 1
 
 
 def test_agent_topology_lists_the_agent_decider(tmp_path):
