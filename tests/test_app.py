@@ -130,6 +130,27 @@ def test_discord_messages_opt_in_is_honoured(tmp_path):
     assert sensor.messages is True
 
 
+def test_discord_history_actuator_is_wired_with_discord(tmp_path):
+    from switchboard.app import build
+    bus, _ = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s", "port": 8133,
+        "discord_bot_token": "t", "discord_application_id": "1",
+    })
+    assert "discord.history" in {a.name for a in bus._actuators}
+
+
+def test_no_discord_means_no_history_actuator(tmp_path):
+    from switchboard.app import build
+    bus, _ = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s", "port": 8134,
+    })
+    assert "discord.history" not in {a.name for a in bus._actuators}
+
+
 def test_llm_actuator_is_not_wired(tmp_path):
     """Registering it would put an API key and real spend in the deployment for
     a feature nothing drives yet."""

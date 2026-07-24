@@ -9,7 +9,7 @@ from switchboard.sensors.deadletter import DeadLetterSensor
 from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
-from switchboard.actuators.discord import DiscordPost, DiscordReply
+from switchboard.actuators.discord import DiscordPost, DiscordReply, DiscordHistory
 from switchboard.actuators.kv import KvActuator
 from switchboard.taps.logger import LoggerTap
 from switchboard.dashboard import Dashboard, DashboardTap
@@ -52,6 +52,10 @@ def build(config: dict):
         bus.add_sensor(discord_sensor); sensors.append(discord_sensor)
         bus.add_decider(PingDecider()); bus.add_decider(EchoDecider())
         bus.add_actuator(DiscordReply(token, app_id))
+        # Registered whenever Discord is wired, not gated on messages=: it reads
+        # over REST and needs no intent, and Phase 4 hands its tool_spec to the
+        # agent. Idle until something emits the command.
+        bus.add_actuator(DiscordHistory(token, app_id))
         if config.get("discord_github_notify_channel_id"):
             bus.add_decider(GitHubNotifyDecider(
                 channel_id=config["discord_github_notify_channel_id"]))
