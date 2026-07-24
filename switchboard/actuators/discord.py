@@ -169,7 +169,14 @@ class DiscordPost:
             body = None
         if isinstance(body, dict):
             message_id = body.get("id")
-        await ctx.result("ok", {"channel_id": channel, "message_id": message_id})
+        # `delivered_by: "you"` is the fix for the self-conversation loop: the
+        # result hands back the id of the message the bot just sent, and without
+        # marking it as the bot's own the model would grab that id and react to,
+        # or reply to, its own post — not realising it was itself. Correct
+        # attribution of a tool result to the actor is what the role tag cannot
+        # carry (the API forces every tool_result into a user-role container).
+        await ctx.result("ok", {"delivered_by": "you", "channel_id": channel,
+                                "message_id": message_id})
 
     async def close(self):
         if self._sender is not None:
@@ -235,8 +242,10 @@ class DiscordReact:
         if resp.status_code >= 400:
             return await ctx.result("error", {"message": _error_message(resp),
                                               "status": resp.status_code})
-        # Success is 204 No Content — there is no body to read.
-        await ctx.result("ok", {"channel_id": args["channel_id"],
+        # Success is 204 No Content — there is no body to read. `reacted_by:
+        # "you"` marks the action as the bot's own, same reason as discord.post.
+        await ctx.result("ok", {"reacted_by": "you",
+                                "channel_id": args["channel_id"],
                                 "message_id": args["message_id"],
                                 "emoji": args["emoji"]})
 

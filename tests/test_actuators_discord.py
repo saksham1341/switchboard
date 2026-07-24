@@ -90,7 +90,7 @@ async def test_discord_post_returns_the_message_id():
     ctx = ActCtx(cmd=_cmd("discord.post", {"content": "hi"}),
                  _emit_result=await _recorder(results))
     await a.act(ctx.cmd, ctx)
-    assert results[0][1] == {"channel_id": "chan-9", "message_id": "m-7"}
+    assert results[0][1] == {"delivered_by": "you", "channel_id": "chan-9", "message_id": "m-7"}
 
 
 async def test_explicit_channel_id_wins_over_the_default():
@@ -127,7 +127,7 @@ async def test_non_object_json_body_still_reports_ok():
                  _emit_result=await _recorder(results))
     await a.act(ctx.cmd, ctx)
     assert results[0][0] == "discord.post.ok"
-    assert results[0][1] == {"channel_id": "chan-9", "message_id": None}
+    assert results[0][1] == {"delivered_by": "you", "channel_id": "chan-9", "message_id": None}
 
 
 async def test_non_json_body_still_reports_ok():
@@ -380,7 +380,7 @@ async def test_react_puts_the_reaction_and_reports_ok():
     assert "/channels/222/messages/42/reactions/" in seen["url"]
     assert seen["url"].endswith("/@me")
     assert name == "discord.react.ok"
-    assert payload == {"channel_id": "222", "message_id": "42", "emoji": "\U0001f44d"}
+    assert payload == {"reacted_by": "you", "channel_id": "222", "message_id": "42", "emoji": "\U0001f44d"}
 
 
 async def test_react_missing_field_is_a_reported_error_without_calling_discord():
