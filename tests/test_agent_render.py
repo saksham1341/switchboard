@@ -166,3 +166,10 @@ def test_header_carries_the_message_id_for_replies():
     # gets everything it acts on.
     out = render_message(_payload(message_id="789"))
     assert "message_id=789" in out.splitlines()[0]
+
+
+def test_header_carries_user_id_for_mentions():
+    # A real Discord ping is <@user_id>; the model needs the id, not just the
+    # display name, and the header is where it gets everything it acts on.
+    out = render_message(_payload(user_id="669491511791976458"))
+    assert "user_id=669491511791976458" in out.splitlines()[0]

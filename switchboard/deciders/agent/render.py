@@ -99,7 +99,12 @@ def render_message(payload: dict) -> str:
 
     bits = [f"channel_id={_sanitize_header_field(payload.get('channel_id'))}",
             f"message_id={_sanitize_header_field(payload.get('message_id'))}",
-            f"user={_sanitize_header_field(payload.get('user_name'))}"]
+            f"user={_sanitize_header_field(payload.get('user_name'))}",
+            # user_id is what a real Discord mention needs: <@user_id>. Without
+            # it in the header the model has only the display name and can only
+            # write plain text. The discord.post tool description tells it the
+            # syntax.
+            f"user_id={_sanitize_header_field(payload.get('user_id'))}"]
     if payload.get("thread_id"):
         bits.insert(1, f"thread_id={_sanitize_header_field(payload.get('thread_id'))}")
         count = thread.get("message_count")

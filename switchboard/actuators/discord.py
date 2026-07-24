@@ -116,7 +116,11 @@ class DiscordPost:
             "direct question, or a request that follows from one. When people are "
             "talking among themselves, do not call this tool at all; read their "
             "messages as context and stay silent. Posting a reply to something "
-            "not meant for you is worse than saying nothing."),
+            "not meant for you is worse than saying nothing. "
+            "To mention (ping) a person, write <@user_id> using the user_id from "
+            "that person's message header — e.g. <@669491511791976458>, never "
+            "their plain name. Only do this when a ping is warranted; addressing "
+            "someone by name in prose is fine and usually better."),
         "input_schema": {
             "type": "object",
             "properties": {
