@@ -160,3 +160,78 @@ def test_llm_actuator_is_not_wired(tmp_path):
         "github_secret": "s", "port": 8132,
     })
     assert "llm" not in bus.topology()["actuators"]
+
+
+def test_no_anthropic_key_means_no_agent_and_no_llm(tmp_path):
+    from switchboard.app import build
+    bus, _ = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s", "port": 8141,
+        "discord_bot_token": "t", "discord_application_id": "1",
+    })
+    assert "llm" not in {a.name for a in bus._actuators}
+    assert "agent" not in {d.name for d in bus._deciders}
+
+
+def test_the_agent_is_wired_when_the_key_and_discord_are_present(tmp_path):
+    from switchboard.app import build
+    bus, _ = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s", "port": 8142,
+        "discord_bot_token": "t", "discord_application_id": "1",
+        "anthropic_api_key": "sk-test",
+    })
+    assert "llm" in {a.name for a in bus._actuators}
+    agent = next(d for d in bus._deciders if d.name == "agent")
+    names = {t["name"] for t in agent._tools}
+    assert names == {"discord.post", "discord.history"}
+
+
+def test_the_agent_needs_discord_not_just_a_key(tmp_path):
+    # Wiring the agent without its tools would give it a tool list naming
+    # actuators nobody bound - spec 7.5's trusted-binding assumption broken
+    # by our own wiring.
+    from switchboard.app import build
+    bus, _ = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s", "port": 8143,
+        "anthropic_api_key": "sk-test",
+    })
+    assert "agent" not in {d.name for d in bus._deciders}
+
+
+def test_discord_post_is_registered_once_even_with_notify_and_agent_both_set(tmp_path):
+    # The trap: discord.post is wanted by both the github-notify branch and
+    # the agent branch. Registering it twice would create two consumer groups
+    # for one command name, and every discord.post command would be handled -
+    # and posted - twice.
+    from switchboard.app import build
+    bus, _ = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s", "port": 8144,
+        "discord_bot_token": "t", "discord_application_id": "1",
+        "discord_github_notify_channel_id": "chan-9",
+        "anthropic_api_key": "sk-test",
+    })
+    names = [a.name for a in bus._actuators]
+    assert names.count("discord.post") == 1
+    assert names.count("discord.history") == 1
+    assert names.count("discord.reply") == 1
+
+
+def test_agent_topology_lists_the_agent_decider(tmp_path):
+    # The dashboard draws the real graph from topology(), so the agent must
+    # be visible there once wired.
+    from switchboard.app import build
+    bus, _ = build({
+        "mamamia_db_path": str(tmp_path / "mm.db"),
+        "switchboard_db_path": str(tmp_path / "sb.db"),
+        "github_secret": "s", "port": 8145,
+        "discord_bot_token": "t", "discord_application_id": "1",
+        "anthropic_api_key": "sk-test",
+    })
+    assert "agent" in bus.topology()["deciders"]

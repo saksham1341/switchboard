@@ -9,8 +9,10 @@ from switchboard.sensors.deadletter import DeadLetterSensor
 from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
+from switchboard.deciders.agent import AgentDecider
 from switchboard.actuators.discord import DiscordPost, DiscordReply, DiscordHistory
 from switchboard.actuators.kv import KvActuator
+from switchboard.actuators.llm import LlmActuator
 from switchboard.taps.logger import LoggerTap
 from switchboard.dashboard import Dashboard, DashboardTap
 
@@ -55,11 +57,43 @@ def build(config: dict):
         # Registered whenever Discord is wired, not gated on messages=: it reads
         # over REST and needs no intent, and Phase 4 hands its tool_spec to the
         # agent. Idle until something emits the command.
-        bus.add_actuator(DiscordHistory(token, app_id))
+        history = DiscordHistory(token, app_id)
+        bus.add_actuator(history)
+
+        # DiscordPost is wanted by two independent branches below - the
+        # github-notify relay and the agent's tool list. Construct and register
+        # it at most once, whichever branch needs it first: the command name
+        # "discord.post" must map to exactly one actuator, because the Bus
+        # gives each *registration* its own consumer group filtered on that
+        # name (see Bus._act). Adding it twice would create two consumer
+        # groups for one command name, and every discord.post command would
+        # be handled - and posted - twice.
+        post = None
+
+        def _discord_post():
+            nonlocal post
+            if post is None:
+                post = DiscordPost(token, app_id)
+                bus.add_actuator(post)
+            return post
+
         if config.get("discord_github_notify_channel_id"):
             bus.add_decider(GitHubNotifyDecider(
                 channel_id=config["discord_github_notify_channel_id"]))
-            bus.add_actuator(DiscordPost(token, app_id))
+            _discord_post()
+
+        # The agent is wired only with BOTH a key and Discord: its tool list is
+        # a promise that every named tool has a bound actuator (spec 7.5), and
+        # the wiring is what keeps that promise. A key alone would hand it tools
+        # that reach nothing - a command nobody consumes never fails, it simply
+        # hangs, which is the one failure mode with no error to observe.
+        if config.get("anthropic_api_key"):
+            agent_post = _discord_post()
+            bus.add_actuator(LlmActuator(config["anthropic_api_key"]))
+            bus.add_decider(AgentDecider(tools=[
+                agent_post.tool_spec | {"name": agent_post.name},
+                history.tool_spec | {"name": history.name},
+            ]))
 
     # Expired keys are already invisible to reads, so this is only about
     # reclaiming disk — and only some backends need it. Sqlite and memory stores
@@ -100,6 +134,7 @@ async def run() -> None:
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
         "discord_github_notify_channel_id": os.environ.get("DISCORD_GITHUB_NOTIFY_CHANNEL_ID"),
         "discord_messages": os.environ.get("DISCORD_MESSAGES", "").lower() in ("1", "true", "yes"),
+        "anthropic_api_key": os.environ.get("ANTHROPIC_API_KEY"),
         "dashboard_token": os.environ.get("SB_DASHBOARD_TOKEN"),
         "dashboard_ingest_url": os.environ.get(
             "SB_DASHBOARD_INGEST_URL",

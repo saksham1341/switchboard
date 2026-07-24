@@ -20,6 +20,10 @@ services:
       # gateway refuses the connection otherwise. Unset = slash commands only.
       DISCORD_MESSAGES: ${DISCORD_MESSAGES:-}
 
+      # --- Agent ---
+      # The agentic decider is wired only when this AND Discord are set.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
       # --- Dashboard ---
       # Set a token to enable the live dashboard; unset = no dashboard at all.
       # It serves on the main port, so the public tunnel reaches it. The page is
