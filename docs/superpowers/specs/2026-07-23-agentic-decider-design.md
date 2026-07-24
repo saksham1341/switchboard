@@ -336,6 +336,8 @@ Two guards live in the sensor: the **cascade guard** (never announce a dead `swi
 
 It is also the first real consumer of the `Scheduler`, and it lets the dashboard drop its own 5s `message_state` poll — one poller, many subscribers.
 
+**The polling is not a commitment.** The sensor's contract to everything else is only *"emits `switchboard.deadletter`"*; how it learns of a dead letter is private to one file. If mamamia ever exposes dead-letter notifications, this becomes a **composite sensor** — push for immediacy, the sweep retained as a reconcile backstop — which is exactly the shape `SensorCtx` was built for, with `http` for push and `schedule` for pull. The announced-set already makes the two paths idempotent against each other, so the sweep demotes from primary to safety net rather than being deleted. No consumer changes: not the agent's gather, not the dashboard, not an alerting decider. Had this been Bus code in `_consume`, the same migration would be core surgery.
+
 ## 11. The at-least-once principle
 
 The obs log is at-least-once, so **every handler must be safe to run twice on the same observation.** With §10.1 in place, that safety is provided generically at `_consume` — handlers are written straight, and semantic idempotency (`done:<command_id>`) is added back *only* where a crash-window double is expensive (see §12, hole 1). **Deferred for v1** by decision — we solve it at the framework level first, and add semantic guards later, one layer at a time.
