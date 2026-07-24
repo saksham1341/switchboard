@@ -11,7 +11,7 @@ from mamamia.server.transaction import SQLiteTransaction
 from mamamia.server.registry import LogRegistry
 
 from switchboard.backoff import backoff
-from switchboard.errors import PermanentError
+from switchboard.errors import PermanentError, RetryableError
 from switchboard.http import HttpServer
 from switchboard.message import (
     OBS_LOG, CMD_LOG, Observation, Command, DecideCtx, ActCtx,
@@ -257,6 +257,13 @@ class Bus:
                     raise
                 except PermanentError:
                     await settle(msg.id, Outcome.DEAD)
+                except RetryableError as e:
+                    # The handler knows the delay (e.g. a 429's retry-after); use
+                    # it. None means "retry, but you pick when" → same as any
+                    # plain exception below.
+                    attempts = await orch.state_store.get_retry_count(log, group_id, msg.id)
+                    delay = e.retry_after if e.retry_after is not None else backoff(attempts)
+                    await settle(msg.id, Outcome.RETRY, retry_after=delay)
                 except Exception:
                     attempts = await orch.state_store.get_retry_count(log, group_id, msg.id)
                     await settle(msg.id, Outcome.RETRY, retry_after=backoff(attempts))

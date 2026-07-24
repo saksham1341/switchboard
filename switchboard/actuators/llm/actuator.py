@@ -7,6 +7,7 @@ The actuator owns the contract and the error discipline; a backend owns one
 provider's wire format. That split is what lets a provider change without the
 decider, the logs, or a single test moving.
 """
+import re
 from typing import Protocol, runtime_checkable
 
 # A 4xx normally means "do not retry" — the provider explained what is wrong and
@@ -18,9 +19,46 @@ from typing import Protocol, runtime_checkable
 #        message unanswered when a retry seconds later would have worked.
 #   408  the provider timed out reading the request. Same story.
 #
-# The Bus's backoff (1s, 1.1s, 2.9s, 4.3s, 13.8s, 31.3s, ...) crosses a typical
-# per-minute rate window well inside max_retries.
+# On a transient status the backend raises RetryableError carrying the provider's
+# own retry-after; the Bus honours it. Blind exponential backoff fires early
+# retries so close together that a large call re-exhausts the very token budget
+# it is waiting on — the provider's header is the delay that actually works.
 TRANSIENT_STATUS = frozenset({408, 429})
+
+_RETRY_CAP = 120.0     # never wait longer than this on a provider's say-so
+_DUR_UNITS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def _duration_seconds(s):
+    """Parse a plain number of seconds ("2", "2.5") or a compound duration
+    string ("205ms", "1m26.4s") into float seconds, or None."""
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        return float(s)              # bare seconds — the standard Retry-After form
+    except ValueError:
+        pass
+    parts = re.findall(r"([0-9.]+)\s*(ms|s|m|h)", s)
+    if not parts:
+        return None
+    return sum(float(n) * _DUR_UNITS[u] for n, u in parts)
+
+
+def parse_retry_after(resp):
+    """The delay a rate-limited response tells us to wait, capped, or None.
+
+    Prefers the standard `Retry-After` header; falls back to the token-window
+    reset some providers surface (Groq's `x-ratelimit-reset-tokens`, often
+    sub-second). None → the caller lets the Bus pick its own backoff.
+    """
+    headers = getattr(resp, "headers", {})
+    val = _duration_seconds(headers.get("retry-after"))
+    if val is None:
+        val = _duration_seconds(headers.get("x-ratelimit-reset-tokens"))
+    if val is None:
+        return None
+    return max(0.0, min(val, _RETRY_CAP))
 
 
 class LlmError(Exception):

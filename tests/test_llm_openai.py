@@ -1,4 +1,5 @@
 import json
+from switchboard.errors import RetryableError
 
 import httpx
 import pytest
@@ -334,7 +335,7 @@ async def test_5xx_raises_for_status_so_the_bus_retries():
     def handler(request):
         return httpx.Response(502, text="bad gateway")
     b = _backend(handler)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(RetryableError):
         await b.complete({"model": "m", "messages": []})
     await b.close()
 
@@ -364,6 +365,41 @@ async def test_transient_4xx_propagates_for_retry(status):
     def handler(request):
         return httpx.Response(status, json={"error": {"message": "rate limited"}})
     b = _backend(handler)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(RetryableError):
         await b.complete({"model": "m", "messages": []})
+    await b.close()
+
+
+# --- retry-after: honour the provider's delay ---------------------------------
+
+async def test_429_carries_the_retry_after_from_the_header():
+    def handler(request):
+        return httpx.Response(429, json={"error": {"message": "slow down"}},
+                              headers={"retry-after": "2.5"})
+    b = _backend(handler)
+    with pytest.raises(RetryableError) as e:
+        await b.complete({"model": "m", "messages": []})
+    assert e.value.retry_after == 2.5
+    await b.close()
+
+
+async def test_429_falls_back_to_ratelimit_reset_tokens():
+    def handler(request):
+        return httpx.Response(429, json={"error": {"message": "slow down"}},
+                              headers={"x-ratelimit-reset-tokens": "205ms"})
+    b = _backend(handler)
+    with pytest.raises(RetryableError) as e:
+        await b.complete({"model": "m", "messages": []})
+    assert abs(e.value.retry_after - 0.205) < 1e-6
+    await b.close()
+
+
+async def test_transient_without_a_header_leaves_retry_after_none():
+    # None means "Bus, you pick the backoff" — same as any plain exception.
+    def handler(request):
+        return httpx.Response(429, json={"error": {"message": "slow"}})
+    b = _backend(handler)
+    with pytest.raises(RetryableError) as e:
+        await b.complete({"model": "m", "messages": []})
+    assert e.value.retry_after is None
     await b.close()

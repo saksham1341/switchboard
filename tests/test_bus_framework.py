@@ -20,9 +20,11 @@ class _SS:
 class _Orch:
     def __init__(self, retry_count=0):
         self.settled = []
+        self.retry_afters = []
         self.state_store = _SS(retry_count)
     async def settle(self, log, group, mid, inst, *, outcome, retry_after=0.0):
         self.settled.append((mid, outcome))
+        self.retry_afters.append(retry_after)
 
 
 class _Reg:
@@ -110,3 +112,43 @@ async def test_bus_dedup_lives_in_its_own_scope():
 
     role = ScopedStore(store, "actuator/x/")
     assert await role.get("_bus/processed:actuator/x:5") is None   # unreachable
+
+
+async def test_permanent_error_is_dead_not_retried():
+    from switchboard.errors import PermanentError as PE
+    orch = _Orch()
+    bus = _drive([_Msg(5, "boom")], orch)
+    async def handle(v): raise PE("nope")
+    await bus._consume(CMD_LOG, "actuator/boom", Command.from_message, lambda v: True, handle)
+    assert orch.settled == [(5, Outcome.DEAD)]
+
+
+async def test_retryable_error_honours_its_retry_after():
+    from switchboard.errors import RetryableError
+    orch = _Orch(retry_count=0)
+    bus = _drive([_Msg(5, "boom")], orch)
+    async def handle(v): raise RetryableError("slow down", retry_after=2.5)
+    await bus._consume(CMD_LOG, "actuator/boom", Command.from_message, lambda v: True, handle)
+    assert orch.settled == [(5, Outcome.RETRY)]
+    assert orch.retry_afters == [2.5]                 # the provider's delay, not backoff
+
+
+async def test_retryable_error_without_delay_falls_back_to_backoff():
+    from switchboard.errors import RetryableError
+    from switchboard.backoff import backoff
+    orch = _Orch(retry_count=3)                        # so backoff(3) is deterministic-ish
+    bus = _drive([_Msg(5, "boom")], orch)
+    async def handle(v): raise RetryableError("slow", retry_after=None)
+    await bus._consume(CMD_LOG, "actuator/boom", Command.from_message, lambda v: True, handle)
+    assert orch.settled == [(5, Outcome.RETRY)]
+    # jittered, so just assert it's a positive Bus-chosen delay, not the 0.0 default
+    assert orch.retry_afters[0] > 0
+
+
+async def test_plain_exception_uses_bus_backoff():
+    orch = _Orch(retry_count=2)
+    bus = _drive([_Msg(5, "boom")], orch)
+    async def handle(v): raise ValueError("whatever")
+    await bus._consume(CMD_LOG, "actuator/boom", Command.from_message, lambda v: True, handle)
+    assert orch.settled == [(5, Outcome.RETRY)]
+    assert orch.retry_afters[0] > 0

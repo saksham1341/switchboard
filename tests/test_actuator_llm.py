@@ -1,4 +1,5 @@
 import httpx
+from switchboard.errors import RetryableError
 import pytest
 
 from switchboard.actuators.llm import LlmActuator, LlmError
@@ -172,7 +173,7 @@ async def test_anthropic_5xx_propagates_rather_than_becoming_an_llm_error():
     def handler(request):
         return httpx.Response(503, text="overloaded")
     b = _anthropic(handler)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(RetryableError):
         await b.complete({"model": "m", "messages": []})
     await b.close()
 
@@ -209,6 +210,32 @@ async def test_anthropic_transient_4xx_propagates_for_retry(status):
     def handler(request):
         return httpx.Response(status, json={"error": {"message": "rate limited"}})
     b = _anthropic(handler)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(RetryableError):
         await b.complete({"model": "m", "messages": []})
     await b.close()
+
+
+# --- retry-after parsing ------------------------------------------------------
+
+def test_parse_retry_after_reads_bare_seconds():
+    from switchboard.actuators.llm.actuator import parse_retry_after
+    class R: headers = {"retry-after": "3"}
+    assert parse_retry_after(R()) == 3.0
+
+
+def test_parse_retry_after_reads_a_compound_duration():
+    from switchboard.actuators.llm.actuator import parse_retry_after
+    class R: headers = {"x-ratelimit-reset-tokens": "1m26.4s"}
+    assert abs(parse_retry_after(R()) - 86.4) < 1e-6
+
+
+def test_parse_retry_after_is_capped():
+    from switchboard.actuators.llm.actuator import parse_retry_after
+    class R: headers = {"retry-after": "99999"}
+    assert parse_retry_after(R()) == 120.0
+
+
+def test_parse_retry_after_none_when_no_header():
+    from switchboard.actuators.llm.actuator import parse_retry_after
+    class R: headers = {}
+    assert parse_retry_after(R()) is None
