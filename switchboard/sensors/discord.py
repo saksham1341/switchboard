@@ -81,25 +81,25 @@ class DiscordSensor:
 
     def __init__(self, bot_token: str, *,
                  commands: list[CommandSpec], guild_id: str | None = None,
-                 messages: bool = False, dedup_ttl: float = 7 * 86_400.0):
+                 dedup_ttl: float = 7 * 86_400.0):
         self._token = bot_token
         self._guild_id = guild_id
-        self.messages = messages
         self._dedup_ttl = dedup_ttl
         self.ctx = None
         self._synced = False
 
-        # message_content is a *privileged* intent: the gateway refuses the
-        # connection outright unless it is also enabled in the Developer Portal.
-        # So it is opt-in — a deployment that only wants slash commands keeps
-        # Intents.none() and needs no portal change.
-        if messages:
-            intents = discord.Intents.none()
-            intents.guilds = True
-            intents.guild_messages = True
-            intents.message_content = True
-        else:
-            intents = discord.Intents.none()
+        # message_content is a *privileged* intent, so this is a hard
+        # deployment requirement rather than a preference: it must be enabled
+        # in the Developer Portal or the gateway refuses login outright and
+        # this sensor dies at start. It was briefly behind a flag while the
+        # message path was unproven; now that the agent depends on it, a
+        # Switchboard that cannot hear messages is not a useful one, and a
+        # flag would only turn a loud startup failure into a silent
+        # never-responds.
+        intents = discord.Intents.none()
+        intents.guilds = True
+        intents.guild_messages = True
+        intents.message_content = True
 
         self._client = discord.Client(intents=intents)
         self._tree = app_commands.CommandTree(self._client)
@@ -110,10 +110,9 @@ class DiscordSensor:
         async def on_ready():
             await self._on_ready()
 
-        if messages:
-            @self._client.event
-            async def on_message(message):
-                await self._on_message(message, bot_id=self._client.user.id)
+        @self._client.event
+        async def on_message(message):
+            await self._on_message(message, bot_id=self._client.user.id)
 
     async def _on_ready(self) -> None:
         # Any timer this sensor grows is declared here, not in bind(): it would

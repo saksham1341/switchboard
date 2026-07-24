@@ -105,7 +105,10 @@ def test_kv_actuator_is_always_wired(tmp_path):
     assert "kv" in bus.topology()["actuators"]
 
 
-def test_discord_messages_is_off_unless_configured(tmp_path):
+def test_wiring_discord_needs_no_flag_to_listen_for_messages(tmp_path):
+    # Message listening used to be opt-in while the path was unproven. It is
+    # now unconditional, so the only question the config answers is whether
+    # Discord is wired at all.
     from switchboard.app import build
     bus, _ = build({
         "mamamia_db_path": str(tmp_path / "mm.db"),
@@ -114,20 +117,8 @@ def test_discord_messages_is_off_unless_configured(tmp_path):
         "discord_bot_token": "t", "discord_application_id": "1",
     })
     sensor = next(s for s in bus._sensors if s.name == "discord")
-    assert sensor.messages is False
-
-
-def test_discord_messages_opt_in_is_honoured(tmp_path):
-    from switchboard.app import build
-    bus, _ = build({
-        "mamamia_db_path": str(tmp_path / "mm.db"),
-        "switchboard_db_path": str(tmp_path / "sb.db"),
-        "github_secret": "s", "port": 8132,
-        "discord_bot_token": "t", "discord_application_id": "1",
-        "discord_messages": True,
-    })
-    sensor = next(s for s in bus._sensors if s.name == "discord")
-    assert sensor.messages is True
+    assert sensor._client.intents.message_content
+    assert hasattr(sensor._client, "on_message")
 
 
 def test_discord_history_actuator_is_wired_with_discord(tmp_path):

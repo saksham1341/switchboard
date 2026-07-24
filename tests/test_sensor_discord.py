@@ -142,7 +142,7 @@ def _ctx_with_store(emit):
 
 async def test_on_message_emits_for_a_human():
     emitted = []
-    s = _sensor(messages=True)
+    s = _sensor()
     s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
     await s._on_message(_FakeMessage(), bot_id=555)
     assert emitted and emitted[0][0] == "discord.message"
@@ -150,7 +150,7 @@ async def test_on_message_emits_for_a_human():
 
 async def test_on_message_ignores_bots_including_itself():
     emitted = []
-    s = _sensor(messages=True)
+    s = _sensor()
     s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
     await s._on_message(_FakeMessage(author=_FakeAuthor(uid=555, bot=True)), bot_id=555)
     await s._on_message(_FakeMessage(author=_FakeAuthor(uid=777, bot=True)), bot_id=555)
@@ -161,7 +161,7 @@ async def test_on_message_dedupes_a_replayed_message_id():
     # Discord replays gateway events on RESUME; the same message id must not
     # become a second observation.
     emitted = []
-    s = _sensor(messages=True)
+    s = _sensor()
     s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
     msg = _FakeMessage(mid=42)
     await s._on_message(msg, bot_id=555)
@@ -171,7 +171,7 @@ async def test_on_message_dedupes_a_replayed_message_id():
 
 async def test_on_message_still_emits_a_different_message_id():
     emitted = []
-    s = _sensor(messages=True)
+    s = _sensor()
     s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
     await s._on_message(_FakeMessage(mid=1), bot_id=555)
     await s._on_message(_FakeMessage(mid=2), bot_id=555)
@@ -187,7 +187,7 @@ async def test_on_message_does_not_mark_seen_when_emit_raises():
         calls["n"] += 1
         raise RuntimeError("boom")
 
-    s = _sensor(messages=True)
+    s = _sensor()
     s.ctx = _ctx_with_store(flaky_emit)
     msg = _FakeMessage(mid=99)
     await s._on_message(msg, bot_id=555)           # swallowed, logged
@@ -200,28 +200,24 @@ async def test_on_message_emit_failure_is_logged_at_error_level(caplog):
     async def flaky_emit(n, p):
         raise RuntimeError("boom")
 
-    s = _sensor(messages=True)
+    s = _sensor()
     s.ctx = _ctx_with_store(flaky_emit)
     with caplog.at_level("ERROR", logger="switchboard.sensors.discord"):
         await s._on_message(_FakeMessage(mid=7), bot_id=555)
     assert any("7" in r.message and r.levelname == "ERROR" for r in caplog.records)
 
 
-def test_messages_off_keeps_intents_none_and_registers_no_listener():
-    s = _sensor()
-    assert s._client.intents.value == discord.Intents.none().value
-    assert not s.messages
-    # @client.event setattr's the coroutine onto the client, so the attribute's
-    # absence is the listener's absence. Asserting it matters more than it looks:
-    # message_content is privileged, and a listener registered without the flag
-    # would mean the gateway refuses login outright rather than degrading.
-    assert not hasattr(s._client, "on_message")
-
-
-def test_messages_on_requests_exactly_the_needed_intents_and_listens():
-    s = _sensor(messages=True)
-    i = s._client.intents
+def test_the_sensor_always_requests_exactly_the_needed_intents():
+    # Unconditional since the agent depends on hearing messages. The negative
+    # half is the point: we ask for message_content because we cannot work
+    # without it, and for nothing else -- members and presences are privileged
+    # too and would widen the portal approval we need for no reason.
+    i = _sensor()._client.intents
     assert i.guilds and i.guild_messages and i.message_content
     assert not i.members and not i.presences
-    assert s.messages
-    assert hasattr(s._client, "on_message")
+
+
+def test_the_sensor_always_registers_the_message_listener():
+    # @client.event setattr's the coroutine onto the client, so the attribute's
+    # presence is the listener's presence.
+    assert hasattr(_sensor()._client, "on_message")

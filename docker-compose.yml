@@ -9,16 +9,15 @@ services:
       # --- Discord (optional) ---
       # The Discord half is wired only when DISCORD_BOT_TOKEN is set. If it is
       # set, DISCORD_APPLICATION_ID is required — the app fails fast without it.
+      # The bot always listens for messages, so the privileged MESSAGE CONTENT
+      # intent must be enabled in the Developer Portal: without it the gateway
+      # refuses login and the sensor dies at start.
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
       DISCORD_APPLICATION_ID: ${DISCORD_APPLICATION_ID:-}
       DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
       # Target channel for the github-notify relay. Unset = slash commands only,
       # no GitHub events relayed into Discord.
       DISCORD_GITHUB_NOTIFY_CHANNEL_ID: ${DISCORD_GITHUB_NOTIFY_CHANNEL_ID:-}
-      # Gateway message listening. Requires the privileged MESSAGE CONTENT
-      # intent to be enabled in the Discord Developer Portal first — the
-      # gateway refuses the connection otherwise. Unset = slash commands only.
-      DISCORD_MESSAGES: ${DISCORD_MESSAGES:-}
 
       # --- Agent ---
       # The agentic decider is wired only when this AND Discord are set.
