@@ -48,11 +48,14 @@ def _tool_outcome(obs) -> tuple[str, bool]:
         return escape_delimiters(str(payload)), False
 
 
-# A Discord message caps at ~2000 chars (~500 tokens), so an agent reply never
-# needs the generic 4096. Reserving that much is not free: providers count the
-# reserved output toward a request's rate-limit check (Groq 413'd a ~1.9k-token
-# call because 1.9k input + 4096 reserved = 6015 > the 6000 TPM). A tight cap
-# keeps requests small enough to pass and leaves headroom for the transcript.
+# A modest default, not because of any one source but because reserving output
+# is not free: providers count the RESERVED max_tokens toward a request's
+# rate-limit check, so an oversized value can get a request rejected that would
+# otherwise fit (a live 413: 1.9k input + 4096 reserved = 6015 > a 6000 TPM
+# limit). A conversational reply is short, so a small cap passes cleanly and
+# leaves headroom for the transcript. It is a constructor arg precisely because
+# the right ceiling is a per-deployment call — bump it when the work needs
+# longer outputs.
 AGENT_MAX_TOKENS = 1024
 
 
