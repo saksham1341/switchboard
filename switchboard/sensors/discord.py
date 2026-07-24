@@ -32,19 +32,23 @@ def _message_observation(message, bot_id: int, bot_role_ids=()) -> tuple[str, di
     for context it does not know exists. `message_count` tells it there is more
     above; `discord.history` is how it reads it.
 
-    `mentions_bot` is true for a direct user mention (`<@bot>`) OR a mention of
-    any role the bot holds (`<@&role>`). The role case matters because a bot
-    with a mentionable same-name role is very often pinged *by that role* — the
-    user types `@switchboard` and Discord resolves it to the role, not the user —
-    and discord.py keeps those in `role_mentions`, never in `mentions`. Missing
-    it is how a plain "@switchboard summarize" silently goes unanswered.
+    `mentions_bot` is true for a direct user mention (`<@bot>`), a mention of
+    any role the bot holds (`<@&role>`), or an `@everyone`/`@here` broadcast.
+    The role case matters because a bot with a mentionable same-name role is
+    very often pinged *by that role* — the user types `@switchboard` and Discord
+    resolves it to the role, not the user — and discord.py keeps those in
+    `role_mentions`, never in `mentions`. `@everyone`/`@here` come through
+    neither list, only `mention_everyone`; the bot is part of everyone, so it
+    wakes and the model decides whether a broadcast actually wants a reply.
     """
     channel = message.channel
     is_thread = isinstance(channel, discord.Thread)
     mention_ids = [str(u.id) for u in message.mentions]
     role_mention_ids = {str(r.id) for r in getattr(message, "role_mentions", [])}
     bot_roles = {str(r) for r in bot_role_ids}
-    mentions_bot = str(bot_id) in mention_ids or bool(role_mention_ids & bot_roles)
+    mentions_bot = (str(bot_id) in mention_ids
+                    or bool(role_mention_ids & bot_roles)
+                    or bool(getattr(message, "mention_everyone", False)))
     return ("discord.message", {
         "message_id": str(message.id),
         "channel_id": str(channel.id),

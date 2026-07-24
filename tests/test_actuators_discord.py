@@ -342,3 +342,76 @@ async def test_discord_post_has_no_reference_when_not_replying():
 def test_reply_to_is_in_the_tool_spec():
     props = DiscordPost.tool_spec["input_schema"]["properties"]
     assert "reply_to_message_id" in props
+
+
+# --- discord.react -----------------------------------------------------------
+
+from switchboard.actuators.discord import DiscordReact
+
+
+def _react_actuator(handler):
+    a = DiscordReact("bot", "app", client=_client(handler))
+    a.bind(ActuatorCtx(store=MemoryStore()))
+    return a
+
+
+async def _run_react(act, args):
+    results = []
+    async def emit(name, payload, cid):
+        results.append((name, payload)); return 0
+    cmd = _cmd("discord.react", args)
+    await act.act(cmd, ActCtx(cmd=cmd, _emit_result=emit))
+    return results[0]
+
+
+async def test_react_puts_the_reaction_and_reports_ok():
+    seen = {}
+    def h(req):
+        seen["method"] = req.method
+        seen["url"] = str(req.url)
+        seen["auth"] = req.headers.get("authorization")
+        return httpx.Response(204)          # Discord's success is 204 No Content
+    name, payload = await _run_react(
+        _react_actuator(h),
+        {"channel_id": "222", "message_id": "42", "emoji": "\U0001f44d"})
+    assert seen["method"] == "PUT"
+    assert seen["auth"] == "Bot bot"
+    # emoji URL-encoded into the path, /@me at the end
+    assert "/channels/222/messages/42/reactions/" in seen["url"]
+    assert seen["url"].endswith("/@me")
+    assert name == "discord.react.ok"
+    assert payload == {"channel_id": "222", "message_id": "42", "emoji": "\U0001f44d"}
+
+
+async def test_react_missing_field_is_a_reported_error_without_calling_discord():
+    def h(req):
+        raise AssertionError("must not call Discord without all fields")
+    for args in ({"message_id": "42", "emoji": "x"},
+                 {"channel_id": "222", "emoji": "x"},
+                 {"channel_id": "222", "message_id": "42"}):
+        name, payload = await _run_react(_react_actuator(h), args)
+        assert name == "discord.react.error"
+
+
+async def test_react_403_is_reported_not_raised():
+    # Missing the Add Reactions permission is permanent; the agent should learn.
+    def h(req):
+        return httpx.Response(403, json={"message": "Missing Permissions", "code": 50013})
+    name, payload = await _run_react(
+        _react_actuator(h), {"channel_id": "222", "message_id": "42", "emoji": "x"})
+    assert name == "discord.react.error"
+    assert "Missing Permissions" in payload["message"]
+
+
+async def test_react_5xx_raises_so_the_bus_retries():
+    def h(req):
+        return httpx.Response(502, text="bad gateway")
+    with pytest.raises(httpx.HTTPStatusError):
+        await _run_react(_react_actuator(h),
+                         {"channel_id": "222", "message_id": "42", "emoji": "x"})
+
+
+def test_react_tool_spec_requires_all_three_fields():
+    req = DiscordReact.tool_spec["input_schema"]["required"]
+    assert set(req) == {"channel_id", "message_id", "emoji"}
+    assert DiscordReact.name == "discord.react"

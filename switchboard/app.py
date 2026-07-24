@@ -10,7 +10,8 @@ from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
 from switchboard.deciders.agent import AgentDecider
-from switchboard.actuators.discord import DiscordPost, DiscordReplyToCommand, DiscordHistory
+from switchboard.actuators.discord import (
+    DiscordPost, DiscordReplyToCommand, DiscordHistory, DiscordReact)
 from switchboard.actuators.kv import KvActuator
 from switchboard.actuators.llm import LlmActuator
 from switchboard.actuators.llm.backends.anthropic import AnthropicBackend
@@ -91,6 +92,8 @@ def build(config: dict):
         # agent. Idle until something emits the command.
         history = DiscordHistory(token, app_id)
         bus.add_actuator(history)
+        react = DiscordReact(token, app_id)
+        bus.add_actuator(react)
 
         # DiscordPost is wanted by two independent branches below - the
         # github-notify relay and the agent's tool list. Construct and register
@@ -125,7 +128,8 @@ def build(config: dict):
             bus.add_decider(AgentDecider(
                 model=config["llm_model"],
                 tools=[agent_post.tool_spec | {"name": agent_post.name},
-                       history.tool_spec | {"name": history.name}]))
+                       history.tool_spec | {"name": history.name},
+                       react.tool_spec | {"name": react.name}]))
 
     # Expired keys are already invisible to reads, so this is only about
     # reclaiming disk — and only some backends need it. Sqlite and memory stores

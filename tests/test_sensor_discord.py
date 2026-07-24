@@ -101,7 +101,7 @@ class _FakeGuild:
 
 class _FakeMessage:
     def __init__(self, channel=None, mentions=(), author=None, content="hi",
-                 mid=1234567890, role_mentions=(), guild=None):
+                 mid=1234567890, role_mentions=(), guild=None, mention_everyone=False):
         self.id = mid
         self.channel = channel if channel is not None else _FakeChannel()
         self.guild = _FakeGuild() if guild is None else guild
@@ -109,6 +109,7 @@ class _FakeMessage:
         self.content = content
         self.mentions = list(mentions)
         self.role_mentions = list(role_mentions)
+        self.mention_everyone = mention_everyone
 
 
 def test_message_observation_in_thread_carries_the_hint():
@@ -196,9 +197,11 @@ async def test_on_message_wakes_on_a_role_ping():
     assert emitted and emitted[0][1]["mentions_bot"] is True
 
 
-async def test_on_message_does_not_treat_everyone_as_a_bot_role():
-    # @everyone is the guild default role (id == guild id) and every member
-    # holds it. A ping of it must not wake the bot as if it were addressed.
+async def test_on_message_does_not_match_the_default_role_in_the_role_list():
+    # The bot's default role (@everyone, id == guild id) is excluded from its
+    # role set, so a default role appearing in role_mentions must not match it.
+    # (A true @everyone broadcast arrives via mention_everyone, tested below —
+    # not through the role list.)
     emitted = []
     s = _sensor()
     s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
@@ -207,6 +210,16 @@ async def test_on_message_does_not_treat_everyone_as_a_bot_role():
                        content="<@&9> hey all")
     await s._on_message(msg, bot_id=555)
     assert emitted and emitted[0][1]["mentions_bot"] is False
+
+
+def test_message_observation_wakes_on_an_everyone_or_here_broadcast():
+    # @everyone and @here both set mention_everyone; the bot is part of everyone,
+    # so it wakes and lets the model judge whether the broadcast wants a reply.
+    from switchboard.sensors.discord import _message_observation
+    _, payload = _message_observation(
+        _FakeMessage(mention_everyone=True, content="@everyone deploy is live"),
+        bot_id=555)
+    assert payload["mentions_bot"] is True
 
 
 async def test_on_message_emits_for_a_human():

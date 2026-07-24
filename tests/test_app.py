@@ -189,7 +189,7 @@ def test_the_agent_is_wired_when_the_key_and_discord_are_present(tmp_path):
     assert "llm" in {a.name for a in bus._actuators}
     agent = next(d for d in bus._deciders if d.name == "agent")
     names = {t["name"] for t in agent._tools}
-    assert names == {"discord.post", "discord.history"}
+    assert names == {"discord.post", "discord.history", "discord.react"}
 
 
 def test_the_agent_needs_discord_not_just_a_key(tmp_path):

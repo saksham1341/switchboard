@@ -79,6 +79,23 @@ class DiscordSender:
             params=params,
         )
 
+    async def add_reaction(self, channel_id: str, message_id: str,
+                           emoji: str) -> httpx.Response:
+        """React to a message as the bot. Returns the response unraised — same
+        reason as fetch_messages: the caller decides which statuses to report vs
+        retry. Needs the Add Reactions permission on the channel.
+
+        The emoji sits in the URL path: a Unicode emoji goes URL-encoded, a
+        custom one as `name:id`. httpx percent-encodes the path segment, so a
+        raw Unicode emoji is passed through as-is.
+        """
+        from urllib.parse import quote
+        return await self._client.put(
+            f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}"
+            f"/reactions/{quote(emoji)}/@me",
+            headers={"Authorization": f"Bot {self._bot_token}"},
+        )
+
     async def close(self) -> None:
         await self._client.aclose()
 
@@ -153,6 +170,75 @@ class DiscordPost:
         if isinstance(body, dict):
             message_id = body.get("id")
         await ctx.result("ok", {"channel_id": channel, "message_id": message_id})
+
+    async def close(self):
+        if self._sender is not None:
+            await self._sender.close()
+
+
+class DiscordReact:
+    """Actuator for the `discord.react` command: add an emoji reaction to a
+    message. A lightweight way to acknowledge or respond without posting — an
+    agent can 👍 a message it agrees with, ✅ a done task, or 👀 something it's
+    looking into, none of which warrant a full reply.
+    """
+    name = "discord.react"
+    tool_spec = {
+        "description": (
+            "React to a Discord message with an emoji. Use this to acknowledge "
+            "or respond lightly — agreement, a thumbs up, marking something seen "
+            "or done — when a full message would be too much. It is the quiet "
+            "alternative to discord.post."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel_id": {
+                    "type": "string",
+                    "description": "Required. The channel or thread the message "
+                                   "is in. Use the channel_id from the header of "
+                                   "the message you are reacting to.",
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "Required. The message to react to. Use the "
+                                   "message_id from its header.",
+                },
+                "emoji": {
+                    "type": "string",
+                    "description": "Required. A single Unicode emoji, e.g. \U0001f44d "
+                                   "or ✅. Not a :shortcode:.",
+                },
+            },
+            "required": ["channel_id", "message_id", "emoji"],
+        },
+    }
+
+    def __init__(self, bot_token, application_id, *, client=None):
+        self._token, self._app_id = bot_token, application_id
+        self._client = client
+        self._sender = None
+
+    def bind(self, ctx):
+        self.ctx = ctx
+        self._sender = DiscordSender(self._token, self._app_id, client=self._client)
+
+    async def act(self, cmd, ctx):
+        args = cmd.args or {}
+        for field in ("channel_id", "message_id", "emoji"):
+            if not isinstance(args.get(field), str) or not args[field]:
+                return await ctx.result("error", {"message": f"{field} is required"})
+
+        resp = await self._sender.add_reaction(
+            args["channel_id"], args["message_id"], args["emoji"])
+        if resp.status_code >= 500:
+            resp.raise_for_status()          # transient: let the Bus retry
+        if resp.status_code >= 400:
+            return await ctx.result("error", {"message": _error_message(resp),
+                                              "status": resp.status_code})
+        # Success is 204 No Content — there is no body to read.
+        await ctx.result("ok", {"channel_id": args["channel_id"],
+                                "message_id": args["message_id"],
+                                "emoji": args["emoji"]})
 
     async def close(self):
         if self._sender is not None:
