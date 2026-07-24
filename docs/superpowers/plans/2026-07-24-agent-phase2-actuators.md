@@ -582,7 +582,7 @@ git commit -m "feat(actuators): generic llm executor over the Messages API"
 
 ---
 
-### Task 3: give `DiscordPost` a voice, named destinations, and a tool_spec
+### Task 3: give `DiscordPost` a voice and a tool_spec
 
 **Files:**
 - Modify: `switchboard/actuators/discord.py` — `DiscordPost.act`
@@ -590,9 +590,9 @@ git commit -m "feat(actuators): generic llm executor over the Messages API"
 
 **Interfaces:**
 - Consumes: `DiscordSender.send(channel_id, content=None, *, embed=None, components=None)` — already accepts `content`; `DiscordPost.act` simply never passed it.
-- Produces: `DiscordPost(bot_token, application_id, *, channels=None, channel_id=None, client=None)` accepting `{content?, channel?, channel_id?, embed?, components?}`, returning `{channel_id, message_id}`, and declaring an **instance** `tool_spec` exposing `{content, channel}` where `channel` is an **enum of configured names**. Phase 4's decider reads the spec off the instance.
+- Produces: `DiscordPost` accepting `{content?, channel_id?, embed?, components?}`, returning `{channel_id, message_id}`, and declaring a `tool_spec` exposing `{content, channel_id}`. The agent chooses its own destination; omitting `channel_id` falls back to the configured default.
 
-**Why names and not ids.** Letting the model emit a raw channel id would be more capable and materially less safe. The agent reads Discord messages — untrusted input — so free choice of destination turns a prompt-injection from *"the agent says something odd in its own thread"* into *"the agent broadcasts its memory anywhere the bot can reach."* A hallucinated snowflake is the lesser worry (it usually 404s); the exfiltration path is the real one. An enum of configured names makes a bad destination structurally unrepresentable, keeps the useful capability ("post that to #releases"), and lets the agent's memory hold semantics rather than brittle ids. `tool_spec` therefore has to be an **instance** attribute, since the enum comes from config.
+**On destination freedom.** The agent can post to any channel the bot can reach. That is deliberate for v1 — the bot lives in one private guild with trusted members and nothing is deployed yet, so masking ids behind configured names would be guarding a risk that is not present. It is recorded as a deferred item with an explicit trigger in the spec's §12, and it is purely additive when the time comes: `channels=` config, an enum in the schema, a lookup in `act`. No rework of anything built here.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -600,8 +600,7 @@ Append to `tests/test_actuators_discord.py`:
 
 ```python
 async def test_discord_post_sends_plain_content():
-    """The agent speaks in plain text; the existing actuator only ever forwarded
-    embeds."""
+    """The agent speaks in plain text; the actuator only ever forwarded embeds."""
     seen = {}
     def h(req):
         seen["body"] = json.loads(req.content)
@@ -626,62 +625,30 @@ async def test_discord_post_returns_the_message_id():
     assert results[0][1] == {"channel_id": "chan-9", "message_id": "m-7"}
 
 
-async def test_tool_spec_offers_only_configured_channel_names():
-    """A raw id would let a prompt-injected agent broadcast anywhere the bot can
-    reach. An enum of configured names makes that unrepresentable."""
-    a = DiscordPost("bot", "app", channels={"releases": "111", "alerts": "222"})
-    props = a.tool_spec["input_schema"]["properties"]
-    assert set(props) == {"content", "channel"}
-    assert sorted(props["channel"]["enum"]) == ["alerts", "releases"]
-    assert "channel_id" not in props           # never an id
-
-
-async def test_named_channel_resolves_to_its_id():
+async def test_explicit_channel_id_wins_over_the_default():
     seen = {}
     def h(req):
         seen["url"] = str(req.url)
         return httpx.Response(200, json={"id": "m-1"})
-    a = _bind(DiscordPost("bot", "app", channels={"releases": "111"},
-                          channel_id="chan-9", client=_client(h)))
+    a = _bind(DiscordPost("bot", "app", channel_id="chan-9", client=_client(h)))
     results = []
-    ctx = ActCtx(cmd=_cmd("discord.post", {"content": "ship it", "channel": "releases"}),
+    ctx = ActCtx(cmd=_cmd("discord.post", {"content": "x", "channel_id": "other-1"}),
                  _emit_result=await _recorder(results))
     await a.act(ctx.cmd, ctx)
-    assert seen["url"].endswith("/channels/111/messages")
+    assert seen["url"].endswith("/channels/other-1/messages")
 
 
-async def test_unknown_channel_name_is_an_error_not_a_post():
-    posted = []
-    def h(req):
-        posted.append(1); return httpx.Response(200, json={"id": "m-1"})
-    a = _bind(DiscordPost("bot", "app", channels={"releases": "111"},
-                          channel_id="chan-9", client=_client(h)))
-    results = []
-    ctx = ActCtx(cmd=_cmd("discord.post", {"content": "x", "channel": "general"}),
-                 _emit_result=await _recorder(results))
-    await a.act(ctx.cmd, ctx)
-    assert posted == []                        # nothing was sent
-    assert results[0][0] == "discord.post.error"
-
-
-async def test_omitting_channel_uses_the_injected_destination():
-    """No name given → the conversation the decider routed it to."""
-    seen = {}
-    def h(req):
-        seen["url"] = str(req.url); return httpx.Response(200, json={"id": "m-1"})
-    a = _bind(DiscordPost("bot", "app", channels={"releases": "111"},
-                          channel_id="chan-9", client=_client(h)))
-    results = []
-    ctx = ActCtx(cmd=_cmd("discord.post", {"content": "hi"}),
-                 _emit_result=await _recorder(results))
-    await a.act(ctx.cmd, ctx)
-    assert seen["url"].endswith("/channels/chan-9/messages")
+async def test_tool_spec_exposes_content_and_destination():
+    spec = DiscordPost.tool_spec
+    assert spec is not None
+    assert set(spec["input_schema"]["properties"]) == {"content", "channel_id"}
+    assert spec["input_schema"]["required"] == ["content"]
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `./scripts/dev.sh test tests/test_actuators_discord.py -q`
-Expected: FAIL — the body has no `content` key, the result lacks `message_id`, `DiscordPost` takes no `channels=`, and no `tool_spec` exists.
+Expected: FAIL — the body has no `content` key, the result lacks `message_id`, and `DiscordPost.tool_spec` does not exist.
 
 - [ ] **Step 3: Update `DiscordPost`**
 
@@ -691,50 +658,37 @@ In `switchboard/actuators/discord.py`, replace the `DiscordPost` class header an
 class DiscordPost:
     """Actuator for the `discord.post` command: post a channel or thread message.
 
-    The tool offers channel *names* from a configured allowlist, never raw ids.
-    An agent reads untrusted messages, so free choice of destination would turn
-    a prompt injection from "says something odd in its own thread" into "can
-    broadcast its memory anywhere the bot can reach". An enum makes a bad
-    destination unrepresentable, and lets the agent remember semantics rather
-    than brittle snowflakes. Omit the name and the message goes wherever the
-    decider routed the conversation.
+    The tool exposes the destination, so an agent may post wherever the bot can
+    reach. Deliberate for v1 (one private guild, trusted members); masking ids
+    behind configured names is a recorded, purely additive follow-up.
     """
     name = "discord.post"
+    tool_spec = {
+        "description": "Send a message to Discord.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "The message text."},
+                "channel_id": {"type": "string",
+                               "description": "Where to post. Omit for the "
+                                              "current conversation."},
+            },
+            "required": ["content"],
+        },
+    }
 
-    def __init__(self, bot_token, application_id, *, channels=None,
-                 channel_id=None, client=None):
+    def __init__(self, bot_token, application_id, *, channel_id=None, client=None):
         self._token, self._app_id = bot_token, application_id
-        self._channels = dict(channels or {})
         self._default_channel = channel_id
         self._client = client
         self._sender = None
-        # An instance attribute, not a class one: the enum comes from config.
-        props = {"content": {"type": "string", "description": "The message text."}}
-        if self._channels:
-            props["channel"] = {
-                "type": "string", "enum": sorted(self._channels),
-                "description": "Where to post. Omit for the current conversation.",
-            }
-        self.tool_spec = {
-            "description": "Send a message to Discord.",
-            "input_schema": {"type": "object", "properties": props,
-                             "required": ["content"]},
-        }
 
     def bind(self, ctx):
         self.ctx = ctx
         self._sender = DiscordSender(self._token, self._app_id, client=self._client)
 
     async def act(self, cmd, ctx):
-        named = cmd.args.get("channel")
-        if named is not None:
-            if named not in self._channels:
-                # Reported, not raised, and nothing is sent.
-                return await ctx.result("error",
-                                        {"message": f"unknown channel: {named!r}"})
-            channel = self._channels[named]
-        else:
-            channel = cmd.args.get("channel_id") or self._default_channel
+        channel = cmd.args.get("channel_id") or self._default_channel
         resp = await self._sender.send(channel,
                                        content=cmd.args.get("content"),
                                        embed=cmd.args.get("embed"),
@@ -752,18 +706,18 @@ Leave `close()` and the rest of the file untouched.
 - [ ] **Step 4: Run to verify pass**
 
 Run: `./scripts/dev.sh test tests/test_actuators_discord.py -q`
-Expected: PASS — the existing embed tests still pass (they assert `seen["body"]["embeds"]`, and `content=None` is omitted from the payload by `DiscordSender.send`), plus 6 new.
+Expected: PASS — the existing embed tests still pass (they assert `seen["body"]["embeds"]`, and `content=None` is omitted from the payload by `DiscordSender.send`), plus 4 new.
 
 - [ ] **Step 5: Full suite**
 
 Run: `./scripts/dev.sh test`
-Expected: PASS — previous total + 6.
+Expected: PASS — previous total + 4.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add switchboard/actuators/discord.py tests/test_actuators_discord.py
-git commit -m "feat(actuators): discord.post gains content, named destinations, message_id, tool_spec"
+git commit -m "feat(actuators): discord.post carries content, returns message_id, declares a tool_spec"
 ```
 
 ---
@@ -774,7 +728,7 @@ git commit -m "feat(actuators): discord.post gains content, named destinations, 
 - §7.1 `tool_spec` opt-in, tool name == actuator name == command name → Task 1. ✓
 - §7.2 result → tool_result outcomes (`ok` / `error`), errors reported not raised → Tasks 1, 2. ✓
 - §7.3 `llm` generic with request shape in the command args; `kv` one actuator one scope, no `tool_spec` on either → Tasks 1, 2. ✓
-- §7.4 destination control → Task 3, **tightened**: the tool offers configured channel *names* (enum), never raw ids, and omitting the name falls back to the decider-routed conversation. ✓
+- §7.4 destination control → Task 3: the tool exposes `channel_id` and the agent chooses. Masking behind configured names is deferred with a trigger recorded in §12. ✓
 - §3 `actuator/kv/` scope holds the agent's memory → Task 1, pinned by `test_writes_land_in_the_actuators_own_scope`. ✓
 - §7.5 curated tool list and trusted binding is Phase 4 wiring, not an actuator concern. Out of scope here by design. ✓
 
@@ -783,7 +737,7 @@ git commit -m "feat(actuators): discord.post gains content, named destinations, 
 **Type consistency:** `ActCtx(cmd=…, _emit_result=…)` matches the current two-field dataclass (`context` was removed in the sensor-platform work). `ActuatorCtx(store=…)` is store-only. `DiscordSender.send(channel_id, content=None, *, embed=None, components=None)` matches the existing signature. `ctx.result(outcome, payload)` produces `f"{cmd.name}.{outcome}"`, so `kv.ok` / `kv.error` / `llm.ok` / `llm.error` follow from the actuator names. ✓
 
 **Two things for the reviewer:**
-1. Task 3 changes `DiscordPost.act` to pass `content` through and to read `message_id` from the response, and moves `tool_spec` to an instance attribute. The existing embed tests assert on `seen["body"]["embeds"]` and should be unaffected, but the reviewer should confirm no existing test asserts the exact shape of the `ok` payload (it gains `message_id`), and that `test_app.py` still constructs `DiscordPost` correctly now that it takes `channels=`.
+1. Task 3 changes `DiscordPost.act` to pass `content` through and to read `message_id` from the response, The existing embed tests assert on `seen["body"]["embeds"]` and should be unaffected, but the reviewer should confirm no existing test asserts the exact shape of the `ok` payload (it gains `message_id`).
 2. Nothing here is wired into `app.build()`. These actuators are built and tested but unregistered — deliberate, since the agent that drives them arrives in Phase 4. Registering `llm`/`kv` earlier would mean an API key in the deployment for a feature nothing uses.
 
 ---
