@@ -15,6 +15,10 @@ services:
       # Target channel for the github-notify relay. Unset = slash commands only,
       # no GitHub events relayed into Discord.
       DISCORD_GITHUB_NOTIFY_CHANNEL_ID: ${DISCORD_GITHUB_NOTIFY_CHANNEL_ID:-}
+      # Gateway message listening. Requires the privileged MESSAGE CONTENT
+      # intent to be enabled in the Discord Developer Portal first — the
+      # gateway refuses the connection otherwise. Unset = slash commands only.
+      DISCORD_MESSAGES: ${DISCORD_MESSAGES:-}
 
       # --- Dashboard ---
       # Set a token to enable the live dashboard; unset = no dashboard at all.

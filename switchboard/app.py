@@ -47,7 +47,8 @@ def build(config: dict):
         if not app_id:
             raise ValueError("discord_application_id is required when discord_bot_token is set")
         discord_sensor = DiscordSensor(token, commands=DISCORD_COMMANDS,
-                                       guild_id=config.get("discord_guild_id"))
+                                       guild_id=config.get("discord_guild_id"),
+                                       messages=bool(config.get("discord_messages")))
         bus.add_sensor(discord_sensor); sensors.append(discord_sensor)
         bus.add_decider(PingDecider()); bus.add_decider(EchoDecider())
         bus.add_actuator(DiscordReply(token, app_id))
@@ -94,6 +95,7 @@ async def run() -> None:
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
         "discord_github_notify_channel_id": os.environ.get("DISCORD_GITHUB_NOTIFY_CHANNEL_ID"),
+        "discord_messages": os.environ.get("DISCORD_MESSAGES", "").lower() in ("1", "true", "yes"),
         "dashboard_token": os.environ.get("SB_DASHBOARD_TOKEN"),
         "dashboard_ingest_url": os.environ.get(
             "SB_DASHBOARD_INGEST_URL",

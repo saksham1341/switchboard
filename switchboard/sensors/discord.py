@@ -19,6 +19,35 @@ def _command_observation(command: str, interaction, options: dict) -> tuple[str,
     })
 
 
+def _message_observation(message, bot_id: int) -> tuple[str, dict]:
+    """Shape a gateway message into a `discord.message` observation.
+
+    `channel_id` is always where the message *is* — the thread id when it is in
+    a thread — so replying to it lands in place without the reader knowing which
+    it got. The `thread` block is the hint from spec §6.5: a mid-thread mention
+    gives the agent a conversation starting at the mention, and it cannot ask
+    for context it does not know exists. `message_count` tells it there is more
+    above; `discord.history` is how it reads it.
+    """
+    channel = message.channel
+    is_thread = isinstance(channel, discord.Thread)
+    mention_ids = [str(u.id) for u in message.mentions]
+    return ("discord.message", {
+        "message_id": str(message.id),
+        "channel_id": str(channel.id),
+        "parent_id": str(channel.parent_id) if is_thread else None,
+        "thread_id": str(channel.id) if is_thread else None,
+        "guild_id": str(message.guild.id) if message.guild else None,
+        "user_id": str(message.author.id),
+        "user_name": str(message.author),
+        "content": message.content,
+        "mentions": mention_ids,
+        "mentions_bot": str(bot_id) in mention_ids,
+        "thread": {"is_thread": is_thread,
+                   "message_count": getattr(channel, "message_count", None) if is_thread else None},
+    })
+
+
 @dataclass(frozen=True)
 class Option:
     """A declared slash-command parameter. `type` is a plain Python type
@@ -48,13 +77,27 @@ class DiscordSensor:
     name = "discord"
 
     def __init__(self, bot_token: str, *,
-                 commands: list[CommandSpec], guild_id: str | None = None):
+                 commands: list[CommandSpec], guild_id: str | None = None,
+                 messages: bool = False):
         self._token = bot_token
         self._guild_id = guild_id
+        self.messages = messages
         self.ctx = None
         self._synced = False
 
-        self._client = discord.Client(intents=discord.Intents.none())
+        # message_content is a *privileged* intent: the gateway refuses the
+        # connection outright unless it is also enabled in the Developer Portal.
+        # So it is opt-in — a deployment that only wants slash commands keeps
+        # Intents.none() and needs no portal change.
+        if messages:
+            intents = discord.Intents.none()
+            intents.guilds = True
+            intents.guild_messages = True
+            intents.message_content = True
+        else:
+            intents = discord.Intents.none()
+
+        self._client = discord.Client(intents=intents)
         self._tree = app_commands.CommandTree(self._client)
         for spec in commands:
             self._tree.add_command(self._make_command(spec))
@@ -62,6 +105,11 @@ class DiscordSensor:
         @self._client.event
         async def on_ready():
             await self._on_ready()
+
+        if messages:
+            @self._client.event
+            async def on_message(message):
+                await self._on_message(message, bot_id=self._client.user.id)
 
     async def _on_ready(self) -> None:
         # Any timer this sensor grows is declared here, not in bind(): it would
@@ -119,6 +167,15 @@ class DiscordSensor:
 
         return app_commands.Command(
             name=spec.name, description=spec.description, callback=callback)
+
+    async def _on_message(self, message, *, bot_id: int) -> None:
+        # Every bot is ignored, ourselves included. Ignoring only ourselves would
+        # let two Switchboard-shaped bots talk each other into an endless loop,
+        # and the failure would be a live spend, not a test failure.
+        if message.author.bot:
+            return
+        name, payload = _message_observation(message, bot_id)
+        await self.ctx.emit(name, payload)
 
     def bind(self, ctx) -> None:
         self.ctx = ctx          # no routes; any timer waits for the gateway
