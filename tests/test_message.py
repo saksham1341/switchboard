@@ -1,4 +1,5 @@
-from switchboard.message import Observation, Command, OBS_LOG, CMD_LOG
+from switchboard.message import (
+    OBS_LOG, CMD_LOG, Observation, Command, DecideCtx, ActCtx)
 
 
 class _Msg:
@@ -121,3 +122,50 @@ def test_rendered_survives_an_unserialisable_payload():
     # Degrade, never raise: a reader asking for text must not take down a turn.
     obs = Observation.from_message(_msg({"bad": {1, 2}}, {"name": "x"}))
     assert isinstance(obs.rendered, str)
+
+
+# --- the emit-callable arity contract ---------------------------------------
+# DecideCtx/ActCtx pass `text` only when it is supplied, so a callable written
+# against the older 3-arg contract keeps working. That branching is invisible
+# at the call site, so pin BOTH arities here: without this, a future 3-arg fake
+# passes every test until someone supplies a text, then fails several frames
+# from the cause.
+
+async def test_decide_ctx_omits_text_for_a_three_arg_callable():
+    seen = []
+    async def three_arg(name, args, observation_id):
+        seen.append((name, args, observation_id)); return 1
+    ctx = DecideCtx(obs=Observation(id=7, name="x", payload={}),
+                    _emit_command=three_arg)
+    assert await ctx.command("cmd", {"a": 1}) == 1
+    assert seen == [("cmd", {"a": 1}, 7)]
+
+
+async def test_decide_ctx_passes_text_to_a_four_arg_callable():
+    seen = []
+    async def four_arg(name, args, observation_id, text=None):
+        seen.append(text); return 1
+    ctx = DecideCtx(obs=Observation(id=7, name="x", payload={}),
+                    _emit_command=four_arg)
+    await ctx.command("cmd", {}, text="PRETTY")
+    assert seen == ["PRETTY"]
+
+
+async def test_act_ctx_omits_text_for_a_three_arg_callable():
+    seen = []
+    async def three_arg(name, payload, cmd_id):
+        seen.append(name); return 0
+    cmd = Command(id=3, name="tool", args={})
+    ctx = ActCtx(cmd=cmd, _emit_result=three_arg)
+    await ctx.result("ok", {})
+    assert seen == ["tool.ok"]
+
+
+async def test_act_ctx_passes_text_to_a_four_arg_callable():
+    seen = []
+    async def four_arg(name, payload, cmd_id, text=None):
+        seen.append(text); return 0
+    cmd = Command(id=3, name="tool", args={})
+    ctx = ActCtx(cmd=cmd, _emit_result=four_arg)
+    await ctx.result("ok", {}, text="RENDERED")
+    assert seen == ["RENDERED"]
