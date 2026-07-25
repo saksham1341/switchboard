@@ -6,7 +6,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from switchboard.dashboard import Dashboard, DashboardTap, project
+from switchboard.dashboard import DEAD_MAX, Dashboard, DashboardTap, project
 from switchboard.dashboard.stats import FRAME_KEYS
 from switchboard.message import Observation, Command
 
@@ -173,7 +173,7 @@ async def test_topology_lists_registered_roles(tmp_path):
         async def start(self): pass
         async def stop(self): pass
 
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(_R("github")); bus.add_decider(_R("notify")); bus.add_actuator(_R("discord.post"))
     assert bus.topology() == {"sensors": ["github"], "deciders": ["notify"],
                               "actuators": ["discord.post"]}
@@ -210,3 +210,86 @@ def test_the_projection_never_carries_the_rendered_text():
                   "text": "[discord.message] SHOULD NOT APPEAR EITHER"}
     frame = project("obs", Observation.from_message(m))
     assert "SHOULD NOT APPEAR" not in repr(frame)
+
+
+# --- dead-letter subscription (replaces the poll) ----------------------------
+
+def test_the_deadletter_projection_carries_the_link_and_no_payload():
+    class M:
+        id = 9
+    m = M()
+    m.payload = {"log": "cmd", "message_id": 44, "name": "llm",
+                 "secret": "SHOULD NOT APPEAR"}
+    m.metadata = {"name": "switchboard.deadletter", "emitted_by": "sensor/deadletter"}
+    frame = project("obs", Observation.from_message(m))
+    assert set(frame) == set(FRAME_KEYS)
+    assert frame["dead_log"] == "cmd" and frame["dead_id"] == 44
+    assert "SHOULD NOT APPEAR" not in repr(frame)
+
+
+def test_an_ordinary_frame_has_no_dead_fields():
+    frame = project("obs", _obs())
+    assert frame["dead_log"] is None and frame["dead_id"] is None
+
+
+async def test_ingest_marks_dead_from_a_deadletter_frame(tmp_path):
+    dash = _dash(tmp_path)
+    seen = asyncio.Queue(); dash._clients.add(seen)
+    app = Starlette(routes=[Route("/dashboard/ingest", dash.ingest, methods=["POST"])])
+    TestClient(app).post("/dashboard/ingest",
+        json={"frames": [{"log": "obs", "id": 9, "name": "switchboard.deadletter",
+                          "dead_log": "cmd", "dead_id": 44, "seen_at": 0}]},
+        headers={"Authorization": "Bearer t0ken"})
+    assert {"log": "cmd", "id": 44} in dash._dead
+
+
+def _dead_frames(ids):
+    return [{"log": "obs", "id": 9, "name": "switchboard.deadletter",
+             "dead_log": "cmd", "dead_id": i, "seen_at": 0} for i in ids]
+
+
+def _post_dead(dash, ids):
+    app = Starlette(routes=[Route("/dashboard/ingest", dash.ingest, methods=["POST"])])
+    return TestClient(app).post("/dashboard/ingest", json={"frames": _dead_frames(ids)},
+                                headers={"Authorization": "Bearer t0ken"})
+
+
+async def test_the_dead_list_is_capped_and_drops_the_oldest(tmp_path):
+    """The poll this replaced re-derived the list from message_state every
+    time, so it was implicitly bounded by log_max_dead and self-healing. An
+    in-process list that is only ever appended to grows without limit and is
+    re-broadcast in full on every new dead letter."""
+    dash = _dash(tmp_path)
+    _post_dead(dash, range(DEAD_MAX + 5))
+    assert len(dash._dead) == DEAD_MAX
+    assert {"log": "cmd", "id": 0} not in dash._dead          # oldest dropped
+    assert {"log": "cmd", "id": DEAD_MAX + 4} in dash._dead   # newest kept
+
+
+async def test_a_repeated_dead_letter_is_not_listed_twice(tmp_path):
+    dash = _dash(tmp_path)
+    _post_dead(dash, [44, 44, 44])
+    assert dash._dead == [{"log": "cmd", "id": 44}]
+
+
+async def test_a_dead_letter_evicted_by_the_cap_can_be_listed_again(tmp_path):
+    """The dedupe index has to be trimmed with the list. If it is not, an
+    evicted entry is remembered forever as "already seen" and can never
+    reappear -- a leak of exactly the kind the cap exists to stop."""
+    dash = _dash(tmp_path)
+    _post_dead(dash, range(DEAD_MAX + 1))          # id 0 is evicted
+    _post_dead(dash, [0])
+    assert {"log": "cmd", "id": 0} in dash._dead
+    assert len(dash._dead) == DEAD_MAX
+
+
+def test_the_dashboard_no_longer_polls(tmp_path):
+    from switchboard.app import build
+    from switchboard.dashboard import Dashboard
+    assert not hasattr(Dashboard, "refresh_dead")
+    bus, _ = build({"mamamia_db_path": str(tmp_path / "mm.db"),
+                    "switchboard_db_path": str(tmp_path / "sb.db"),
+                    "github_secret": "s", "port": 8167,
+                    "dashboard_token": "t0ken",
+                    "dashboard_ingest_url": "http://127.0.0.1:8167/dashboard/ingest"})
+    assert "dashboard-dead" not in bus._maintenance

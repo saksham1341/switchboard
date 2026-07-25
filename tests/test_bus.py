@@ -46,7 +46,7 @@ class _Sensor:
 
 async def test_full_spine_obs_to_cmd_to_result(tmp_path):
     act, tap = _Actuator(), _Tap()
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_decider(_Decider())
     bus.add_actuator(act)
     bus.add_tap(tap)
@@ -66,7 +66,7 @@ async def test_full_spine_obs_to_cmd_to_result(tmp_path):
 
 async def test_actuator_only_consumes_its_command_name(tmp_path):
     act = _Actuator()  # name "do.it"
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_actuator(act)
     await bus.start()
     try:
@@ -81,7 +81,7 @@ async def test_every_role_is_bound_with_its_own_scope(tmp_path):
     from switchboard.store import MemoryStore
     store = MemoryStore()
     sensor, dec, act, tap = _Sensor(), _Decider(), _Actuator(), _Tap()
-    bus = Bus(str(tmp_path / "mm.db"), store=store, wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), store=store, consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(sensor); bus.add_decider(dec); bus.add_actuator(act); bus.add_tap(tap)
     await bus.start()
     try:
@@ -96,7 +96,7 @@ async def test_every_role_is_bound_with_its_own_scope(tmp_path):
 
 async def test_sensor_start_and_stop_are_called(tmp_path):
     sensor = _Sensor()
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(sensor)
     await bus.start()
     await _wait(lambda: sensor.started)
@@ -106,7 +106,7 @@ async def test_sensor_start_and_stop_are_called(tmp_path):
 
 async def test_actuator_is_closed_on_stop(tmp_path):
     act = _Actuator()
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_actuator(act)
     await bus.start()
     await bus.stop()
@@ -127,7 +127,7 @@ async def test_a_sensor_that_raises_has_its_timers_stopped(tmp_path):
         async def stop(self): pass
 
     s = _Exploding()
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(s)
     await bus.start()
     try:
@@ -152,7 +152,7 @@ async def test_a_sensor_that_returns_cleanly_keeps_its_timers(tmp_path):
         async def stop(self): pass
 
     s = _Quiet()
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(s)
     await bus.start()
     try:
@@ -175,7 +175,7 @@ async def test_timers_stop_before_the_sensor_they_belong_to(tmp_path):
         async def stop(self):
             order.append("stop")
 
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(_Watching())
     await bus.start()
     await _wait(lambda: "tick" in order)
@@ -204,7 +204,7 @@ async def test_routes_are_registered_before_the_server_starts(tmp_path):
         async def stop(self): pass
 
     bus = Bus(str(tmp_path / "mm.db"), http=_RecordingHttp(),
-              wait_ms=50, reaper_interval=3600.0)
+              consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(_Routed())
     await bus.start()
     try:
@@ -232,7 +232,7 @@ async def test_bus_stamps_the_emitting_role_on_every_message(tmp_path):
             await self.ctx.emit("thing.happened", {"v": 1})
         async def stop(self): pass
 
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(_Emitting()); bus.add_decider(_Decider())
     bus.add_actuator(_Actuator()); bus.add_tap(_Spy())
     await bus.start()
@@ -265,7 +265,7 @@ async def test_each_sensor_is_attributed_to_itself(tmp_path):
             async def stop(self): pass
         return _S()
 
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(make("alpha")); bus.add_sensor(make("beta"))
     bus.add_tap(_Spy())
     await bus.start()

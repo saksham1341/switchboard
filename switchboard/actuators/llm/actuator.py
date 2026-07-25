@@ -25,7 +25,6 @@ from typing import Protocol, runtime_checkable
 # it is waiting on — the provider's header is the delay that actually works.
 TRANSIENT_STATUS = frozenset({408, 429})
 
-_RETRY_CAP = 120.0     # never wait longer than this on a provider's say-so
 _DUR_UNITS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 
 
@@ -46,11 +45,15 @@ def _duration_seconds(s):
 
 
 def parse_retry_after(resp):
-    """The delay a rate-limited response tells us to wait, capped, or None.
+    """The delay a rate-limited response tells us to wait, or None.
 
     Prefers the standard `Retry-After` header; falls back to the token-window
     reset some providers surface (Groq's `x-ratelimit-reset-tokens`, often
     sub-second). None → the caller lets the Bus pick its own backoff.
+
+    Reports the provider's raw value uncapped: how long to defer a message is
+    Bus policy, not a provider detail. The Bus clamps it against its own
+    retry_after_max_s.
     """
     headers = getattr(resp, "headers", {})
     val = _duration_seconds(headers.get("retry-after"))
@@ -58,7 +61,7 @@ def parse_retry_after(resp):
         val = _duration_seconds(headers.get("x-ratelimit-reset-tokens"))
     if val is None:
         return None
-    return max(0.0, min(val, _RETRY_CAP))
+    return max(0.0, val)
 
 
 class LlmError(Exception):

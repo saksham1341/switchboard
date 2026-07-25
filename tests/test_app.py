@@ -38,11 +38,38 @@ def test_build_wires_discord_and_relay(tmp_path):
     assert {"ping", "echo", "github-notify"} <= {d.name for d in bus._deciders}
 
 
-def test_max_log_messages_reaches_the_bus(tmp_path):
-    # SB_MAX_LOG_MESSAGES is passed through compose; it must not be inert.
-    bus, _ = build(_base(tmp_path) | {"max_log_messages": 250})
-    assert bus._max_log_messages == 250
-    assert build(_base(tmp_path))[0]._max_log_messages == 10_000   # default
+def test_log_max_messages_reaches_the_bus(tmp_path):
+    # SB_LOG_MAX_MESSAGES is passed through compose; it must not be inert.
+    bus, _ = build(_base(tmp_path) | {"log_max_messages": 250})
+    assert bus._log_max_messages == 250
+    assert build(_base(tmp_path))[0]._log_max_messages == 100_000   # default
+
+
+def test_env_names_reach_the_bus(tmp_path, monkeypatch):
+    """Every knob is env-configurable and lands where its name says."""
+    from switchboard.app import build
+    cfg = {"mamamia_db_path": str(tmp_path / "mm.db"),
+           "switchboard_db_path": str(tmp_path / "sb.db"),
+           "github_secret": "s", "port": 8161,
+           "message_max_retries": 3, "handler_timeout_s": 7.0,
+           "retry_backoff_max_s": 11.0, "retry_after_max_s": 13.0,
+           "log_max_messages": 100_000}
+    bus, _ = build(cfg)
+    assert bus._message_max_retries == 3
+    assert bus._handler_timeout_s == 7.0
+    assert bus._retry_backoff_max_s == 11.0
+    assert bus._retry_after_max_s == 13.0
+    assert bus._log_max_messages == 100_000
+
+
+def test_log_max_messages_defaults_to_100k(tmp_path):
+    """clock.tick emits 1440/day; at the old 10k default ticks would fill the
+    log in about a week and evict real history."""
+    from switchboard.app import build
+    bus, _ = build({"mamamia_db_path": str(tmp_path / "mm.db"),
+                    "switchboard_db_path": str(tmp_path / "sb.db"),
+                    "github_secret": "s", "port": 8162})
+    assert bus._log_max_messages == 100_000
 
 
 def test_relay_decider_absent_without_notify_channel(tmp_path):
@@ -96,7 +123,7 @@ async def test_maintenance_timer_is_registered_and_started(tmp_path):
     from switchboard.bus import Bus
     from tests.test_bus import _wait
     calls = []
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.schedule_maintenance("store", 0.02, lambda: calls.append(1))
     await bus.start()
     try:
@@ -114,6 +141,16 @@ def test_kv_actuator_is_always_wired(tmp_path):
         "github_secret": "s", "port": 8131,
     })
     assert "kv" in bus.topology()["actuators"]
+
+
+def test_the_clock_sensor_is_always_wired(tmp_path):
+    """It has no dependencies and nothing to configure — like the kv actuator,
+    it ships with the platform and sits idle until something subscribes."""
+    from switchboard.app import build
+    bus, _ = build({"mamamia_db_path": str(tmp_path / "mm.db"),
+                    "switchboard_db_path": str(tmp_path / "sb.db"),
+                    "github_secret": "s", "port": 8163})
+    assert "clock" in bus.topology()["sensors"]
 
 
 def test_wiring_discord_needs_no_flag_to_listen_for_messages(tmp_path):
@@ -291,3 +328,77 @@ def test_a_missing_model_fails_fast(tmp_path):
     with pytest.raises(ValueError):
         build(_cfg(tmp_path, 8156, llm_backend="openai", llm_api_key="k",
                    llm_base_url="http://x"))
+
+
+def test_the_watchdog_threshold_is_derived_from_the_bus_not_hardcoded(tmp_path):
+    """A literal would silently go stale: the handler timeout is multiplied by
+    (retries + 1), so changing it moves the legitimate-work window by minutes.
+    Derived, the watchdog follows."""
+    from switchboard.app import build
+    cfg = {"mamamia_db_path": str(tmp_path / "mm.db"),
+           "switchboard_db_path": str(tmp_path / "sb.db"),
+           "github_secret": "s", "port": 8164,
+           "discord_bot_token": "t", "discord_application_id": "1",
+           "llm_backend": "openai", "llm_api_key": "k",
+           "llm_base_url": "http://x", "llm_model": "m",
+           "handler_timeout_s": 100.0}
+    bus, _ = build(cfg)
+    agent = next(d for d in bus._deciders if d.name == "agent")
+    assert agent._stuck_after > bus.worst_case_retry_seconds
+
+
+def test_raising_the_handler_timeout_moves_the_watchdog(tmp_path):
+    from switchboard.app import build
+    def mk(port, t):
+        bus, _ = build({"mamamia_db_path": str(tmp_path / f"mm{port}.db"),
+                        "switchboard_db_path": str(tmp_path / f"sb{port}.db"),
+                        "github_secret": "s", "port": port,
+                        "discord_bot_token": "t", "discord_application_id": "1",
+                        "llm_backend": "openai", "llm_api_key": "k",
+                        "llm_base_url": "http://x", "llm_model": "m",
+                        "handler_timeout_s": t})
+        return next(d for d in bus._deciders if d.name == "agent")._stuck_after
+    assert mk(8165, 100.0) > mk(8166, 30.0)
+
+
+def _agent_with(tmp_path, port, **extra):
+    from switchboard.app import build
+    bus, _ = build({"mamamia_db_path": str(tmp_path / f"mm{port}.db"),
+                    "switchboard_db_path": str(tmp_path / f"sb{port}.db"),
+                    "github_secret": "s", "port": port,
+                    "discord_bot_token": "t", "discord_application_id": "1",
+                    "llm_backend": "openai", "llm_api_key": "k",
+                    "llm_base_url": "http://x", "llm_model": "m", **extra})
+    return bus, next(d for d in bus._deciders if d.name == "agent")
+
+
+def test_the_stuck_margin_is_a_multiplier_of_the_derived_window(tmp_path):
+    bus, agent = _agent_with(tmp_path, 8167, stuck_margin=2.0)
+    assert agent._stuck_after == bus.worst_case_retry_seconds * 2.0
+
+
+def test_a_stuck_margin_below_one_is_clamped(tmp_path):
+    """The whole point of deriving the threshold is that it sits PAST the
+    retry window. A margin under 1.0 would put it inside, freeing sessions
+    whose commands are still legitimately retrying -- so it cannot be
+    expressible, however the env is set."""
+    bus, agent = _agent_with(tmp_path, 8168, stuck_margin=0.1)
+    assert agent._stuck_after >= bus.worst_case_retry_seconds
+
+
+def test_an_inverted_session_ttl_is_raised_above_the_watchdog_window(tmp_path):
+    """_end_if_expired is only harmless because the stuck check always fires
+    first. SB_SESSION_TTL_S=1800 inverts that -- and then a busy session whose
+    command is still LEGITIMATELY retrying is deleted mid-turn and its result
+    dropped. The relationship is enforced where both numbers are derived, not
+    left to the operator."""
+    bus, agent = _agent_with(tmp_path, 8171, session_ttl_s=1800.0)
+    assert agent._stuck_after < agent._session_ttl_s
+
+
+def test_a_sane_session_ttl_is_left_exactly_as_configured(tmp_path):
+    """The clamp must be a floor, not a rewrite: a TTL already above the
+    watchdog window is the operator's number and stays untouched."""
+    bus, agent = _agent_with(tmp_path, 8172, session_ttl_s=14400.0)
+    assert agent._session_ttl_s == 14400.0
+    assert agent._stuck_after < 14400.0

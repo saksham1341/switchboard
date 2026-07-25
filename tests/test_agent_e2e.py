@@ -61,8 +61,8 @@ class _FakePost:
 async def test_a_mention_produces_a_reply_through_the_real_bus(tmp_path):
     llm, post = _FakeLlm(), _FakePost()
     bus = Bus(str(tmp_path / "mm.db"), store=MemoryStore(),
-              wait_ms=50, reaper_interval=3600.0)
-    bus.add_decider(AgentDecider(tools=[TOOL], model="test-model"))
+              consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
+    bus.add_decider(AgentDecider(tools=[TOOL], model="test-model", stuck_after=1800.0))
     bus.add_actuator(llm)
     bus.add_actuator(post)
     await bus.start()
@@ -98,8 +98,8 @@ async def test_a_mention_produces_a_reply_through_the_real_bus(tmp_path):
 async def test_a_producers_rendered_text_reaches_the_model(tmp_path):
     llm, post = _FakeLlm(), _FakePost()
     bus = Bus(str(tmp_path / "mm.db"), store=MemoryStore(),
-              wait_ms=50, reaper_interval=3600.0)
-    bus.add_decider(AgentDecider(tools=[TOOL], model="test-model"))
+              consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
+    bus.add_decider(AgentDecider(tools=[TOOL], model="test-model", stuck_after=1800.0))
     bus.add_actuator(llm)
     bus.add_actuator(post)
     await bus.start()

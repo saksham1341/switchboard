@@ -22,7 +22,8 @@ from pathlib import Path
 import httpx
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from switchboard.dashboard.stats import FRAME_KEYS, backfill, dead_message_ids
+from switchboard.dashboard.stats import FRAME_KEYS, backfill
+from switchboard.sensors.deadletter import DEADLETTER
 
 
 def _reframe(frame: dict) -> dict:
@@ -33,6 +34,14 @@ logger = logging.getLogger(__name__)
 
 QUEUE_MAX = 256          # tap-side buffer before the oldest frames are dropped
 CLIENT_MAX = 256         # per-browser buffer
+DEAD_MAX = 500           # DEFAULT ONLY -- the real bound is passed in from the
+                         # configured log_max_dead. The poll this replaced
+                         # re-derived the list from message_state and was
+                         # bounded by that ceiling for free; nothing rebuilds it
+                         # now, so the bound has to be carried here. A hardcoded
+                         # 500 was accurate only while SB_LOG_MAX_DEAD was at
+                         # its default -- raising the env var silently truncated
+                         # the dashboard's view of what had died.
 POST_TIMEOUT = 2.0
 PAGE = Path(__file__).with_name("page.html")
 
@@ -43,7 +52,17 @@ def project(log: str, view) -> dict:
 
     Observation payloads carry GitHub bodies, Discord user ids, and a live
     interaction_token — which is a capability, not merely data.
+
+    A `switchboard.deadletter` observation is the one exception worth naming:
+    its payload IS structure (which log, which message died), never producer
+    content, so `dead_log`/`dead_id` are read from it deliberately — every
+    other field below stays name/id/link, same as always.
     """
+    dead_log = dead_id = None
+    if view.name == DEADLETTER:
+        payload = getattr(view, "payload", None) or {}
+        dead_log = payload.get("log")
+        dead_id = payload.get("message_id")
     return {
         "log": log,
         "id": view.id,
@@ -51,6 +70,8 @@ def project(log: str, view) -> dict:
         "emitted_by": view.emitted_by,
         "observation_id": getattr(view, "observation_id", None),
         "command_id": getattr(view, "command_id", None),
+        "dead_log": dead_log,
+        "dead_id": dead_id,
         "seen_at": time.time(),
     }
 
@@ -125,12 +146,18 @@ class DashboardTap:
 class Dashboard:
     """Serves the page, accepts authenticated frames, fans them out over SSE."""
 
-    def __init__(self, topology: dict, token: str, db_path: str):
+    def __init__(self, topology: dict, token: str, db_path: str,
+                 dead_max: int = DEAD_MAX):
         self._topology = topology
         self._token = token
         self._db = db_path
+        self._dead_max = dead_max
         self._clients: set[asyncio.Queue] = set()
         self._dead: list[dict] = []
+        # Membership index for _dead, trimmed with it. The list is what the
+        # browser gets (order matters); this is only so the dedupe below is not
+        # a linear scan of 500 entries per frame.
+        self._dead_seen: set[tuple] = set()
         self._dropped = 0
 
     # --- routes ----------------------------------------------------------
@@ -151,10 +178,34 @@ class Dashboard:
             return JSONResponse({"error": "malformed json"}, status_code=400)
 
         self._dropped = body.get("dropped", self._dropped)
-        for frame in body.get("frames", []):
+        new_dead = False
+        for raw in body.get("frames", []):
             # Re-shape to the allowlist at the boundary too: the browser escapes
             # on render, but a frame with unexpected keys should never reach it.
-            self._broadcast({"type": "event", "frame": _reframe(frame)})
+            frame = _reframe(raw)
+            if (frame["name"] == DEADLETTER and frame["dead_log"] is not None
+                    and frame["dead_id"] is not None):
+                entry = {"log": frame["dead_log"], "id": frame["dead_id"]}
+                mark = (frame["dead_log"], frame["dead_id"])
+                if mark not in self._dead_seen:
+                    self._dead.append(entry)
+                    self._dead_seen.add(mark)
+                    # Bounded, oldest first. Losing pre-restart dead letters is
+                    # accepted (nothing rebuilds this list any more); an
+                    # unbounded one that is re-broadcast in full on every new
+                    # dead letter is not. The index is trimmed with the list, or
+                    # an evicted entry would be remembered as "already seen"
+                    # forever and could never reappear.
+                    while len(self._dead) > self._dead_max:
+                        gone = self._dead.pop(0)
+                        self._dead_seen.discard((gone["log"], gone["id"]))
+                    new_dead = True
+            self._broadcast({"type": "event", "frame": frame})
+        if new_dead:
+            # Same shape refresh_dead used to push: a dead command emits no
+            # result observation, so this list is the one signal the rest of
+            # the event stream cannot carry on its own.
+            self._broadcast({"type": "dead", "dead": self._dead})
         return JSONResponse({"status": "ok"}, status_code=202)
 
     async def stream(self, request):
@@ -192,15 +243,3 @@ class Dashboard:
             except asyncio.QueueFull:
                 # One stalled browser must not stall the others.
                 self._clients.discard(q)
-
-    def refresh_dead(self) -> None:
-        """Polled on a timer. Failure is the only signal the event stream cannot
-        carry, because a dead command produces no result observation at all."""
-        try:
-            dead = dead_message_ids(self._db)
-        except Exception as exc:
-            logger.debug("dead-letter refresh skipped: %s", exc)
-            return
-        if dead != self._dead:
-            self._dead = dead
-            self._broadcast({"type": "dead", "dead": dead})
