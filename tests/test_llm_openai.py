@@ -403,3 +403,16 @@ async def test_transient_without_a_header_leaves_retry_after_none():
         await b.complete({"model": "m", "messages": []})
     assert e.value.retry_after is None
     await b.close()
+
+
+async def test_a_429_reports_the_providers_delay_unclamped():
+    """Clamping is the Bus's policy now. The backend reports what the provider
+    said; a 3593s daily-quota answer travels intact and the Bus decides."""
+    def handler(request):
+        return httpx.Response(429, json={"error": {"message": "quota"}},
+                              headers={"retry-after": "3593"})
+    b = _backend(handler)
+    with pytest.raises(RetryableError) as e:
+        await b.complete({"model": "m", "messages": []})
+    assert e.value.retry_after == 3593.0
+    await b.close()

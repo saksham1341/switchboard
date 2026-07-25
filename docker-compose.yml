@@ -37,7 +37,24 @@ services:
       SB_DASHBOARD_TOKEN: ${SB_DASHBOARD_TOKEN:-}
 
       # --- Tuning ---
-      SB_MAX_LOG_MESSAGES: ${SB_MAX_LOG_MESSAGES:-10000}
+      # How many times a message is retried before it dead-letters.
+      SB_MESSAGE_MAX_RETRIES: ${SB_MESSAGE_MAX_RETRIES:-10}
+      # How long a handler gets per attempt before the Bus times it out.
+      SB_HANDLER_TIMEOUT_S: ${SB_HANDLER_TIMEOUT_S:-100}
+      # Ceiling on the Bus's own jittered exponential backoff between retries.
+      SB_RETRY_BACKOFF_MAX_S: ${SB_RETRY_BACKOFF_MAX_S:-300}
+      # Ceiling the Bus clamps a handler-requested retry_after to (e.g. a 429's delay).
+      SB_RETRY_AFTER_MAX_S: ${SB_RETRY_AFTER_MAX_S:-120}
+      # Long-poll wait per acquire_blocking call on the consume loop.
+      SB_CONSUMER_WAIT_MS: ${SB_CONSUMER_WAIT_MS:-30000}
+      # How often the lease reaper sweeps for expired leases.
+      SB_LEASE_REAPER_INTERVAL_S: ${SB_LEASE_REAPER_INTERVAL_S:-60}
+      # How long a processed (group, msg.id) pair is remembered for dedup.
+      SB_DEDUP_TTL_S: ${SB_DEDUP_TTL_S:-3600}
+      # Ring-buffer size of the event log before old messages are evicted.
+      SB_LOG_MAX_MESSAGES: ${SB_LOG_MAX_MESSAGES:-100000}
+      # How many dead-lettered messages are kept before the oldest are dropped.
+      SB_LOG_MAX_DEAD: ${SB_LOG_MAX_DEAD:-500}
       SB_PORT: ${SB_PORT:-8080}
     # Loopback only — never the LAN. Ingress (tunnel, reverse proxy, whatever)
     # is the host's concern, not this stack's; point it at 127.0.0.1:8080.

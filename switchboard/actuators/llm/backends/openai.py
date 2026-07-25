@@ -20,7 +20,13 @@ from switchboard.actuators.llm.actuator import (
 from switchboard.errors import RetryableError
 
 DEFAULT_MAX_TOKENS = 4096
-TIMEOUT = 120.0                 # a long completion with tools is not fast
+# One HTTP call, no tools run here, and max_tokens is capped by the caller —
+# so generation is bounded and only provider queueing varies. A short timeout
+# with retries also beats a long one: at 60s a request is far more likely dead
+# than slow, and a retry gets a fresh connection. The Bus's handler timeout
+# (100s) is the backstop above this, deliberately: the inner, specific timeout
+# should fire first and produce a meaningful error.
+TIMEOUT = 60.0
 
 _FINISH_TO_STOP = {
     "tool_calls": "tool_use",

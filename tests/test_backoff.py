@@ -17,3 +17,10 @@ def test_backoff_capped_at_5_minutes():
 
 def test_backoff_nonnegative():
     assert backoff(0) >= 0
+
+
+def test_backoff_cap_is_supplied_by_the_caller():
+    # every draw sits in [cap/2, cap] once the ceiling is reached
+    for _ in range(50):
+        d = backoff(20, cap=10.0)
+        assert 5.0 <= d <= 10.0

@@ -13,7 +13,7 @@ class _Boom:
 
 async def test_dead_letters_lists_dead(tmp_path):
     mm = str(tmp_path / "e.db")
-    b = Bus(mm, wait_ms=50, reaper_interval=3600.0)
+    b = Bus(mm, consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     b.add_decider(_Boom())
     await b.start()
     try:

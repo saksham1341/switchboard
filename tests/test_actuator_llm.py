@@ -229,13 +229,28 @@ def test_parse_retry_after_reads_a_compound_duration():
     assert abs(parse_retry_after(R()) - 86.4) < 1e-6
 
 
-def test_parse_retry_after_is_capped():
+def test_parse_retry_after_is_not_capped():
+    # Clamping is the Bus's policy now. The actuator reports what the provider
+    # said, uncapped; a daily-quota answer travels intact.
     from switchboard.actuators.llm.actuator import parse_retry_after
     class R: headers = {"retry-after": "99999"}
-    assert parse_retry_after(R()) == 120.0
+    assert parse_retry_after(R()) == 99999.0
 
 
 def test_parse_retry_after_none_when_no_header():
     from switchboard.actuators.llm.actuator import parse_retry_after
     class R: headers = {}
     assert parse_retry_after(R()) is None
+
+
+async def test_a_429_reports_the_providers_delay_unclamped():
+    """Clamping is the Bus's policy now. The backend reports what the provider
+    said; a 3593s daily-quota answer travels intact and the Bus decides."""
+    def handler(request):
+        return httpx.Response(429, json={"error": {"message": "quota"}},
+                              headers={"retry-after": "3593"})
+    b = _anthropic(handler)
+    with pytest.raises(RetryableError) as e:
+        await b.complete({"model": "m", "messages": []})
+    assert e.value.retry_after == 3593.0
+    await b.close()

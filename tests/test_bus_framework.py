@@ -41,7 +41,7 @@ class _Reg:
 
 def _drive(msgs, orch, *, retry_count=0, max_retries=10):
     """Build a Bus wired to a fake registry, ready for _consume."""
-    bus = Bus(":memory:", max_retries=max_retries)
+    bus = Bus(":memory:", message_max_retries=max_retries)
     bus._registry = _Reg(msgs, bus, orch)
     bus._running = True
     return bus
@@ -158,7 +158,7 @@ async def test_append_stores_text_only_when_given(tmp_path):
     """Absence is the default. Storing json.dumps(payload) as `text` would
     duplicate the payload byte-for-byte in metadata for zero information."""
     from switchboard.bus import Bus
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     await bus.start()
     try:
         await bus.emit_observation("a.thing", {"x": 1})
@@ -170,3 +170,56 @@ async def test_append_stores_text_only_when_given(tmp_path):
         assert metas[1]["text"] == "PRETTY"
     finally:
         await bus.stop()
+
+
+def test_worst_case_covers_both_retry_paths_and_handler_time():
+    """The two retry paths are the jittered backoff ceiling and an explicit
+    retry_after; a message takes the worse, PLUS the handler's own time on
+    every attempt. The handler term is the one people forget and it is
+    multiplied by (retries + 1)."""
+    from switchboard.bus import Bus
+    bus = Bus(":memory:", message_max_retries=10, handler_timeout_s=100.0,
+              retry_backoff_max_s=300.0, retry_after_max_s=120.0)
+    # jittered ceiling sum = 1+2+4+...+256 capped at 300 for the last = 811
+    # explicit = 10 * 120 = 1200  (the worse path)
+    # handler  = 11 * 100 = 1100
+    assert bus.worst_case_retry_seconds == 1200 + 1100
+
+
+def test_worst_case_takes_the_backoff_path_when_it_dominates():
+    from switchboard.bus import Bus
+    bus = Bus(":memory:", message_max_retries=10, handler_timeout_s=1.0,
+              retry_backoff_max_s=300.0, retry_after_max_s=0.0)
+    assert bus.worst_case_retry_seconds == 811 + 11
+
+
+def test_worst_case_moves_with_the_handler_timeout():
+    """The regression this property exists to prevent: raising the handler
+    timeout must move anything derived from it, automatically."""
+    from switchboard.bus import Bus
+    lo = Bus(":memory:", handler_timeout_s=30.0).worst_case_retry_seconds
+    hi = Bus(":memory:", handler_timeout_s=100.0).worst_case_retry_seconds
+    assert hi - lo == 11 * 70.0
+
+
+async def test_retry_after_is_clamped_by_the_bus_not_trusted(tmp_path):
+    """retry_after is a request the Bus may clamp, not a promise it obeys. A
+    provider answering with a daily-quota reset (~3593s) must not pin a
+    consumer for an hour."""
+    from switchboard.errors import RetryableError
+    orch = _Orch()
+    bus = _drive([_Msg(5, "boom")], orch)
+    bus._retry_after_max_s = 120.0
+    async def handle(v): raise RetryableError("quota", retry_after=3593.0)
+    await bus._consume(CMD_LOG, "actuator/boom", Command.from_message, lambda v: True, handle)
+    assert orch.retry_afters == [120.0]
+
+
+async def test_a_retry_after_under_the_cap_is_honoured_exactly():
+    from switchboard.errors import RetryableError
+    orch = _Orch()
+    bus = _drive([_Msg(5, "boom")], orch)
+    bus._retry_after_max_s = 120.0
+    async def handle(v): raise RetryableError("slow", retry_after=2.5)
+    await bus._consume(CMD_LOG, "actuator/boom", Command.from_message, lambda v: True, handle)
+    assert orch.retry_afters == [2.5]

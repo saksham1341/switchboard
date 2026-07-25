@@ -173,7 +173,7 @@ async def test_topology_lists_registered_roles(tmp_path):
         async def start(self): pass
         async def stop(self): pass
 
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.add_sensor(_R("github")); bus.add_decider(_R("notify")); bus.add_actuator(_R("discord.post"))
     assert bus.topology() == {"sensors": ["github"], "deciders": ["notify"],
                               "actuators": ["discord.post"]}

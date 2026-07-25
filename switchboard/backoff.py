@@ -1,7 +1,9 @@
 import random
 
+BACKOFF_BASE = 1.0   # start at one second — not a thing anyone tunes
 
-def backoff(attempts: int, *, base: float = 1.0, cap: float = 300.0) -> float:
+
+def backoff(attempts: int, *, base: float = BACKOFF_BASE, cap: float = 300.0) -> float:
     """Exponential backoff with equal jitter. The ceiling for a given attempt is
     min(cap, base * 2**attempts); the actual delay is a uniform draw in
     [ceiling/2, ceiling]. Jitter spreads retries so a burst of failures does not

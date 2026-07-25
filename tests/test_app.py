@@ -38,11 +38,38 @@ def test_build_wires_discord_and_relay(tmp_path):
     assert {"ping", "echo", "github-notify"} <= {d.name for d in bus._deciders}
 
 
-def test_max_log_messages_reaches_the_bus(tmp_path):
-    # SB_MAX_LOG_MESSAGES is passed through compose; it must not be inert.
-    bus, _ = build(_base(tmp_path) | {"max_log_messages": 250})
-    assert bus._max_log_messages == 250
-    assert build(_base(tmp_path))[0]._max_log_messages == 10_000   # default
+def test_log_max_messages_reaches_the_bus(tmp_path):
+    # SB_LOG_MAX_MESSAGES is passed through compose; it must not be inert.
+    bus, _ = build(_base(tmp_path) | {"log_max_messages": 250})
+    assert bus._log_max_messages == 250
+    assert build(_base(tmp_path))[0]._log_max_messages == 100_000   # default
+
+
+def test_env_names_reach_the_bus(tmp_path, monkeypatch):
+    """Every knob is env-configurable and lands where its name says."""
+    from switchboard.app import build
+    cfg = {"mamamia_db_path": str(tmp_path / "mm.db"),
+           "switchboard_db_path": str(tmp_path / "sb.db"),
+           "github_secret": "s", "port": 8161,
+           "message_max_retries": 3, "handler_timeout_s": 7.0,
+           "retry_backoff_max_s": 11.0, "retry_after_max_s": 13.0,
+           "log_max_messages": 100_000}
+    bus, _ = build(cfg)
+    assert bus._message_max_retries == 3
+    assert bus._handler_timeout_s == 7.0
+    assert bus._retry_backoff_max_s == 11.0
+    assert bus._retry_after_max_s == 13.0
+    assert bus._log_max_messages == 100_000
+
+
+def test_log_max_messages_defaults_to_100k(tmp_path):
+    """clock.tick emits 1440/day; at the old 10k default ticks would fill the
+    log in about a week and evict real history."""
+    from switchboard.app import build
+    bus, _ = build({"mamamia_db_path": str(tmp_path / "mm.db"),
+                    "switchboard_db_path": str(tmp_path / "sb.db"),
+                    "github_secret": "s", "port": 8162})
+    assert bus._log_max_messages == 100_000
 
 
 def test_relay_decider_absent_without_notify_channel(tmp_path):
@@ -96,7 +123,7 @@ async def test_maintenance_timer_is_registered_and_started(tmp_path):
     from switchboard.bus import Bus
     from tests.test_bus import _wait
     calls = []
-    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    bus = Bus(str(tmp_path / "mm.db"), consumer_wait_ms=50, lease_reaper_interval_s=3600.0)
     bus.schedule_maintenance("store", 0.02, lambda: calls.append(1))
     await bus.start()
     try:

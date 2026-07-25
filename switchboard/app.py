@@ -55,7 +55,15 @@ def build(config: dict):
                       port=int(config.get("port", 8080)))
     store = SqliteStore(config["switchboard_db_path"])
     bus = Bus(config["mamamia_db_path"], store=store, http=http,
-              max_log_messages=int(config.get("max_log_messages", 10_000)))
+              message_max_retries=int(config.get("message_max_retries", 10)),
+              handler_timeout_s=float(config.get("handler_timeout_s", 100.0)),
+              retry_backoff_max_s=float(config.get("retry_backoff_max_s", 300.0)),
+              retry_after_max_s=float(config.get("retry_after_max_s", 120.0)),
+              consumer_wait_ms=int(config.get("consumer_wait_ms", 30_000)),
+              lease_reaper_interval_s=float(config.get("lease_reaper_interval_s", 60.0)),
+              dedup_ttl_s=float(config.get("dedup_ttl_s", 3600.0)),
+              log_max_messages=int(config.get("log_max_messages", 100_000)),
+              log_max_dead=int(config.get("log_max_dead", 500)))
     bus.add_tap(LoggerTap())
     # Memory, always available. No key, no cost, no external call — it is local
     # storage over the store the Bus already holds, and it sits idle until
@@ -164,7 +172,15 @@ async def run() -> None:
         "switchboard_db_path": os.path.join(data_dir, "switchboard.db"),
         "github_secret": os.environ["GITHUB_WEBHOOK_SECRET"],
         "port": int(os.environ.get("SB_PORT", "8080")),
-        "max_log_messages": int(os.environ.get("SB_MAX_LOG_MESSAGES", "10000")),
+        "message_max_retries": int(os.environ.get("SB_MESSAGE_MAX_RETRIES", "10")),
+        "handler_timeout_s": float(os.environ.get("SB_HANDLER_TIMEOUT_S", "100")),
+        "retry_backoff_max_s": float(os.environ.get("SB_RETRY_BACKOFF_MAX_S", "300")),
+        "retry_after_max_s": float(os.environ.get("SB_RETRY_AFTER_MAX_S", "120")),
+        "consumer_wait_ms": int(os.environ.get("SB_CONSUMER_WAIT_MS", "30000")),
+        "lease_reaper_interval_s": float(os.environ.get("SB_LEASE_REAPER_INTERVAL_S", "60")),
+        "dedup_ttl_s": float(os.environ.get("SB_DEDUP_TTL_S", "3600")),
+        "log_max_messages": int(os.environ.get("SB_LOG_MAX_MESSAGES", "100000")),
+        "log_max_dead": int(os.environ.get("SB_LOG_MAX_DEAD", "500")),
         "discord_bot_token": os.environ.get("DISCORD_BOT_TOKEN"),
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),

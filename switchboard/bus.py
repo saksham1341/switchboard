@@ -10,7 +10,7 @@ from mamamia.server.lease.sqlite import SQLiteLeaseManager
 from mamamia.server.transaction import SQLiteTransaction
 from mamamia.server.registry import LogRegistry
 
-from switchboard.backoff import backoff
+from switchboard.backoff import backoff, BACKOFF_BASE
 from switchboard.errors import PermanentError, RetryableError
 from switchboard.http import HttpServer
 from switchboard.message import (
@@ -33,17 +33,20 @@ def _as_async(fn):
 
 class Bus:
     def __init__(self, mamamia_db_path, *, store=None, http=None,
-                 default_timeout_s=30.0, wait_ms=30_000, reaper_interval=60.0,
-                 max_retries=10, max_log_messages=10_000, max_dead=500,
-                 processed_ttl=3600.0):
+                 message_max_retries=10, handler_timeout_s=100.0,
+                 retry_backoff_max_s=300.0, retry_after_max_s=120.0,
+                 consumer_wait_ms=30_000, lease_reaper_interval_s=60.0,
+                 dedup_ttl_s=3600.0, log_max_messages=100_000, log_max_dead=500):
         self._db = mamamia_db_path
-        self._default_timeout_s = default_timeout_s
-        self._wait_ms = wait_ms
-        self._reaper_interval = reaper_interval
-        self._max_retries = max_retries
-        self._max_log_messages = max_log_messages
-        self._max_dead = max_dead
-        self._processed_ttl = processed_ttl
+        self._message_max_retries = message_max_retries
+        self._handler_timeout_s = handler_timeout_s
+        self._retry_backoff_max_s = retry_backoff_max_s
+        self._retry_after_max_s = retry_after_max_s
+        self._consumer_wait_ms = consumer_wait_ms
+        self._lease_reaper_interval_s = lease_reaper_interval_s
+        self._dedup_ttl_s = dedup_ttl_s
+        self._log_max_messages = log_max_messages
+        self._log_max_dead = log_max_dead
 
         self._instance = f"sb-{uuid.uuid4().hex}"
         self._sensors, self._deciders, self._actuators, self._taps = [], [], [], []
@@ -63,6 +66,26 @@ class Bus:
         # without any of them binding a port.
         self._http = http if http is not None else HttpServer(serve=False)
         self._scheduler = Scheduler()
+
+    @property
+    def worst_case_retry_seconds(self) -> float:
+        """Longest a message can legitimately stay in flight before it dead-letters.
+
+        Two retry paths exist and a message takes the worse of them: the
+        jittered backoff ceiling, or an explicit retry_after. Both are then
+        paid on top of the handler's own time on EVERY attempt — the term
+        people forget, and it is multiplied by (retries + 1).
+
+        Anything watching for a stuck consumer must sit above this or it will
+        kill live work. Derived rather than chosen precisely because the
+        handler timeout is the most leveraged knob here: an 80s change to it
+        moves this by 15 minutes.
+        """
+        jittered = sum(min(self._retry_backoff_max_s, BACKOFF_BASE * 2 ** i)
+                       for i in range(self._message_max_retries))
+        explicit = self._message_max_retries * self._retry_after_max_s
+        return (max(jittered, explicit)
+                + (self._message_max_retries + 1) * self._handler_timeout_s)
 
     def topology(self) -> dict:
         """What is actually wired, by kind and name — so a view draws the real
@@ -126,12 +149,12 @@ class Bus:
         self._registry = LogRegistry(
             storage=SQLiteStorage(self._conn), state=SQLiteStateStore(self._conn),
             lease=SQLiteLeaseManager(self._conn), transaction=SQLiteTransaction(self._conn),
-            max_log_messages=self._max_log_messages, max_dead=self._max_dead,
+            max_log_messages=self._log_max_messages, max_dead=self._log_max_dead,
         )
         for log in (OBS_LOG, CMD_LOG):
-            self._registry.get_orchestrator(log).max_retries = self._max_retries
+            self._registry.get_orchestrator(log).max_retries = self._message_max_retries
         self._running = True
-        self._registry.start_reaper(interval=self._reaper_interval)
+        self._registry.start_reaper(interval=self._lease_reaper_interval_s)
 
         def scoped(kind, name):
             return ScopedStore(self._store, f"{kind}/{name}/")
@@ -229,12 +252,12 @@ class Bus:
         return await self._bus_store.get(f"processed:{group_id}:{mid}") is not None
 
     async def _mark_processed(self, group_id, mid) -> None:
-        await self._bus_store.set(f"processed:{group_id}:{mid}", "1", ttl=self._processed_ttl)
+        await self._bus_store.set(f"processed:{group_id}:{mid}", "1", ttl=self._dedup_ttl_s)
 
     # generic consume loop shared by all consuming roles
     async def _consume(self, log, group_id, decode, keep, handle):
         orch = self._registry.get_orchestrator(log)
-        timeout_s, lease_s = self._default_timeout_s, self._default_timeout_s * 2
+        timeout_s, lease_s = self._handler_timeout_s, self._handler_timeout_s * 2
 
         async def settle(mid, outcome, retry_after=0.0):
             try:
@@ -245,7 +268,7 @@ class Bus:
         while self._running:
             try:
                 msg = await self._registry.acquire_blocking(
-                    log, group_id, self._instance, duration=lease_s, wait_ms=self._wait_ms)
+                    log, group_id, self._instance, duration=lease_s, wait_ms=self._consumer_wait_ms)
                 if msg is None:
                     continue
                 if await self._already_processed(group_id, msg.id):
@@ -265,15 +288,19 @@ class Bus:
                 except PermanentError:
                     await settle(msg.id, Outcome.DEAD)
                 except RetryableError as e:
-                    # The handler knows the delay (e.g. a 429's retry-after); use
-                    # it. None means "retry, but you pick when" → same as any
-                    # plain exception below.
                     attempts = await orch.state_store.get_retry_count(log, group_id, msg.id)
-                    delay = e.retry_after if e.retry_after is not None else backoff(attempts)
+                    if e.retry_after is None:
+                        delay = backoff(attempts, cap=self._retry_backoff_max_s)
+                    else:
+                        # A request, not a promise. A provider can honestly answer
+                        # with a daily-quota reset (~3593s); honouring that would
+                        # pin the consumer for an hour.
+                        delay = min(e.retry_after, self._retry_after_max_s)
                     await settle(msg.id, Outcome.RETRY, retry_after=delay)
                 except Exception:
                     attempts = await orch.state_store.get_retry_count(log, group_id, msg.id)
-                    await settle(msg.id, Outcome.RETRY, retry_after=backoff(attempts))
+                    await settle(msg.id, Outcome.RETRY,
+                                 retry_after=backoff(attempts, cap=self._retry_backoff_max_s))
             except asyncio.CancelledError:
                 raise
             except Exception:
