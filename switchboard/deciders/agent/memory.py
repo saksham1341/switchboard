@@ -30,32 +30,52 @@ from switchboard.actuators.kv import OPS
 SCRATCHPAD = "scratchpad"
 MEMORY = "memory"
 
-# A run of one or more namespace-looking leading segments a hostile key might
-# supply to try to climb out of its namespace: bare ".." path-traversal
-# segments, or a "word:" prefix mimicking a real namespace tag (e.g.
-# "session:999:" or "global:"). Stripped before the real prefix is applied so
-# the model can never plant its own namespace tag in the final key.
-_LEADING_JUNK = re.compile(r"^(?:\.\.|[^:/]*:)+")
+# A leading run of ".." path-traversal segments. Only ".." — a namespace tag
+# needs a colon, and by the time this runs there are none left to find (see
+# _sanitize_key). Neutralised anyway: a key that opens with ".." is a key
+# trying to climb, and it should not read as one in the store.
+_LEADING_DOTS = re.compile(r"^(?:\.\.)+")
+
+# The two characters a tail must never contain literally, and what each is
+# encoded as. `:` because it is what makes a namespace tag ("global:",
+# "session:999:") — a tail with no colon cannot forge one, whatever else it
+# says. `/` because it is the ScopedStore separator. `%` leads the list
+# because it is the escape character: encoding it first is what makes this a
+# reversible mapping rather than a mangling, so two distinct model keys can
+# never land on one stored key.
+_ENCODE = (("%", "%25"), (":", "%3A"), ("/", "%2F"))
 
 
 def _sanitize_key(key: object) -> str:
-    """Reduce a model-supplied key to a bare tail: no path separators, no
-    leading path-traversal, no leading namespace-looking prefix. Treats the
-    input as hostile -- a non-string collapses to the empty tail rather than
-    raising, so a malformed call still lands (harmlessly) inside the caller's
-    own namespace instead of blowing up the fan-out.
+    """Reduce a model-supplied key to a tail that cannot name a namespace.
+
+    Treats the input as hostile -- a non-string collapses to the empty tail
+    rather than raising, so a malformed call still lands (harmlessly) inside
+    the caller's own namespace instead of blowing up the fan-out.
+
+    Encoding, not truncating. The previous rule stripped a leading run of
+    namespace-looking segments, and because that run was greedy through the
+    LAST colon it silently reduced every colon-delimited key to its final
+    segment: 'project:alpha:status' and 'project:beta:status' both became
+    'status', so the second memory destroyed the first with no signal to the
+    model -- `op: list` showed only the collapsed key. A colon-delimited key is
+    the most likely thing an LLM types into a key/value store, and the tool
+    description tells it not to worry about namespacing, which reads as
+    "colons are harmless", not "your key is cut down to its last segment".
+
+    The security property is unchanged and is why the encoding is chosen this
+    way rather than a strip: a namespace tag is made of colons, so a tail that
+    contains no literal colon cannot forge one no matter what it spells. The
+    `startswith(prefix)` re-check in _namespaced_key still backs it up.
     """
     if not isinstance(key, str):
         return ""
-    key = key.replace("/", "")
-    # Strip repeatedly: an attacker can chain traversal and fake-namespace
-    # segments ("../session:999:secret", "session:999:../secret"), and a
-    # single pass would only catch the outermost one.
-    while True:
-        stripped = _LEADING_JUNK.sub("", key)
-        if stripped == key:
-            return stripped
-        key = stripped
+    for raw, encoded in _ENCODE:
+        key = key.replace(raw, encoded)
+    # Encoded, not deleted, for the same reason: deleting a leading ".." would
+    # map '..notes' and 'notes' onto one stored key, reintroducing in miniature
+    # the collision this function exists to stop.
+    return _LEADING_DOTS.sub(lambda m: "%2E" * len(m.group(0)), key)
 
 
 def _namespaced_key(prefix: str, raw_key: object) -> str:
