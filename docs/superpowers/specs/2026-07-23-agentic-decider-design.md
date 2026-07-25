@@ -1,6 +1,8 @@
 # Agentic Decider — Design (SSOT)
 
-**Status:** Approved design, co-designed in conversation. **Not yet implemented.** Built later, one layer at a time, so each lands clean.
+**Status:** **Built and running** through Phase 4 (the turn loop). Phases 1–4 are live; the pieces still outstanding are listed in §13 and marked Phase 5. Built one layer at a time, so each landed clean.
+
+This doc is reconciled against the code, not against its own earlier drafts — where running the system contradicted the design, the design was corrected and the reason recorded.
 
 **What this is:** the single source of truth for how an LLM agent runs *inside* Switchboard — as a role in the four-role substrate, not as a sandboxed process bolted on. Read it top to bottom once for the mental model; after that, jump to the section you need.
 
@@ -38,7 +40,7 @@ One rule follows directly, and §6.6 is only its application: **a decider sees t
 |---|---|
 | **Sensor** | `discord.message` — a Discord channel/thread message becomes an observation |
 | **Decider** | `AgentDecider` — the router. The *only* agent-specific component |
-| **Actuator** | `llm` (the model), `kv` (memory), `web_search`, the reply actuator, … |
+| **Actuator** | `llm` (the model), `kv` (memory), `discord.post` (the reply), `discord.history`, `discord.react`, … |
 | **Tap** | unchanged — the dashboard/logger observe the whole episode |
 
 Everything except `AgentDecider` is a dumb, agent-unaware `command → effect + result` box. The "agent-ness" lives entirely in the decider.
@@ -54,14 +56,12 @@ Three roles, three scoped `KeyStore`s, and — per the substrate rule — **they
 │      decider/agent          │   │       actuator/llm          │   │       actuator/kv           │
 │  orchestration state        │   │  billing safety             │   │  the model's memory         │
 │                             │   │                             │   │                             │
-│  thread:<tid> → sid         │   │  cost ledger (tokens, $)    │   │  session:<sid>:*  scratchpad │
-│  session:<sid>:messages     │   │  [done:<cmd_id> deferred]   │   │  global:*         long-term  │
-│  session:<sid>:turn         │   │                             │   │                             │
-│  session:<sid>:spent        │   │                             │   │                             │
-│  session:<sid>:state        │   │                             │   │                             │
-│  session:<sid>:buffer       │   │                             │   │                             │
+│  thread:discord:<key> → sid │   │  cost ledger (tokens, $)    │   │  session:<sid>:*  scratchpad │
+│  session:<sid> → {           │   │  [Phase 5]                  │   │  global:*         long-term  │
+│    state, turn, messages,   │   │  [done:<cmd_id> deferred]   │   │  [Phase 5: decider-side      │
+│    buffer, gather,          │   │                             │   │   prefixing not built yet]   │
+│    channel_id, anchor }     │   │                             │   │                             │
 │  pending:<cmd_id> → {…}      │   │                             │   │                             │
-│  turn:<key>:gather          │   │                             │   │                             │
 └────────────────────────────┘   └────────────────────────────┘   └────────────────────────────┘
 ```
 
@@ -73,9 +73,9 @@ The agent therefore has a clean **three-tier memory**:
 
 | tier | where | lifetime | model access |
 |---|---|---|---|
-| conversation | `decider/agent/` `session:<sid>:messages` | the session (TTL) | *is* its context; can't address as memory |
-| scratchpad | `actuator/kv/` `session:<sid>:*` | dies with session (TTL) | `scratchpad` tool |
-| long-term | `actuator/kv/` `global:*` | permanent | `memory` tool |
+| conversation | `decider/agent/` `session:<sid>` | the session (**TTL is Phase 5** — today it does not expire) | *is* its context; can't address as memory |
+| scratchpad | `actuator/kv/` `session:<sid>:*` | dies with session (TTL) | `scratchpad` tool — **Phase 5** |
+| long-term | `actuator/kv/` `global:*` | permanent | `memory` tool — **Phase 5** |
 
 ---
 
@@ -87,7 +87,7 @@ Everything the agent does is one of these messages. `emitted_by` is stamped by t
 
 | name | from | carries |
 |---|---|---|
-| `discord.message` | sensor/discord | `{thread_id, channel_id, user, content, mentions}` |
+| `discord.message` | sensor/discord | `{message_id, channel_id, thread_id, parent_id, guild_id, user_id, user_name, content, mentions, mentions_bot, bot_mention_ids, mention_everyone, thread:{is_thread, message_count}}` |
 | `llm.ok` | actuator/llm | `{stop_reason, content:[blocks], usage}` (has `command_id`) |
 | `<tool>.ok` | tool actuator | tool result payload (has `command_id`) |
 | `<tool>.error` | tool actuator | `{message}` — a *handled* failure (has `command_id`) |
@@ -99,8 +99,12 @@ Everything the agent does is one of these messages. `emitted_by` is stamped by t
 |---|---|---|
 | `llm` | actuator/llm | `{system, messages, tools, model, max_tokens}` |
 | `kv` | actuator/kv | `{op, key, value?, ttl?}` |
-| `web_search` | actuator/web_search | `{query}` |
-| `discord.reply` | reply actuator | `{content, <destination injected by decider>}` |
+| `discord.post` | actuator/discord.post | `{content, channel_id, reply_to_message_id?}` — **the agent's reply** |
+| `discord.history` | actuator/discord.history | `{channel_id, limit?, before?}` |
+| `discord.react` | actuator/discord.react | `{channel_id, message_id, emoji}` |
+| `discord.reply_to_command` | actuator/discord.reply_to_command | `{interaction_token, content}` — slash-command followup, **not** the agent's reply and not a tool |
+
+The names matter and were renamed once in flight: `discord.post` is how the agent speaks (optionally threading under a message via `reply_to_message_id`), while `discord.reply_to_command` answers a `/ping`-style interaction and carries no `tool_spec`. The original `discord.reply` name meant the latter but read as the former, which is exactly the confusion the rename removed.
 
 ---
 
@@ -132,7 +136,7 @@ decide(obs):
     (kind=="tool") → on_gather(p, obs)
 
 advance(sid):                          # the SOLE way a session takes a turn
-    if turn >= MAX_TURNS or spent > MAX_SPEND:  halt(sid); return   # §9
+    # no turn cap — see §9. MAX_SPEND is the Phase 5 backstop and goes here.
     turn++
     flush buffer → one combined user turn appended to messages
     tools = configured_tool_specs + [scratchpad, memory]
@@ -172,7 +176,11 @@ One `llm.ok` can carry several `tool_use` blocks (parallel calls), and Anthropic
 
 ### 6.1 Identity — free from the substrate
 
-`session_id = the id of the discord.message observation that started it.` mamamia hands every observation a unique monotonic id, so the first message *is* the session's name — no minting mechanism. The thread mapping is **learned from the reply's result**: the reply actuator creates/uses a thread and returns its id in `discord.reply.ok`; the decider records `thread:discord:<thread_id> → sid`. From then on every message in that thread routes to the session.
+`session_id = the id of the discord.message observation that started it.` mamamia hands every observation a unique monotonic id, so the first message *is* the session's name — no minting mechanism.
+
+The routing key is taken **from the incoming message itself**, at mint: `thread_id or channel_id`. The decider records `thread:discord:<key> → sid`, and from then on every message arriving under that key routes to the session. (An earlier draft had the mapping *learned from a reply's result* — the reply actuator creating a thread and returning its id. That was never built: the agent does not create threads, it posts into whatever channel or thread the conversation already lives in, so the key is known the moment the first message arrives and needs no round-trip.)
+
+A consequence worth stating plainly: in a **plain channel** the key is the channel, so everyone in that channel shares one session and one transcript. In a thread the key is the thread, which is narrower. Neither is a privacy boundary — see §12 hole 6.
 
 The key is **source-qualified**, not source-neutral. Extracting the routing id is per-source work — `thread_id or channel_id` for Discord, something else for anything later — and the qualifier keeps two sources' id spaces from ever sharing a namespace. Note the direction: the generalization that eventually pays is a *more specific* key, not an abstract one. Session state is persisted, so a key rename is a migration rather than a find-and-replace; the qualifier costs nothing today and removes that later.
 
@@ -180,9 +188,11 @@ The key is **source-qualified**, not source-neutral. Extracting the routing id i
 
 Every session has a **buffer** of pending input. Messages the session should hear land there; the agent only *takes a turn* on a mention.
 
+**"Mention" is broader than a direct user ping**, and each form was a live miss before it was handled. `mentions_bot` is true for a direct `<@bot>`, a mention of any **role the bot holds** (`<@&role>`), or an **`@everyone`/`@here`** broadcast. The role case matters most: a bot with a mentionable same-name role is usually pinged *by that role* — the user types `@switchboard`, Discord resolves it to the role, and discord.py files it under `role_mentions`, never `mentions`. Two "summarize this" requests were silently ignored before that was fixed. `@everyone` is included because the bot is part of everyone; it wakes and the model decides whether a broadcast wants an answer. The bot's own default role (`@everyone` as a *role* entry) is excluded from its role set, or every broadcast would match twice over.
+
 ```
 on_message(obs):
-    is_mention = bot in obs.mentions
+    is_mention = obs.mentions_bot          # user ping | bot role ping | @everyone
     sid = thread_map[thread]
     if sid is None:
         if not is_mention: return                # no session + no mention → ignore entirely
@@ -206,7 +216,9 @@ The rule has one gap, closed in §6.5: a thread that discussed something for twe
 
 `idle ↔ busy`. "Waiting on llm" vs "waiting on tools" is not a lifecycle distinction — the `pending`/gather bookkeeping already knows which. `state` is explicit, not derived, so nothing scans.
 
-### 6.4 Expiry
+### 6.4 Expiry — **Phase 5, none of this is built**
+
+> Sessions currently **never expire**. The design below is settled and unimplemented; it is recorded here so Phase 5 builds the agreed shape rather than re-deciding it. Everything in §6.4 reads as future tense.
 
 **Tracking and conversation are one record with one TTL.** `session:<sid>` holds state, messages and anchor; the thread map points at it. They must expire *together*, and the reason is a live failure mode rather than tidiness: if the map outlives the conversation, an ordinary non-mention message in a long-dead thread wakes the agent with empty memory and nothing addressed to it — it answers a conversation it was not invited to. Expiring as a unit returns the thread cleanly to "needs a mention", which is the right behavior for a thread silent that long.
 
@@ -214,7 +226,7 @@ The rule has one gap, closed in §6.5: a thread that discussed something for twe
 
 - **Scratchpad** — the decider injects `ttl=IDLE_TTL` on `scratchpad` kv commands. **Long-term memory** — no ttl.
 - **`/reset`** — deletes the session record; next message starts clean.
-- **Stuck-busy watchdog** (v1) — a `ctx.schedule` sweep halts any session busy > N minutes. The safety net for a result that never arrives (§12, hole 3).
+- **Stuck-busy watchdog** — a `ctx.schedule` sweep halts any session busy > N minutes. The safety net for a result that never arrives (§12, hole 3), and the *only* net for a command whose actuator was never bound (§7.5) — that case produces no error to observe, so nothing else can catch it.
 
 Expiry is not a special path: a thread whose session has evaporated is indistinguishable from a thread never seen, so the next mention recovers context through the same §6.5 route as a first mention. There is exactly one "I lack context" mechanism, and no session-revival logic.
 
@@ -252,13 +264,20 @@ So the split is: the **decider** does per-source extraction (which field is the 
 `advance` renders each buffered message with its structure intact rather than as bare prose:
 
 ```
-[discord.message] thread_id=222 channel_id=222 user=alice#0001
+[discord.message] channel_id=222 message_id=111 user=alice#0001 user_id=669491511791976458
 <message>
-hey what do you think?
+hey <@669491511791976458> (you) what do you think?
 </message>
 ```
 
 The ids the model needs to act are in the turn it is answering, so the system prompt carries only the pairing rule once — *act on a source using that source's tools; ids come from the message header* — instead of the whole burden. A second source is then a new renderer plus its tools, with no decider change.
+
+Two fields earn their place by enabling an action the model otherwise cannot take:
+
+- **`message_id`** — what `discord.post`'s `reply_to_message_id` needs to thread a reply under the message being answered, and what `discord.react` needs to react to it.
+- **`user_id`** — a real mention is `<@user_id>`. With only the display name in the header the model can write plain text and nothing else; it was observed doing exactly that (`<@dawkrish>`, which pings nobody) before the id was surfaced.
+
+**Mentions of the bot are tagged, never stripped.** A `<@id>` or `<@&role>` referring to the bot renders as `<@id> (you)`, and an `@everyone`/`@here` as `@everyone (you are included)`. The model must know *when and where* it was addressed, but removing the mention would also stop it mentioning itself and hide the id. The tag is an informational hint, **not** a trust boundary — the trusted signal is `mentions_bot`, computed by the sensor, so a user typing "(you)" changes nothing.
 
 **The header must be unforgeable by construction.** Message content is untrusted (§12, hole 4) and a user can type `[slack.message] channel_id=…` straight into Discord. The decider writes the header; content goes inside delimiters the decider never emits. Without that separation, prompt injection gets a second and much easier route to the distribution problem hole 4 describes.
 
@@ -280,7 +299,7 @@ class Actuator(Protocol):
 # ToolSpec = {"description": str, "input_schema": <JSON schema>}
 ```
 
-Tool name **==** actuator name **==** command name — identity mapping, no registry. **Declaring a `tool_spec` is the opt-in**: an actuator with one is a tool the agent may call; without one, unreachable. So `discord.post` (spam a channel) can stay tool-less while `web_search` and the reply actuator opt in. "All available commands" means "all commands that opted in."
+Tool name **==** actuator name **==** command name — identity mapping, no registry. **Declaring a `tool_spec` is the opt-in**: an actuator with one is a tool the agent may call; without one, unreachable. So `discord.reply_to_command` (a slash-command followup, meaningless to the agent) stays tool-less while `discord.post`, `discord.history` and `discord.react` opt in. "All available commands" means "all commands that opted in."
 
 ### 7.2 Result → tool_result
 
@@ -297,6 +316,12 @@ Convention: **the ok payload *is* the tool content** (json-serialized).
 ### 7.3 The two decider-private actuators (no `tool_spec`)
 
 **`llm` — a generic executor, not agent-specific.** The decider emits it directly (that's `advance`); the agent never "calls the LLM as a tool." System prompt, model, tools, max_tokens all travel in the command args because the decider owns them. *Any* decider could emit `llm` commands. Cost accounting is the decider reading `usage` off each `llm.ok`.
+
+**One actuator, pluggable provider backends.** `LlmActuator(backend=…)` is thin — call `complete`, emit `ok`, catch `LlmError` and emit `error`, let anything else propagate so the Bus retries. All provider knowledge lives behind an `LlmBackend`. The canonical wire format is **Anthropic-shaped because it is the superset**: an assistant turn's `content` is an ordered list of blocks (so interleaved text and `tool_use` keep their order) and N ordered `tool_result` blocks ride in one user turn. OpenAI's flat `content` + parallel `tool_calls` cannot represent that, so ours→theirs is a well-defined flattening while the reverse would be lossy. Information is only ever discarded at the edge that cannot represent it, never in our own format. `OpenAiBackend` therefore serves Groq, Gemini, Cerebras, OpenRouter, Ollama and anything else speaking chat-completions by base-URL alone.
+
+**`model` is always sent, never defaulted by a backend.** The command recorded in the log is the record of what actually ran; a backend that silently substituted its own default would make an old command unreplayable the moment that default changed. A missing model is a *reported* error.
+
+**`max_tokens` is capped low (1024) by the decider.** Not a source assumption — providers count the *reserved* output toward a request's rate-limit check, so an oversized value gets a request rejected that would otherwise fit. Live: a 1.9k-token conversation + the generic 4096 reserved = 6015 against a 6000 TPM limit → 413. Constructor-overridable per deployment.
 
 **`kv` — reached only through decider-injected virtual tools.** The agent sees `scratchpad` and `memory`, never raw `kv`. When it calls one, the decider **rewrites the key and emits a plain `kv` command**:
 
@@ -322,7 +347,7 @@ The guard, when it is time, is masking ids behind configured **names**: the tool
 `app.build()` hands the `AgentDecider` a **curated** list at construction — not "every actuator with a tool_spec, auto-discovered":
 
 ```python
-AgentDecider(tools=[web_search.tool_spec, reply.tool_spec, …], system=…)
+AgentDecider(tools=[post.tool_spec, history.tool_spec, react.tool_spec], model=…, system=…)
 ```
 
 The agent's reachable surface = exactly the tools passed + the two memory tools it injects. **What the agent can touch is a config decision, not an emergent one.**
@@ -358,9 +383,9 @@ Until `MAX_SPEND` lands, there is **no automated spend backstop** — Phase 4 th
 
 ---
 
-## 10. Framework prerequisites
+## 10. Framework changes
 
-Two additive changes to the core, which the agent depends on. **These are platform work, specced/built before the agent, not part of it.**
+Additive changes to the core. The first two are **prerequisites** — platform work specced and built *before* the agent. §10.3 came later, forced by running it.
 
 ### 10.1 `_consume` dedup — one clean place for at-least-once
 
@@ -412,6 +437,18 @@ It is also the first real consumer of the `Scheduler`, and it lets the dashboard
 
 **The polling is not a commitment.** The sensor's contract to everything else is only *"emits `switchboard.deadletter`"*; how it learns of a dead letter is private to one file. If mamamia ever exposes dead-letter notifications, this becomes a **composite sensor** — push for immediacy, the sweep retained as a reconcile backstop — which is exactly the shape `SensorCtx` was built for, with `http` for push and `schedule` for pull. The announced-set already makes the two paths idempotent against each other, so the sweep demotes from primary to safety net rather than being deleted. No consumer changes: not the agent's gather, not the dashboard, not an alerting decider. Had this been Bus code in `_consume`, the same migration would be core surgery.
 
+### 10.3 `RetryableError` — the handler can name the delay
+
+The symmetric partner of `PermanentError`. `PermanentError` says *never retry* (→ DEAD); `RetryableError(retry_after=…)` says *retry, and here is when*. With `retry_after=None` it is identical to any plain exception — the Bus applies its own exponential backoff. **The class exists for the override.**
+
+It was forced by live traffic, and the failure is worth recording because it is counter-intuitive: **blind backoff caused the very failures it was retrying.** A 429 raised a generic exception, so the Bus guessed `backoff(attempts)` — 1s, 1s, 4s, 5s, 12s — firing five retries inside ~23 seconds. Each retry was a ~4k-token request against a 12k-tokens-per-minute budget, so the retries themselves re-exhausted the budget and re-earned the 429. The loop could not converge, burned all ten attempts, and dead-lettered a request that would have succeeded on a single well-timed retry.
+
+The provider already knew the answer. A 429 carries `Retry-After`, and some carry a token-window reset (`x-ratelimit-reset-tokens: 205ms`). The llm backends now parse either — bare seconds or a compound duration like `1m26.4s` — and raise `RetryableError` carrying it. The Bus honours it verbatim.
+
+**The delay is capped (120s).** A provider can legitimately answer with an hour (a *daily* quota reset returns `retry-after: 3593`), and honouring that would pin a session `busy` for an hour. Capping means short windows are respected exactly and absurd ones degrade to a normal dead-letter — the session recovers instead of hanging. Verified on the first live 429 after shipping.
+
+The generalisation: **any handler that knows better than the Bus can say so, and the Bus stays the default for everything else.** Nothing existing changed behaviour — a plain exception still gets backoff.
+
 ## 11. The at-least-once principle
 
 The obs log is at-least-once, so **every handler must be safe to run twice on the same observation.** With §10.1 in place, that safety is provided generically at `_consume` — handlers are written straight, and semantic idempotency (`done:<command_id>`) is added back *only* where a crash-window double is expensive (see §12, hole 1). **Deferred for v1** by decision — we solve it at the framework level first, and add semantic guards later, one layer at a time.
@@ -422,7 +459,7 @@ The obs log is at-least-once, so **every handler must be safe to run twice on th
 
 | # | hole | consequence | when to close |
 |---|---|---|---|
-| 1 | **crash-window double** | crash between `on_response` finishing and `_consume` marking → redelivered `llm.ok` re-emits the tool command. A second `web_search` (wasted) or a second `discord.reply` (**double post**). Same family: a `discord.message` redelivered *after* its buffer was flushed re-buffers and buys one extra paid turn — the buffer's `message_id` dedup only covers the still-buffered window, not this one. | `done:<command_id>` on non-idempotent actuators. **Reply first** — it's user-visible. |
+| 1 | **crash-window double** | crash between `on_response` finishing and `_consume` marking → redelivered `llm.ok` re-emits the tool command. A second `discord.history` (wasted) or a second `discord.post` (**double post**). Same family: a `discord.message` redelivered *after* its buffer was flushed re-buffers and buys one extra paid turn — the buffer's `message_id` dedup only covers the still-buffered window, not this one. | `done:<command_id>` on non-idempotent actuators. **Reply first** — it's user-visible. |
 | 7 | **a partial handler failure loses the turn's work** | `decide()` deletes `pending:<command_id>` before doing the work that entry authorizes, so a raise anywhere after that point is unrecoverable: the redelivered observation finds nothing pending and returns. Observed: an `llm.ok` whose tool-command emit raises leaves the session `busy` with the model's answer silently discarded. **This is the deliberate half of a two-sided trade** — deleting *last* instead would make the redelivery re-run partially-completed work, duplicating user-visible posts. We chose losing a turn over double-posting. | Not a bug to patch in isolation; it is hole 1 seen from the other side, and both close together with `done:<command_id>` idempotency keys on the actuators. The Phase 5 watchdog recovers the *session*; it cannot recover the lost turn. |
 | 2 | **unbounded conversation** | the sliding TTL (§6.4) bounds *idle* threads, but a continuously active one never expires and its messages ride in every `llm` payload — token cost + cmd-log size climb with length | a message-count cap, oldest dropped, alongside the TTL. Deliberately **not** built in v1: the real limit depends on observed thread shapes, so it is a post-production fix once we hit it |
 | 3 | **a declared tool with no actuator** | the command is unconsumed, not failed — never retried, never DEAD, never announced. Not a defect to close: the wiring is **trusted to bind honestly** (§7.5). Listed so nobody mistakes the silence for a bug in the sensor. | not fixed — by design; watchdog is the net |
@@ -449,52 +486,60 @@ Not agent holes — platform assumptions that only two sensors have ever exercis
 
 | piece | kind | status |
 |---|---|---|
-| `_consume` `(group, msg.id)` dedup | framework | **prereq** |
-| `sensor/deadletter` — scheduled DEAD-table sweep | sensor | **prereq** |
-| `Actuator.tool_spec` | contract | new |
-| `llm` actuator (generic executor) | actuator | new |
-| `kv` actuator (+ decider virtual memory tools) | actuator | new |
-| `web_search` actuator | actuator | new, trivial |
-| reply-to-thread actuator/mode | actuator | new |
-| `discord.message` sensor (message-content intent, carries thread hint) | sensor | new |
-| `discord.history` actuator (`tool_spec`, `before`/`limit`) | actuator | new |
-| `AgentDecider` — dispatch, buffer, gather, advance, finish, caps, watchdog, memory-prefixing, hallucination check | decider | **the meat** |
+| `_consume` `(group, msg.id)` dedup | framework | **built** (prereq) |
+| `sensor/deadletter` — scheduled DEAD-table sweep | sensor | **built** (prereq) |
+| `RetryableError` + `retry_after` (§10.3) | framework | **built**, forced by live traffic |
+| `Actuator.tool_spec` | contract | **built** |
+| `llm` actuator + pluggable backends (`AnthropicBackend`, `OpenAiBackend`) | actuator | **built** |
+| `kv` actuator | actuator | **built** and wired, idle — the decider-side virtual memory tools are Phase 5 |
+| `discord.message` sensor (message-content intent, thread hint, role/`@everyone` wake) | sensor | **built** |
+| `discord.post` (`tool_spec`, `reply_to_message_id`) — the agent's reply | actuator | **built** |
+| `discord.history` (`tool_spec`, `before`/`limit`) | actuator | **built** |
+| `discord.react` (`tool_spec`) | actuator | **built** |
+| `discord.reply_to_command` — slash-command followup, no `tool_spec` | actuator | **built** (renamed from `discord.reply`) |
+| `AgentDecider` — dispatch, buffer, gather, advance, finish, hallucination check | decider | **built** |
+| `web_search` actuator | actuator | **not built** — referenced by earlier drafts of this doc; nothing depends on it |
+| session TTL, memory tools, `MAX_SPEND`, stuck-busy watchdog, `/reset`, transcript cap | — | **Phase 5** |
 
 ---
 
-## 14. Worked trace — "@switchboard search the latest mamamia release and summarize"
+## 14. Worked trace — a real episode, copied from the logs
 
-The whole episode as it appears in the logs. This is the fastest way to understand the system.
+Not a hypothetical. This is `@switchboard hey, write a joke, put <@686…> in it`, read back out of the obs/cmd logs after it ran. An earlier draft of this section traced a `web_search` tool that was never wired — a spec describing a system nobody built. A trace taken from the log cannot drift, because it happened.
 
 ```
-OBS#100 discord.message {mentions:[bot], content:"…summarize"}
-  on_message: mint sid=100, buffer+=msg(mention), idle → advance
-  advance: turn 0→1, flush→1 user turn, emit CMD#1 llm{sys,msgs,tools}
-           pending:1={llm,100}, state=busy
+OBS#167 discord.message  {mentions_bot:true, user_id:669…,
+                          content:"<@bot> hey, write a joke, put <@686…> in it"}
+  on_message: mint sid=167, buffer+=msg(mention), idle → advance
+  advance:    turn 0→1, flush buffer → 1 user turn, emit CMD#48 llm{sys,msgs,tools,model,max_tokens}
+              save(session) THEN pending:48={llm,167}   ← order matters, §5.2
+              state=busy
 
-CMD#1 → llm actuator → Anthropic → tool_use(web_search, tu_A)
-OBS#101 llm.ok{content:[tu_A], usage}  (command_id=1)
-  on_response(100): append assistant, spent+=$, fan out
-    tu_A ∈ tools → emit CMD#2 web_search; pending:2={tool,100,tu_A,turn:1}
-    gather turn:1 = {remaining:1, order:[tu_A]}
+CMD#48 → llm actuator → OpenAiBackend → Groq
+OBS#168 llm.ok {stop_reason:tool_use, content:[tool_use discord.post], usage} (command_id=48)
+  on_response: append assistant turn, fan out
+               discord.post ∈ tools → emit CMD#49; pending:49={tool,167,tu_A}
+               gather = {order:[tu_A], results:{}}   ← saved BEFORE the emit
 
-CMD#2 → web_search → OBS#102 web_search.ok{results} (command_id=2)
-  on_gather: results[tu_A]=ok, remaining→0
-    append user(tool_result tu_A), advance → turn→2, emit CMD#3 llm
+CMD#49 discord.post {content:"Why did the chicken cross the road? …<@686…>s…",
+                     channel_id:1529…, reply_to_message_id:1530…}
+       → posts to Discord, threaded under the message it answers
+OBS#169 discord.post.ok {delivered_by:"you", channel_id, message_id} (command_id=49)
+  on_gather:  results[tu_A]=ok, gather complete
+              append user(tool_result), advance → turn→2, emit CMD#50 llm
 
-CMD#3 → llm → tool_use(discord.reply, tu_B, content:"0.2.0: …")
-OBS#103 llm.ok
-  on_response: fan out tu_B; inject destination from session → emit CMD#4 discord.reply
-CMD#4 → reply actuator posts, returns {message_id, thread_id:T}
-OBS#104 discord.reply.ok
-  on_gather: record thread_map[T]=100, advance → CMD#5 llm
-
-CMD#5 → llm → end_turn, no tools
-OBS#105 llm.ok
-  on_response: no tool_use → finish; buffer has no mention → state=idle
+CMD#50 → llm
+OBS#170 llm.ok {stop_reason:end_turn, content:[text]}  (command_id=50)
+  on_response: no tool_use → finish; buffer holds no mention → state=idle
 ```
 
-Episode = OBS 100–105, CMD 1–5. The entire reasoning is in the logs — replayable, and it lights up the patch-panel dashboard as it runs (`llm`, `web_search`, `discord.reply` all patching through). That is the property a sandboxed agent cannot give.
+Episode = OBS 167–170, CMD 48–50. Three things in it are worth naming:
+
+- **`end_turn` is the only terminator.** There is no turn cap (§9). The loop ended because the model stopped calling tools, which is the honest condition.
+- **`delivered_by:"you"`** in the result is not decoration. Without it the model reads back a bare `message_id` and cannot tell the post was its own — observed reacting to and replying to itself.
+- The three messages that arrived *after* (`lol`, `chalo something worked`, …) were non-mentions, so they buffered as context and produced no reply. The session sat `idle` with `buffer=3`.
+
+The entire reasoning is in the logs — replayable, auditable, and it lights the patch-panel dashboard as it runs. That is the property a sandboxed agent cannot give.
 
 ---
 
@@ -517,6 +562,6 @@ Episode = OBS 100–105, CMD 1–5. The entire reasoning is in the logs — repl
 ## 16. Why this shape
 
 - **The decider is deterministic** → the agent is replayable (stub `llm` with recorded responses) and shadowable (a new prompt against live traffic, emitting to a shadow log a tap diffs). No other agent architecture gives you this, because none separate the routing (deterministic) from the thinking (behind an actuator).
-- **Actuators are agent-unaware** → the same `web_search` serves the agent, a plain decider, or a future one, with no coupling. The tool set *is* the actuator set.
+- **Actuators are agent-unaware** → the same `discord.post` serves the agent and the github-notify decider, with no coupling. The tool set *is* the actuator set.
 - **Everything is in the log** → audit, replay, live visualization, and cost accounting all fall out of the substrate rather than being bolted on.
 - **No core contamination** → the whole agent is additive: a decider, three actuators, one sensor, one protocol field (`tool_spec`), and two framework prereqs that stand on their own merits. The four-role split was built for exactly this, and this is the proof.
