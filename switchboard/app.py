@@ -6,6 +6,7 @@ from switchboard.http import HttpServer
 from switchboard.store import SqliteStore
 from switchboard.sensors.github import GitHubSensor
 from switchboard.sensors.deadletter import DeadLetterSensor
+from switchboard.sensors.clock import ClockSensor
 from switchboard.sensors.discord import DiscordSensor, CommandSpec, Option
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider, EchoDecider
@@ -81,7 +82,8 @@ def build(config: dict):
     backend = _llm_backend(config)
 
     sensors = [GitHubSensor(secret=config["github_secret"]),
-               DeadLetterSensor(config["mamamia_db_path"])]
+               DeadLetterSensor(config["mamamia_db_path"]),
+               ClockSensor(interval=config.get("clock_tick_s", 60.0))]
     for s in sensors:
         bus.add_sensor(s)
 
@@ -181,6 +183,7 @@ async def run() -> None:
         "dedup_ttl_s": float(os.environ.get("SB_DEDUP_TTL_S", "3600")),
         "log_max_messages": int(os.environ.get("SB_LOG_MAX_MESSAGES", "100000")),
         "log_max_dead": int(os.environ.get("SB_LOG_MAX_DEAD", "500")),
+        "clock_tick_s": float(os.environ.get("SB_CLOCK_TICK_S", "60")),
         "discord_bot_token": os.environ.get("DISCORD_BOT_TOKEN"),
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
