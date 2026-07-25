@@ -64,6 +64,19 @@ def _tool_outcome(obs) -> tuple[str, bool]:
 # longer outputs.
 AGENT_MAX_TOKENS = 1024
 
+# The store TTL on a session record is a BACKSTOP, not the expiry mechanism, and
+# the two are not redundant. Expiry is the decider's: the tick sweep ends a
+# session whose `last_seen` is older than the logical TTL, and draining its
+# scratchpad is part of ending it. That drain needs the sid, so it can only
+# happen while the record still exists — which is exactly why the store must not
+# get there first. The store TTL only catches the case where the PROCESS was
+# down past the deadline, so no tick ever fired and no code ever ran; then the
+# record is reclaimed with nothing to drain its keys.
+#
+# A factor rather than a literal, so the invariant "the decider wins in normal
+# operation" cannot be broken by tuning SB_SESSION_TTL_S alone.
+SESSION_STORE_TTL_FACTOR = 4.0
+
 
 class AgentDecider:
     name = "agent"
@@ -89,7 +102,9 @@ class AgentDecider:
 
     def bind(self, ctx) -> None:
         self.ctx = ctx
-        self._sessions = Sessions(ctx.store, ttl=self._session_ttl_s)
+        self._sessions = Sessions(ctx.store, ttl=(
+            None if self._session_ttl_s is None
+            else self._session_ttl_s * SESSION_STORE_TTL_FACTOR))
 
     def subscribes(self, obs) -> bool:
         # Coarse and synchronous — it cannot reach the store, so it cannot know
@@ -111,7 +126,7 @@ class AgentDecider:
             return await self._on_reset(obs, ctx)
 
         if obs.name == "clock.tick":
-            return await self._sweep_stuck(obs, ctx)
+            return await self._on_tick(obs, ctx)
 
         if obs.name == "switchboard.deadletter":
             # A dead command emits no result. The sensor is the only signal and
@@ -181,6 +196,23 @@ class AgentDecider:
             "interaction_token": payload.get("interaction_token"),
             "content": "Conversation cleared.",
         })
+
+    @staticmethod
+    def _progress(s) -> None:
+        """Stamp both clocks. Called wherever the session genuinely moved.
+
+        Two fields because they bound two different things and the durations are
+        nowhere near each other. `busy_since` bounds ONE message's retry chain
+        (`stuck_after`, derived in app.py) and is cleared the moment the session
+        goes idle. `last_seen` bounds how long a conversation may go quiet before
+        it is over, and survives going idle — it is the only thing an idle
+        session can be judged on.
+
+        They advance together because "the session moved" is one fact. Splitting
+        them would let a session look busy-and-progressing to the watchdog while
+        looking abandoned to the sweep, or the reverse.
+        """
+        s["busy_since"] = s["last_seen"] = time.time()
 
     async def _end_session(self, s, ctx) -> None:
         """The one path by which a session ends. `/reset` and idle expiry both
@@ -317,7 +349,7 @@ class AgentDecider:
         # reply with no matching user turn: a structurally invalid transcript
         # that no watchdog can repair.
         s["state"] = "busy"
-        s["busy_since"] = time.time()
+        self._progress(s)
         await self._sessions.save(s)
         await self._sessions.put_pending(cid, {"kind": "llm", "sid": s["sid"]})
 
@@ -437,7 +469,7 @@ class AgentDecider:
         # result — and a session merely unlucky with 429s crossed a threshold
         # meant to catch a session that had stopped moving. `busy_since` means
         # "since the last progress", which is what stuck actually means.
-        s["busy_since"] = time.time()
+        self._progress(s)
         await self._sessions.save(s)
         for tid, name, args in to_emit:
             cid = await ctx.command(name, args)
@@ -459,7 +491,7 @@ class AgentDecider:
         # exactly what it should, and must not be swept out from under it.
         # Persisted by _maybe_close_gather, which either saves the partial
         # gather or advances (which stamps again).
-        s["busy_since"] = time.time()
+        self._progress(s)
         gather["results"][tool_use_id] = {"type": "tool_result",
                                           "tool_use_id": tool_use_id,
                                           "content": content,
@@ -536,42 +568,90 @@ class AgentDecider:
                  "content": [gather["results"][t] for t in gather["order"]]})
         s["gather"] = None
 
-    async def _sweep_stuck(self, obs, ctx) -> None:
-        """Free sessions that have been busy longer than any legitimate retry
-        chain could take.
+    async def _on_tick(self, obs, ctx) -> None:
+        """The tick sweep: free what is wedged, end what has gone quiet.
 
         This runs on a tick rather than on a timer, and that is the point: it
         arrives as an observation through the decider's own consumer group, so
         it is serial with every other handler. A maintenance timer would run
         outside the consume loop and could interleave with an in-flight
         decide() mid-await, clobbering the very session record it is reading
-        (§5.3 — the settle discipline IS the concurrency control).
+        (§5.3 — the settle discipline IS the concurrency control). It is also
+        why expiry lives HERE rather than anywhere else: the sweep already
+        enumerates every session, so the sid is in hand, and the sid is the
+        only thing that can name a session's scratchpad keys.
 
-        Silent by design: the session goes idle and the event is logged, but
-        nothing is posted. Everything a user sees still comes from the model.
+        Both checks, in this order, per session. A wedged session is un-stuck
+        first and only then judged on idleness, so a session past `stuck_after`
+        but still inside the idle limit is freed and keeps its notes — its
+        conversation is alive, it is the TURN that died. A session wedged for
+        longer than the idle limit is repaired and then ended on the same tick,
+        which is right: freeing it is not something anyone said.
+
+        Silent by design: nothing is posted on either path. Everything a user
+        sees still comes from the model.
         """
         payload = obs.payload if isinstance(obs.payload, dict) else {}
         now = payload.get("at")
         if not isinstance(now, (int, float)):
             return
+        # A snapshot list, so ending a session mid-loop (which deletes keys)
+        # cannot disturb the iteration.
         for key in await self.ctx.store.keys("session:"):
             sid = key.split(":", 1)[1]
             s = await self._sessions.load(int(sid)) if sid.isdigit() else None
-            if s is None or s.get("state") != "busy":
+            if s is None:
                 continue
-            since = s.get("busy_since")
-            if not isinstance(since, (int, float)) or now - since < self._stuck_after:
-                continue
-            logger.warning("session %s stuck busy for %.0fs; freeing",
-                           s["sid"], now - since)
-            self._abandon_gather(s)
-            # Before the save, deliberately. A crash between the two leaves the
-            # session busy with a repaired transcript and no pending entries —
-            # the next tick sweeps it again and finishes the job. The reverse
-            # order (save first) would leave an IDLE session whose abandoned
-            # commands can still come back: take_pending would succeed, and a
-            # result belonging to a turn that no longer exists would reopen it.
-            await self._sessions.clear_pending(s["sid"])
-            s["state"] = "idle"
-            s["busy_since"] = None
-            await self._sessions.save(s)
+            await self._free_if_stuck(s, now)
+            await self._end_if_expired(s, ctx, now)
+
+    async def _free_if_stuck(self, s, now) -> None:
+        """Busy for longer than any legitimate retry chain could take."""
+        if s.get("state") != "busy":
+            return
+        since = s.get("busy_since")
+        if not isinstance(since, (int, float)) or now - since < self._stuck_after:
+            return
+        logger.warning("session %s stuck busy for %.0fs; freeing",
+                       s["sid"], now - since)
+        self._abandon_gather(s)
+        # Before the save, deliberately. A crash between the two leaves the
+        # session busy with a repaired transcript and no pending entries —
+        # the next tick sweeps it again and finishes the job. The reverse
+        # order (save first) would leave an IDLE session whose abandoned
+        # commands can still come back: take_pending would succeed, and a
+        # result belonging to a turn that no longer exists would reopen it.
+        await self._sessions.clear_pending(s["sid"])
+        s["state"] = "idle"
+        s["busy_since"] = None
+        # `last_seen` is deliberately NOT refreshed. Being rescued is not
+        # progress — nobody said anything. If the watchdog stamped it, a
+        # permanently wedged session would be freed, re-wedged and re-freed
+        # forever, and could never become old enough to end.
+        await self._sessions.save(s)
+
+    async def _end_if_expired(self, s, ctx, now) -> None:
+        """Quiet for longer than the logical session TTL.
+
+        This is the moment that did not exist before. Expiry used to happen
+        inside the store, when a record's TTL lapsed: no code ran, so there was
+        no observation, no handler, and the sid was gone — nothing could drain
+        the scratchpad because nothing knew there was anything to drain.
+
+        No check on `state`. `busy_since` and `last_seen` are stamped together
+        by `_progress`, so a busy session that is genuinely working has a fresh
+        `last_seen` and cannot reach this; one that is not working was just
+        freed by the stuck check above. Gating on idle would add a rule that
+        never changes an outcome, and hide a misconfigured pair of thresholds
+        instead of expiring the dead session underneath it.
+        """
+        if self._session_ttl_s is None:
+            return                  # opt-in: None keeps a session immortal
+        last = s.get("last_seen")
+        # A record written before `last_seen` existed has nothing to judge, and
+        # guessing would end a live conversation. Left alone; the next turn
+        # stamps it, and the store TTL is the backstop meanwhile.
+        if not isinstance(last, (int, float)) or now - last < self._session_ttl_s:
+            return
+        logger.info("session %s idle for %.0fs; ending", s["sid"], now - last)
+        await self._end_session(s, ctx)

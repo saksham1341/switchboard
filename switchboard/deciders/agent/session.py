@@ -5,6 +5,7 @@ here is read from and written back to the store, so a process restart mid-turn
 loses nothing but the in-flight call itself.
 """
 import json
+import time
 
 
 class Sessions:
@@ -34,9 +35,14 @@ class Sessions:
         await self._store.set(self._route_key(s), str(s["sid"]), ttl=self._ttl)
 
     async def new(self, *, sid, source, channel_id, thread_id, anchor) -> dict:
+        # `last_seen` is stamped at mint and refreshed by the decider on every
+        # genuine bit of progress. It exists because `busy_since` is None
+        # whenever the session is idle -- so an idle session, the only kind that
+        # can be expired, had nothing to measure its idleness against.
         s = {"sid": sid, "source": source, "channel_id": channel_id,
              "thread_id": thread_id, "anchor": anchor,
              "state": "idle", "turn": 0, "busy_since": None,
+             "last_seen": time.time(),
              "messages": [], "buffer": [], "gather": None}
         await self.save(s)
         return s

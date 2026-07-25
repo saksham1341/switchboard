@@ -1301,3 +1301,175 @@ async def test_a_late_result_after_a_reset_is_silent(caplog):
                                      oid=400, command_id=cid))
     assert rec.emitted == []
     assert caplog.records == []
+
+
+# --- explicit expiry: the decider ends a session, the store no longer does ----
+#
+# There was previously no moment at which a session "ended" by timing out. The
+# store simply dropped the record when its TTL lapsed, and because no code ran,
+# there was no observation, no handler, and — critically — no sid left in hand,
+# so nothing could ever drain the scratchpad. The tick sweep already enumerates
+# every session, so expiry is checked where the sid is already known.
+
+def _clock_agent(**kw):
+    """An agent whose STORE clock is controllable, not just time.time()."""
+    clock = type("C", (), {"t": 1000.0, "__call__": lambda self: self.t})()
+    kw.setdefault("model", "test-model")
+    kw.setdefault("stuck_after", 1800.0)
+    a = AgentDecider(tools=[TOOL], **kw)
+    a.bind(DeciderCtx(store=MemoryStore(time_fn=clock)))
+    return a, clock
+
+
+async def test_a_session_records_when_it_was_last_seen():
+    """busy_since only exists while busy, so before this there was nothing to
+    measure idleness against."""
+    a = _agent(session_ttl_s=100.0)
+    await _deliver(a, _obs("discord.message", _message()))
+    assert isinstance((await a._sessions.load(100))["last_seen"], float)
+
+
+async def test_a_session_idle_past_the_limit_is_ended_on_tick(monkeypatch):
+    a = _agent(session_ttl_s=100.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    cid = await _mint(a)
+    await _deliver(a, _obs("llm.ok", {"stop_reason": "end_turn", "content": []},
+                           oid=200, command_id=cid))          # idle at 1000
+    rec = await _deliver(a, _tick(at=1101.0))                 # 101s idle
+    assert _drain_of(rec) == {"op": "delete_prefix", "prefix": "session:100:"}
+    assert await a._sessions.load(100) is None
+    assert await a._sessions.route("discord", "222") is None
+
+
+async def test_a_session_still_making_progress_is_never_expired(monkeypatch):
+    """The one that matters for a long-running conversation: minted long past
+    the TTL ago, but answering. last_seen refreshing on progress is what keeps
+    the sweep off it — an absolute clock from session birth would end a
+    conversation mid-sentence."""
+    a = _agent(session_ttl_s=100.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    cid = await _mint(a)
+    await _deliver(a, _obs("llm.ok", {"stop_reason": "end_turn", "content": []},
+                           oid=200, command_id=cid))
+    clock[0] = 5000.0                       # 4000s after it was created
+    await _deliver(a, _obs("discord.message", _message(mid="2"), oid=101))
+    rec = await _deliver(a, _tick(at=5050.0))
+    assert _drain_of(rec) is None
+    assert await a._sessions.load(100) is not None
+
+
+async def test_the_stuck_check_runs_before_the_expiry_check(monkeypatch):
+    """Order matters. A wedged session is un-stuck first and only becomes
+    eligible for ordinary idle expiry once it has been idle that long — a
+    session past stuck_after but not past the idle limit is FREED, not ended,
+    because its conversation is still alive and its notes are still wanted."""
+    a = _agent(stuck_after=100.0, session_ttl_s=1000.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    await _mint(a)                                            # busy at 1000
+    rec = await _deliver(a, _tick(at=1200.0))                 # 200s: stuck, not idle-expired
+    s = await a._sessions.load(100)
+    assert s is not None and s["state"] == "idle"
+    assert _drain_of(rec) is None
+
+
+async def test_freeing_a_stuck_session_is_not_progress(monkeypatch):
+    """The watchdog repairs a turn; it does not mean anyone said anything. If
+    the sweep refreshed last_seen, a permanently wedged session would be freed
+    and re-freed forever and never become eligible to end."""
+    a = _agent(stuck_after=100.0, session_ttl_s=500.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    await _mint(a)
+    await _deliver(a, _tick(at=1200.0))                       # freed
+    assert (await a._sessions.load(100))["last_seen"] == 1000.0
+    rec = await _deliver(a, _tick(at=1600.0))                 # 600s idle: ended
+    assert _drain_of(rec) is not None
+    assert await a._sessions.load(100) is None
+
+
+async def test_a_redelivered_tick_does_not_double_drain_or_raise(monkeypatch):
+    """At-least-once: _consume marks a message processed only after the handler
+    returns, so the same tick arrives twice."""
+    a = _agent(session_ttl_s=100.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    cid = await _mint(a)
+    await _deliver(a, _obs("llm.ok", {"stop_reason": "end_turn", "content": []},
+                           oid=200, command_id=cid))
+    assert _drain_of(await _deliver(a, _tick(at=1101.0))) is not None
+    rec = await _deliver(a, _tick(at=1101.0))                 # the very same tick
+    assert rec.emitted == []
+
+
+async def test_the_drains_own_result_is_silent(caplog):
+    """The drain command has no pending entry — nothing is waiting on it. Its
+    kv.ok must return quietly rather than logging once per drained session."""
+    a = _agent(session_ttl_s=100.0)
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    await _deliver(a, _obs("discord.message", _message()))
+    kv_cid = 12345
+    with caplog.at_level("WARNING"):
+        rec = await _deliver(a, _obs("kv.ok", {"removed": 3, "truncated": False},
+                                     oid=400, command_id=kv_cid))
+    assert rec.emitted == []
+    assert caplog.records == []
+
+
+async def test_a_session_with_no_ttl_configured_never_expires(monkeypatch):
+    """None keeps a session immortal, which is what the rest of this file
+    assumes. Expiry must be opt-in, not a default that appeared underneath it."""
+    a = _agent(session_ttl_s=None)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    cid = await _mint(a)
+    await _deliver(a, _obs("llm.ok", {"stop_reason": "end_turn", "content": []},
+                           oid=200, command_id=cid))
+    rec = await _deliver(a, _tick(at=999999.0))
+    assert _drain_of(rec) is None
+    assert await a._sessions.load(100) is not None
+
+
+async def test_the_store_ttl_is_a_backstop_the_decider_beats():
+    """Two expiry mechanisms, and neither is redundant. The decider wins in
+    normal operation, so the store TTL must be strictly LONGER than the logical
+    one — if the store dropped the record first, the sid would be gone before
+    any tick could drain the scratchpad, which is the failure this whole design
+    exists to remove. The store TTL only catches a process that was down past
+    the deadline, so no tick ever fired."""
+    a, clock = _clock_agent(session_ttl_s=100.0)
+    await _deliver(a, _obs("discord.message", _message()))
+    clock.t += 150.0                        # past the logical TTL, no tick fired
+    assert await a._sessions.load(100) is not None
+    assert await a._sessions.route("discord", "222") is not None
+
+
+async def test_the_store_ttl_backstop_does_eventually_fire():
+    """It is a backstop, not decoration. A process down for long enough still
+    has its sessions reclaimed — see the known, bounded leak this leaves."""
+    from switchboard.deciders.agent.decider import SESSION_STORE_TTL_FACTOR
+    a, clock = _clock_agent(session_ttl_s=100.0)
+    await _deliver(a, _obs("discord.message", _message()))
+    clock.t += 100.0 * SESSION_STORE_TTL_FACTOR + 1.0
+    assert await a._sessions.load(100) is None
+
+
+async def test_a_session_wedged_past_both_thresholds_ends_and_stays_ended(monkeypatch):
+    """The case that actually pins the order of the two checks. Run the other
+    way round, `_end_if_expired` deletes the record and route, and then
+    `_free_if_stuck` — still looking at the in-memory dict, which never stopped
+    saying "busy" — repairs it and SAVES, resurrecting a session that was just
+    ended along with the route pointing at it. The drain has already gone out by
+    then, so what comes back is a session whose notes are gone."""
+    a = _agent(stuck_after=100.0, session_ttl_s=200.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    await _mint(a)                                   # busy at 1000
+    rec = await _deliver(a, _tick(at=1500.0))        # past stuck AND past idle
+    assert _drain_of(rec) is not None
+    assert await a._sessions.load(100) is None
+    assert await a._sessions.route("discord", "222") is None

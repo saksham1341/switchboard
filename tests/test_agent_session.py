@@ -9,6 +9,11 @@ def _sessions():
 async def test_new_session_has_the_documented_shape():
     s = await _sessions().new(sid=100, source="discord", channel_id="222",
                               thread_id="222", anchor="1234567890")
+    # `last_seen` is stamped at mint, so it is checked by type and then removed
+    # rather than pinned to a value. It is what an IDLE session's expiry is
+    # measured against -- `busy_since` is None whenever the session is idle, so
+    # it could never serve.
+    assert isinstance(s.pop("last_seen"), float)
     assert s == {"sid": 100, "source": "discord", "channel_id": "222",
                  "thread_id": "222", "anchor": "1234567890",
                  "state": "idle", "turn": 0, "busy_since": None,
