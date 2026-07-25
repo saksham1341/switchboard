@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import discord
 from discord import app_commands
 
+from switchboard.render import message_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -22,7 +24,7 @@ def _command_observation(command: str, interaction, options: dict) -> tuple[str,
     })
 
 
-def _message_observation(message, bot_id: int) -> tuple[str, dict]:
+def _message_observation(message, bot_id: int, bot_role_ids=()) -> tuple[str, dict]:
     """Shape a gateway message into a `discord.message` observation.
 
     `channel_id` is always where the message *is* — the thread id when it is in
@@ -31,10 +33,28 @@ def _message_observation(message, bot_id: int) -> tuple[str, dict]:
     gives the agent a conversation starting at the mention, and it cannot ask
     for context it does not know exists. `message_count` tells it there is more
     above; `discord.history` is how it reads it.
+
+    `mentions_bot` is true for a direct user mention (`<@bot>`), a mention of
+    any role the bot holds (`<@&role>`), or an `@everyone`/`@here` broadcast.
+    The role case matters because a bot with a mentionable same-name role is
+    very often pinged *by that role* — the user types `@switchboard` and Discord
+    resolves it to the role, not the user — and discord.py keeps those in
+    `role_mentions`, never in `mentions`. `@everyone`/`@here` come through
+    neither list, only `mention_everyone`; the bot is part of everyone, so it
+    wakes and the model decides whether a broadcast actually wants a reply.
     """
     channel = message.channel
     is_thread = isinstance(channel, discord.Thread)
     mention_ids = [str(u.id) for u in message.mentions]
+    role_mention_ids = {str(r.id) for r in getattr(message, "role_mentions", [])}
+    bot_roles = {str(r) for r in bot_role_ids}
+    everyone = bool(getattr(message, "mention_everyone", False))
+    # The specific ids in this message that refer to the bot — the renderer tags
+    # (never strips) these so the model can see it was addressed and where,
+    # while the raw <@id> survives so it can still mention itself.
+    bot_mention_ids = ([str(bot_id)] if str(bot_id) in mention_ids else []) \
+        + sorted(role_mention_ids & bot_roles)
+    mentions_bot = bool(bot_mention_ids) or everyone
     return ("discord.message", {
         "message_id": str(message.id),
         "channel_id": str(channel.id),
@@ -45,10 +65,54 @@ def _message_observation(message, bot_id: int) -> tuple[str, dict]:
         "user_name": str(message.author),
         "content": message.content,
         "mentions": mention_ids,
-        "mentions_bot": str(bot_id) in mention_ids,
+        "mentions_bot": mentions_bot,
+        "bot_mention_ids": bot_mention_ids,
+        "mention_everyone": everyone,
         "thread": {"is_thread": is_thread,
                    "message_count": getattr(channel, "message_count", None) if is_thread else None},
     })
+
+
+def _tag_bot_mentions(content: str, payload: dict) -> str:
+    """Annotate — never remove — a mention of the bot. The model must know when
+    and where it was addressed, but the raw <@id> stays so it can still mention
+    itself and learn the id. The tag is a hint, not a trust boundary: the
+    trusted signal is `mentions_bot` from the sensor."""
+    for mid in payload.get("bot_mention_ids") or []:
+        content = content.replace(f"<@{mid}>", f"<@{mid}> (you)")
+        content = content.replace(f"<@&{mid}>", f"<@&{mid}> (you)")
+    if payload.get("mention_everyone"):
+        content = content.replace("@everyone", "@everyone (you are included)")
+        content = content.replace("@here", "@here (you are included)")
+    return content
+
+
+def render_message(payload: dict) -> str:
+    """A discord.message payload as text. The sensor owns this
+    because it owns the payload shape — and DiscordHistory calls the same
+    function, which is what makes history and live identical by construction."""
+    payload = payload if isinstance(payload, dict) else {}
+    thread = payload.get("thread")
+    thread = thread if isinstance(thread, dict) else {}
+
+    fields = {"channel_id": payload.get("channel_id"),
+              "message_id": payload.get("message_id"),
+              "user": payload.get("user_name"),
+              "user_id": payload.get("user_id")}
+    if payload.get("thread_id"):
+        fields["thread_id"] = payload.get("thread_id")
+        count = thread.get("message_count")
+        if isinstance(count, int):
+            fields["thread_messages"] = count
+
+    # None is a legitimately empty message (an attachment-only post); anything
+    # else non-string is a malformed payload, and showing its repr degrades
+    # visibly rather than silently rendering an empty body.
+    content = payload.get("content")
+    if not isinstance(content, str):
+        content = "" if content is None else str(content)
+    body = _tag_bot_mentions(content, payload)
+    return message_text("discord.message", fields, body)
 
 
 @dataclass(frozen=True)
@@ -81,25 +145,25 @@ class DiscordSensor:
 
     def __init__(self, bot_token: str, *,
                  commands: list[CommandSpec], guild_id: str | None = None,
-                 messages: bool = False, dedup_ttl: float = 7 * 86_400.0):
+                 dedup_ttl: float = 7 * 86_400.0):
         self._token = bot_token
         self._guild_id = guild_id
-        self.messages = messages
         self._dedup_ttl = dedup_ttl
         self.ctx = None
         self._synced = False
 
-        # message_content is a *privileged* intent: the gateway refuses the
-        # connection outright unless it is also enabled in the Developer Portal.
-        # So it is opt-in — a deployment that only wants slash commands keeps
-        # Intents.none() and needs no portal change.
-        if messages:
-            intents = discord.Intents.none()
-            intents.guilds = True
-            intents.guild_messages = True
-            intents.message_content = True
-        else:
-            intents = discord.Intents.none()
+        # message_content is a *privileged* intent, so this is a hard
+        # deployment requirement rather than a preference: it must be enabled
+        # in the Developer Portal or the gateway refuses login outright and
+        # this sensor dies at start. It was briefly behind a flag while the
+        # message path was unproven; now that the agent depends on it, a
+        # Switchboard that cannot hear messages is not a useful one, and a
+        # flag would only turn a loud startup failure into a silent
+        # never-responds.
+        intents = discord.Intents.none()
+        intents.guilds = True
+        intents.guild_messages = True
+        intents.message_content = True
 
         self._client = discord.Client(intents=intents)
         self._tree = app_commands.CommandTree(self._client)
@@ -110,10 +174,9 @@ class DiscordSensor:
         async def on_ready():
             await self._on_ready()
 
-        if messages:
-            @self._client.event
-            async def on_message(message):
-                await self._on_message(message, bot_id=self._client.user.id)
+        @self._client.event
+        async def on_message(message):
+            await self._on_message(message, bot_id=self._client.user.id)
 
     async def _on_ready(self) -> None:
         # Any timer this sensor grows is declared here, not in bind(): it would
@@ -187,11 +250,18 @@ class DiscordSensor:
         if await self.ctx.store.get(key) is not None:
             return
 
-        name, payload = _message_observation(message, bot_id)
+        # The bot's roles in this guild, minus @everyone (the default role, which
+        # every member holds — treating it as "the bot's role" would make every
+        # @everyone ping wake the agent). `guild.me` is the bot's own member and
+        # needs no privileged intent to read.
+        me = message.guild.me if message.guild else None
+        bot_role_ids = [r.id for r in me.roles if not r.is_default()] if me else []
+
+        name, payload = _message_observation(message, bot_id, bot_role_ids)
         # Emit first, record second: a crash (or a failed emit) in between costs
         # a duplicate, the reverse order costs the event.
         try:
-            await self.ctx.emit(name, payload)
+            await self.ctx.emit(name, payload, text=render_message(payload))
         except Exception:
             # Nothing upstream can retry a gateway event: discord.py's dispatcher
             # would otherwise swallow this into its default on_error (a bare

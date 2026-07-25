@@ -1,16 +1,21 @@
 import httpx
 
+from switchboard.sensors.discord import render_message
+
 DISCORD_API = "https://discord.com/api/v10"
 
 
 class DiscordSender:
-    """The Discord connector's two send paths, both plain HTTP (no gateway):
+    """The Discord connector's HTTP send paths (no gateway). Two of them, and
+    the names matter because they are easy to confuse:
 
-    - reply(): an interaction *followup* — POST to the interaction webhook, which
-      needs only the application id + interaction token (no bot auth) and is valid
-      for 15 minutes. This is how a slash command's result reaches the user.
-    - send(): a channel message via the bot REST API (Bot-token auth), with no
-      time window — for work that outlives the interaction, and for notifications.
+    - interaction_followup(): the reply to a slash-*command* interaction — POST
+      to the interaction webhook, which needs only the application id +
+      interaction token (no bot auth) and is valid for 15 minutes. NOT a reply
+      to a message; it is how a slash command's result reaches the user.
+    - send(): an ordinary channel message via the bot REST API (Bot-token auth),
+      with no time window — for work that outlives the interaction, for
+      notifications, and (with reply_to_message_id) for replying to a message.
     """
 
     def __init__(self, bot_token: str, application_id: str, *,
@@ -19,7 +24,7 @@ class DiscordSender:
         self._application_id = str(application_id)
         self._client = client or httpx.AsyncClient(timeout=10.0)
 
-    async def reply(self, interaction_token: str, content: str) -> httpx.Response:
+    async def interaction_followup(self, interaction_token: str, content: str) -> httpx.Response:
         resp = await self._client.post(
             f"{DISCORD_API}/webhooks/{self._application_id}/{interaction_token}",
             json={"content": content},
@@ -29,7 +34,8 @@ class DiscordSender:
 
     async def send(self, channel_id: str, content: str | None = None, *,
                    embed: dict | None = None,
-                   components: list | None = None) -> httpx.Response:
+                   components: list | None = None,
+                   reply_to_message_id: str | None = None) -> httpx.Response:
         payload: dict = {}
         if content is not None:
             payload["content"] = content
@@ -37,6 +43,14 @@ class DiscordSender:
             payload["embeds"] = [embed]
         if components is not None:
             payload["components"] = components
+        if reply_to_message_id is not None:
+            # fail_if_not_exists=False so replying to a since-deleted message
+            # posts a normal message instead of hard-400ing. A reply the user
+            # cannot see the parent of still beats no reply.
+            payload["message_reference"] = {
+                "message_id": str(reply_to_message_id),
+                "fail_if_not_exists": False,
+            }
         resp = await self._client.post(
             f"{DISCORD_API}/channels/{channel_id}/messages",
             headers={"Authorization": f"Bot {self._bot_token}"},
@@ -67,6 +81,23 @@ class DiscordSender:
             params=params,
         )
 
+    async def add_reaction(self, channel_id: str, message_id: str,
+                           emoji: str) -> httpx.Response:
+        """React to a message as the bot. Returns the response unraised — same
+        reason as fetch_messages: the caller decides which statuses to report vs
+        retry. Needs the Add Reactions permission on the channel.
+
+        The emoji sits in the URL path: a Unicode emoji goes URL-encoded, a
+        custom one as `name:id`. httpx percent-encodes the path segment, so a
+        raw Unicode emoji is passed through as-is.
+        """
+        from urllib.parse import quote
+        return await self._client.put(
+            f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}"
+            f"/reactions/{quote(emoji)}/@me",
+            headers={"Authorization": f"Bot {self._bot_token}"},
+        )
+
     async def close(self) -> None:
         await self._client.aclose()
 
@@ -80,16 +111,41 @@ class DiscordPost:
     """
     name = "discord.post"
     tool_spec = {
-        "description": "Send a message to Discord.",
+        "description": (
+            "Send a message to Discord. A Discord channel carries many people's "
+            "conversations at once and you are shown all of them as context, so "
+            "only post when a message is actually addressed to you — a mention, a "
+            "direct question, or a request that follows from one. When people are "
+            "talking among themselves, do not call this tool at all; read their "
+            "messages as context and stay silent. Posting a reply to something "
+            "not meant for you is worse than saying nothing. "
+            "To mention (ping) a person, write <@user_id> using the user_id from "
+            "that person's message header — e.g. <@669491511791976458>, never "
+            "their plain name. Only do this when a ping is warranted; addressing "
+            "someone by name in prose is fine and usually better."),
         "input_schema": {
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "The message text."},
-                "channel_id": {"type": "string",
-                               "description": "Where to post. Omit for the "
-                                              "current conversation."},
+                "content": {"type": "string",
+                            "description": "Required. The message text."},
+                "channel_id": {
+                    "type": "string",
+                    "description": "Required. The channel or thread to post to. Use "
+                                   "the channel_id from the header of the message "
+                                   "you are answering, which is where that "
+                                   "conversation lives.",
+                },
+                "reply_to_message_id": {
+                    "type": "string",
+                    "description": "Optional. Attach your message as a reply "
+                                   "under a specific message: pass the message_id "
+                                   "from the header of the message you are "
+                                   "answering. In a busy channel this makes clear "
+                                   "who you are addressing; omit it for a "
+                                   "standalone message.",
+                },
             },
-            "required": ["content"],
+            "required": ["content", "channel_id"],
         },
     }
 
@@ -108,7 +164,8 @@ class DiscordPost:
         resp = await self._sender.send(channel,
                                        content=cmd.args.get("content"),
                                        embed=cmd.args.get("embed"),
-                                       components=cmd.args.get("components"))
+                                       components=cmd.args.get("components"),
+                                       reply_to_message_id=cmd.args.get("reply_to_message_id"))
         # Never trust the shape of the body, only that it parsed. A post we
         # merely could not read the id from is still a successful post.
         message_id = None
@@ -118,16 +175,56 @@ class DiscordPost:
             body = None
         if isinstance(body, dict):
             message_id = body.get("id")
-        await ctx.result("ok", {"channel_id": channel, "message_id": message_id})
+        # `delivered_by: "you"` is the fix for the self-conversation loop: the
+        # result hands back the id of the message the bot just sent, and without
+        # marking it as the bot's own the model would grab that id and react to,
+        # or reply to, its own post — not realising it was itself. Correct
+        # attribution of a tool result to the actor is what the role tag cannot
+        # carry (the API forces every tool_result into a user-role container).
+        await ctx.result("ok", {"delivered_by": "you", "channel_id": channel,
+                                "message_id": message_id})
 
     async def close(self):
         if self._sender is not None:
             await self._sender.close()
 
 
-class DiscordReply:
-    """Actuator for the `discord.reply` command: interaction followup (model A)."""
-    name = "discord.reply"
+class DiscordReact:
+    """Actuator for the `discord.react` command: add an emoji reaction to a
+    message. A lightweight way to acknowledge or respond without posting — an
+    agent can 👍 a message it agrees with, ✅ a done task, or 👀 something it's
+    looking into, none of which warrant a full reply.
+    """
+    name = "discord.react"
+    tool_spec = {
+        "description": (
+            "React to a Discord message with an emoji. Use this to acknowledge "
+            "or respond lightly — agreement, a thumbs up, marking something seen "
+            "or done — when a full message would be too much. It is the quiet "
+            "alternative to discord.post."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel_id": {
+                    "type": "string",
+                    "description": "Required. The channel or thread the message "
+                                   "is in. Use the channel_id from the header of "
+                                   "the message you are reacting to.",
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "Required. The message to react to. Use the "
+                                   "message_id from its header.",
+                },
+                "emoji": {
+                    "type": "string",
+                    "description": "Required. A single Unicode emoji, e.g. \U0001f44d "
+                                   "or ✅. Not a :shortcode:.",
+                },
+            },
+            "required": ["channel_id", "message_id", "emoji"],
+        },
+    }
 
     def __init__(self, bot_token, application_id, *, client=None):
         self._token, self._app_id = bot_token, application_id
@@ -139,7 +236,54 @@ class DiscordReply:
         self._sender = DiscordSender(self._token, self._app_id, client=self._client)
 
     async def act(self, cmd, ctx):
-        await self._sender.reply(cmd.args["interaction_token"], cmd.args["content"])
+        args = cmd.args or {}
+        for field in ("channel_id", "message_id", "emoji"):
+            if not isinstance(args.get(field), str) or not args[field]:
+                return await ctx.result("error", {"message": f"{field} is required"})
+
+        resp = await self._sender.add_reaction(
+            args["channel_id"], args["message_id"], args["emoji"])
+        if resp.status_code >= 500:
+            resp.raise_for_status()          # transient: let the Bus retry
+        if resp.status_code >= 400:
+            return await ctx.result("error", {"message": _error_message(resp),
+                                              "status": resp.status_code})
+        # Success is 204 No Content — there is no body to read. `reacted_by:
+        # "you"` marks the action as the bot's own, same reason as discord.post.
+        await ctx.result("ok", {"reacted_by": "you",
+                                "channel_id": args["channel_id"],
+                                "message_id": args["message_id"],
+                                "emoji": args["emoji"]})
+
+    async def close(self):
+        if self._sender is not None:
+            await self._sender.close()
+
+
+class DiscordReplyToCommand:
+    """Actuator for the `discord.reply_to_command` command: the response to a
+    slash-command interaction, delivered as an interaction followup.
+
+    Named for what it does. It is NOT the agent's message-reply — that is
+    `discord.post` with `reply_to_message_id`. This one answers a `/ping` or
+    `/echo`, keyed by the interaction token the slash-command sensor captured,
+    and carries no `tool_spec`: only the command deciders emit it, never the
+    agent.
+    """
+    name = "discord.reply_to_command"
+
+    def __init__(self, bot_token, application_id, *, client=None):
+        self._token, self._app_id = bot_token, application_id
+        self._client = client
+        self._sender = None
+
+    def bind(self, ctx):
+        self.ctx = ctx
+        self._sender = DiscordSender(self._token, self._app_id, client=self._client)
+
+    async def act(self, cmd, ctx):
+        await self._sender.interaction_followup(
+            cmd.args["interaction_token"], cmd.args["content"])
         await ctx.result("ok")
 
     async def close(self):
@@ -183,20 +327,33 @@ class DiscordHistory:
     tool_spec = {
         "description": (
             "Read earlier messages from a Discord channel or thread, oldest "
-            "first. Use this when you are mentioned partway into a thread and "
-            "the request refers to something you cannot see."),
+            "first. You are often brought into a conversation partway through "
+            "and shown only the message that summoned you. When the request "
+            "refers to something you cannot see — the header shows a "
+            "thread_messages count higher than what you were given, or the "
+            "message points back at earlier discussion — call this to read what "
+            "came before, then answer with that context. If the request stands "
+            "on its own, you do not need it."),
         "input_schema": {
             "type": "object",
             "properties": {
-                "channel_id": {"type": "string",
-                               "description": "The channel or thread to read."},
+                "channel_id": {
+                    "type": "string",
+                    "description": "Required. The channel or thread to read. Use "
+                                   "the channel_id from the message header.",
+                },
                 "limit": {"type": "integer",
-                          "description": f"How many messages, 1-{HISTORY_MAX}. "
-                                         f"Defaults to {HISTORY_DEFAULT}."},
-                "before": {"type": "string",
-                           "description": "Only messages older than this message "
-                                          "id. Use it to skip messages you have "
-                                          "already seen."},
+                          "description": f"Optional. How many messages to read, "
+                                         f"1-{HISTORY_MAX}, as a bare integer (not "
+                                         f"a string). Defaults to {HISTORY_DEFAULT}, "
+                                         f"which covers most conversations."},
+                "before": {
+                    "type": "string",
+                    "description": "Optional. Read only messages older than this "
+                                   "message id — pass the message_id you are "
+                                   "answering to fetch the lead-up without "
+                                   "re-reading messages you already have.",
+                },
             },
             "required": ["channel_id"],
         },
@@ -251,14 +408,25 @@ class DiscordHistory:
             messages.append({
                 "id": str(entry.get("id")),
                 "user": author.get("username"),
+                "user_id": str(author.get("id")) if author.get("id") else None,
                 "bot": bool(author.get("bot")),
                 "content": entry.get("content"),
             })
         messages.reverse()          # Discord returns newest-first; read it forwards
 
+        # Render each fetched message with the SAME function the live sensor
+        # uses, so a message read from history is indistinguishable from one
+        # that arrived live. Escaping happens inside message_text, which matters
+        # here more than anywhere: this is other people's text.
+        rendered = "\n\n".join(
+            render_message({"message_id": m["id"], "channel_id": channel_id,
+                            "user_name": m["user"], "user_id": m["user_id"],
+                            "content": m["content"]})
+            for m in messages)
         await ctx.result("ok", {"channel_id": channel_id,
                                 "messages": messages,
-                                "count": len(messages)})
+                                "count": len(messages)},
+                         text=rendered)
 
     async def close(self):
         if self._sender is not None:

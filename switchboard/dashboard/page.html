@@ -566,7 +566,10 @@ function connect(){
   disconnect();
   status("wait", "reconnecting");
   es = new EventSource("/dashboard/stream");
-  es.onopen = () => status("up", "connected");
+  // Deliberately NOT flipping to "connected" on onopen: the socket can open
+  // through a proxy while the first `hello` is still buffered, so a green pill
+  // there would lie about a board with no jacks. Stay "reconnecting" until real
+  // data lands — the hello handler below is what confirms we are truly up.
   es.onerror = () => {
     // EventSource retries on its own; reflect the gap and let it come back.
     status(es && es.readyState === 2 ? "down" : "wait",

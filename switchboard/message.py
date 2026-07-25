@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol, runtime_checkable
 
@@ -16,13 +17,25 @@ class Observation:
     payload: dict
     command_id: int | None = None      # present ⇒ this is a result observation
     emitted_by: str | None = None      # "sensor/github", "actuator/discord.post"
+    text: str | None = None            # producer's rendered form; None ⇒ none stored
 
     @classmethod
     def from_message(cls, msg) -> "Observation":
         md = msg.metadata or {}
         return cls(id=msg.id, name=md.get("name", ""),
                    payload=msg.payload or {}, command_id=md.get("command_id"),
-                   emitted_by=md.get("emitted_by"))
+                   emitted_by=md.get("emitted_by"), text=md.get("text"))
+
+    @property
+    def rendered(self) -> str:
+        """The text form, always. Falls back to JSON when no producer supplied
+        one — absence is the common case and costs nothing to store."""
+        if self.text is not None:
+            return self.text
+        try:
+            return json.dumps(self.payload)
+        except (TypeError, ValueError):
+            return str(self.payload)
 
 
 @dataclass(frozen=True)
@@ -32,38 +45,62 @@ class Command:
     args: dict
     observation_id: int | None = None  # the observation that triggered this command
     emitted_by: str | None = None      # "decider/github_notify"
+    text: str | None = None            # producer's rendered form; None ⇒ none stored
 
     @classmethod
     def from_message(cls, msg) -> "Command":
         md = msg.metadata or {}
         return cls(id=msg.id, name=md.get("name", ""),
                    args=msg.payload or {}, observation_id=md.get("observation_id"),
-                   emitted_by=md.get("emitted_by"))
+                   emitted_by=md.get("emitted_by"), text=md.get("text"))
+
+    @property
+    def rendered(self) -> str:
+        """The text form, always. Falls back to JSON when no producer supplied
+        one — absence is the common case and costs nothing to store."""
+        if self.text is not None:
+            return self.text
+        try:
+            return json.dumps(self.args)
+        except (TypeError, ValueError):
+            return str(self.args)
 
 
 @dataclass
 class DecideCtx:
     obs: Observation
-    _emit_command: Callable[[str, dict, int], Awaitable[int]]
+    _emit_command: Callable[..., Awaitable[int]]
 
-    async def command(self, name: str, args: dict) -> int:
-        return await self._emit_command(name, args, self.obs.id)
+    async def command(self, name: str, args: dict, text: str | None = None) -> int:
+        # text is passed only when supplied: existing _emit_command fakes across
+        # the test suite implement the pre-existing 3-positional-arg contract, and
+        # this keeps them valid without edits — the new 4th arg is exercised only
+        # by callers that opt into it.
+        if text is None:
+            return await self._emit_command(name, args, self.obs.id)
+        return await self._emit_command(name, args, self.obs.id, text)
 
 
 @dataclass
 class ActCtx:
     cmd: Command
-    _emit_result: Callable[[str, dict, int], Awaitable[int]]
+    _emit_result: Callable[..., Awaitable[int]]
 
-    async def result(self, outcome: str, payload: dict | None = None) -> int:
-        return await self._emit_result(f"{self.cmd.name}.{outcome}", payload or {}, self.cmd.id)
+    async def result(self, outcome: str, payload: dict | None = None,
+                     text: str | None = None) -> int:
+        # Same reasoning as DecideCtx.command: keep the pre-existing 3-arg
+        # _emit_result contract intact for callers that never pass text.
+        name, payload = f"{self.cmd.name}.{outcome}", payload or {}
+        if text is None:
+            return await self._emit_result(name, payload, self.cmd.id)
+        return await self._emit_result(name, payload, self.cmd.id, text)
 
 
 @dataclass
 class SensorCtx:
     """What Switchboard provides to a sensor: how to emit, how the world
     reaches it (push and pull), and what it remembers between wakings."""
-    emit: Callable[[str, dict], Awaitable[int]]
+    emit: Callable[..., Awaitable[int]]
     http: HttpServer
     store: KeyStore
     schedule: OwnerSchedule

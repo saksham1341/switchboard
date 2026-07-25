@@ -2,7 +2,7 @@ import asyncio, json, httpx
 from switchboard.bus import Bus
 from switchboard.deciders.github_notify import GitHubNotifyDecider
 from switchboard.deciders.discord_cmds import PingDecider
-from switchboard.actuators.discord import DiscordPost, DiscordReply
+from switchboard.actuators.discord import DiscordPost, DiscordReplyToCommand
 
 
 async def _wait(pred, timeout=8.0):
@@ -42,7 +42,7 @@ async def test_ping_observation_reaches_followup(tmp_path):
     client = httpx.AsyncClient(transport=httpx.MockTransport(h))
     bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
     bus.add_decider(PingDecider())
-    bus.add_actuator(DiscordReply("bot", "app", client=client))
+    bus.add_actuator(DiscordReplyToCommand("bot", "app", client=client))
     await bus.start()
     try:
         await bus.emit_observation("discord.command.ping", {"interaction_token": "tok-1"})
