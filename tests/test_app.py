@@ -384,3 +384,21 @@ def test_a_stuck_margin_below_one_is_clamped(tmp_path):
     expressible, however the env is set."""
     bus, agent = _agent_with(tmp_path, 8168, stuck_margin=0.1)
     assert agent._stuck_after >= bus.worst_case_retry_seconds
+
+
+def test_an_inverted_session_ttl_is_raised_above_the_watchdog_window(tmp_path):
+    """_end_if_expired is only harmless because the stuck check always fires
+    first. SB_SESSION_TTL_S=1800 inverts that -- and then a busy session whose
+    command is still LEGITIMATELY retrying is deleted mid-turn and its result
+    dropped. The relationship is enforced where both numbers are derived, not
+    left to the operator."""
+    bus, agent = _agent_with(tmp_path, 8171, session_ttl_s=1800.0)
+    assert agent._stuck_after < agent._session_ttl_s
+
+
+def test_a_sane_session_ttl_is_left_exactly_as_configured(tmp_path):
+    """The clamp must be a floor, not a rewrite: a TTL already above the
+    watchdog window is the operator's number and stays untouched."""
+    bus, agent = _agent_with(tmp_path, 8172, session_ttl_s=14400.0)
+    assert agent._session_ttl_s == 14400.0
+    assert agent._stuck_after < 14400.0

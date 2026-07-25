@@ -953,13 +953,22 @@ async def test_the_transcript_after_a_sweep_is_valid_for_the_next_turn():
     assert _unanswered(rec.emitted[0][1]["messages"]) == set()
 
 
-async def test_the_synthesised_abandon_result_is_escaped():
+async def test_the_synthesised_abandon_result_tells_the_model_it_may_have_run():
+    """NOT an escaping test, though it used to claim to be. The abandon text is
+    a constant containing nothing delimiter-shaped, so `escape_delimiters` on it
+    is identity -- the old assertion held with the wrapper deleted. Escaping
+    there is consistency ("every model-facing string goes through it"), not an
+    enforced boundary, and no test can pin a no-op on a constant.
+
+    What IS worth pinning is the content of the message, because the model acts
+    on it: an abandoned call may or may not have taken effect, and a message
+    that implied it definitely had not would invite a duplicate post."""
     a = _agent(stuck_after=100.0)
     await _stuck_mid_gather(a)
     await _deliver(a, _tick(at=1000.0))
     block = (await a._sessions.load(100))["messages"][-1]["content"][0]
-    assert "</untrusted>" not in block["content"]
-    assert block["content"]                       # says something, not empty
+    assert block["is_error"] is True
+    assert "may or may not have taken effect" in block["content"]
 
 
 async def test_a_sweep_drops_the_pending_entries_of_the_session_it_frees():
@@ -1476,11 +1485,17 @@ async def test_a_session_still_making_progress_is_never_expired(monkeypatch):
     assert await a._sessions.load(100) is not None
 
 
-async def test_the_stuck_check_runs_before_the_expiry_check(monkeypatch):
-    """Order matters. A wedged session is un-stuck first and only becomes
-    eligible for ordinary idle expiry once it has been idle that long — a
-    session past stuck_after but not past the idle limit is FREED, not ended,
-    because its conversation is still alive and its notes are still wanted."""
+async def test_a_session_past_only_the_stuck_threshold_is_freed_not_ended(monkeypatch):
+    """Renamed: this was called ...runs_before_the_expiry_check and claimed
+    "Order matters", but it passes with the two checks swapped -- at these
+    thresholds the expiry check is a no-op in either position, so it pinned
+    nothing about ordering. The ordering is genuinely covered by
+    test_a_session_wedged_past_both_thresholds_ends_and_stays_ended, the only
+    test that fails under the swap.
+
+    What this does verify is still worth having: a session past stuck_after but
+    NOT past the idle limit is freed and kept, because its conversation is
+    alive and its notes are still wanted."""
     a = _agent(stuck_after=100.0, session_ttl_s=1000.0)
     clock = [1000.0]
     monkeypatch.setattr(time, "time", lambda: clock[0])
@@ -1589,3 +1604,96 @@ async def test_a_session_wedged_past_both_thresholds_ends_and_stays_ended(monkey
     assert _drain_of(rec) is not None
     assert await a._sessions.load(100) is None
     assert await a._sessions.route("discord", "222") is None
+
+
+# --- the repaired transcript, judged by the real backend translator ---------
+
+def _openai_orphans(messages) -> tuple:
+    """Run the repaired transcript through the ACTUAL OpenAI translator and
+    report what a provider would reject: tool_calls with no answering tool
+    message, and tool messages answering nothing.
+
+    _abandon_gather's docstring makes a claim about what BOTH backends reject,
+    and until now only a hand-rolled checker in this file tested it -- so
+    _to_openai could regress without a single decider test noticing.
+    """
+    from switchboard.actuators.llm.backends.openai import _to_openai
+    out = _to_openai({"messages": messages, "model": "m", "max_tokens": 16})
+    called, answered = [], set()
+    for m in out["messages"]:
+        for tc in m.get("tool_calls") or ():
+            called.append(tc["id"])
+        if m.get("role") == "tool":
+            answered.add(m["tool_call_id"])
+    return (set(called) - answered, answered - set(called))
+
+
+async def test_the_repaired_transcript_survives_the_real_openai_translator():
+    a = _agent(stuck_after=100.0)
+    await _stuck_mid_gather(a, tools=("toolu_A", "toolu_B", "toolu_C"))
+    await _deliver(a, _tick(at=1000.0))
+    rec = await _deliver(a, _obs("discord.message", _message(mid="2"), oid=101))
+    messages = rec.emitted[0][1]["messages"]
+    assert _openai_orphans(messages) == (set(), set())
+
+
+async def test_a_partly_answered_gather_also_survives_the_real_translator():
+    """The harder shape: one tool answered before the freeze, two abandoned.
+    The repair must fill only the gaps and must not duplicate the answer that
+    already arrived -- a doubled tool_call_id is its own rejection."""
+    a = _agent(stuck_after=100.0)
+    cids = await _stuck_mid_gather(a, tools=("toolu_A", "toolu_B", "toolu_C"))
+    await _deliver(a, _obs("discord.post.ok", {"message_id": "9"},
+                           command_id=cids[0]))
+    s = await a._sessions.load(100)
+    s["busy_since"] = 500.0
+    await a._sessions.save(s)
+    await _deliver(a, _tick(at=1000.0))
+    rec = await _deliver(a, _obs("discord.message", _message(mid="2"), oid=101))
+    messages = rec.emitted[0][1]["messages"]
+    assert _openai_orphans(messages) == (set(), set())
+    results = [b for m in messages if isinstance(m["content"], list)
+               for b in m["content"] if b.get("type") == "tool_result"]
+    ids = [b["tool_use_id"] for b in results]
+    assert len(ids) == len(set(ids))          # nothing answered twice
+    # The answer that DID arrive must survive the repair. Overwriting it keeps
+    # the transcript structurally valid, so the orphan check above cannot see
+    # it -- but the model would be told a call was abandoned when it actually
+    # posted, and the obvious recovery is to post again.
+    by_id = {b["tool_use_id"]: b for b in results}
+    assert by_id["toolu_A"].get("is_error") is not True
+    assert by_id["toolu_B"]["is_error"] is True
+
+
+async def test_the_session_record_is_gone_before_the_drain_is_recorded():
+    """A crash between these two writes leaves one undone, and the order picks
+    which. Record-first orphans the scratchpad keys of a conversation that is
+    already over -- the leak spec 7.3 accepts. Entry-first would leave the
+    record and route ALIVE with a drain pending against them, so the list
+    result lands later and wipes the notes of a session still routable and
+    still holding its transcript."""
+    a = _agent()
+    await _mint(a)
+    order = []
+    store = a.ctx.store
+    real_set, real_delete = store.set, store.delete
+
+    async def spy_set(key, value, **kw):
+        if key.startswith("pending:"):
+            order.append("pending")
+        return await real_set(key, value, **kw)
+
+    async def spy_delete(key):
+        if key.startswith("session:"):
+            order.append("session-gone")
+        return await real_delete(key)
+
+    store.set, store.delete = spy_set, spy_delete
+    try:
+        await _deliver(a, _obs("discord.command.reset",
+                               {"channel_id": "222", "interaction_token": "tok"},
+                               oid=200))
+    finally:
+        store.set, store.delete = real_set, real_delete
+    assert "session-gone" in order and "pending" in order
+    assert order.index("session-gone") < order.index("pending")

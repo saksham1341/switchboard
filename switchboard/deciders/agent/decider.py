@@ -272,8 +272,18 @@ class AgentDecider:
         # model supplied, so it cannot be made to name another session or reach
         # `global:` — and `_on_drain` re-checks every key that comes back.
         cid = await ctx.command("kv", {"op": "list", "prefix": f"session:{sid}:"})
-        await self._sessions.put_pending(cid, {"kind": "drain", "sid": sid})
+        # The record goes BEFORE the drain entry is recorded, and the direction
+        # matters as much as the clear_pending ordering above. A crash between
+        # these two writes has to leave one of them undone; this order picks
+        # which. Record-first leaves the already-accepted §7.3 leak: the drain
+        # entry is never written, the keys are orphaned, and the conversation
+        # is gone anyway. Entry-first would leave the record and route ALIVE
+        # with a drain pending against them — the list result lands later and
+        # wipes the scratchpad of a session still routable and still holding
+        # its transcript. Losing keys nobody can reach beats deleting the
+        # working notes of a live conversation.
         await self._sessions.delete(s)
+        await self._sessions.put_pending(cid, {"kind": "drain", "sid": sid})
 
     async def _on_drain(self, p, obs, ctx) -> None:
         """The `list` half of a drain came back: delete what it found.

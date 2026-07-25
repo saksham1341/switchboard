@@ -34,10 +34,14 @@ logger = logging.getLogger(__name__)
 
 QUEUE_MAX = 256          # tap-side buffer before the oldest frames are dropped
 CLIENT_MAX = 256         # per-browser buffer
-DEAD_MAX = 500           # matches Bus's log_max_dead: the poll this replaced
+DEAD_MAX = 500           # DEFAULT ONLY -- the real bound is passed in from the
+                         # configured log_max_dead. The poll this replaced
                          # re-derived the list from message_state and was
-                         # bounded by that ceiling for free. Nothing rebuilds
-                         # it now, so the bound has to be stated here.
+                         # bounded by that ceiling for free; nothing rebuilds it
+                         # now, so the bound has to be carried here. A hardcoded
+                         # 500 was accurate only while SB_LOG_MAX_DEAD was at
+                         # its default -- raising the env var silently truncated
+                         # the dashboard's view of what had died.
 POST_TIMEOUT = 2.0
 PAGE = Path(__file__).with_name("page.html")
 
@@ -142,10 +146,12 @@ class DashboardTap:
 class Dashboard:
     """Serves the page, accepts authenticated frames, fans them out over SSE."""
 
-    def __init__(self, topology: dict, token: str, db_path: str):
+    def __init__(self, topology: dict, token: str, db_path: str,
+                 dead_max: int = DEAD_MAX):
         self._topology = topology
         self._token = token
         self._db = db_path
+        self._dead_max = dead_max
         self._clients: set[asyncio.Queue] = set()
         self._dead: list[dict] = []
         # Membership index for _dead, trimmed with it. The list is what the
@@ -190,7 +196,7 @@ class Dashboard:
                     # dead letter is not. The index is trimmed with the list, or
                     # an evicted entry would be remembered as "already seen"
                     # forever and could never reappear.
-                    while len(self._dead) > DEAD_MAX:
+                    while len(self._dead) > self._dead_max:
                         gone = self._dead.pop(0)
                         self._dead_seen.discard((gone["log"], gone["id"]))
                     new_dead = True

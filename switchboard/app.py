@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 
 from switchboard.bus import Bus
@@ -19,6 +20,15 @@ from switchboard.actuators.llm.backends.anthropic import AnthropicBackend
 from switchboard.actuators.llm.backends.openai import OpenAiBackend
 from switchboard.taps.logger import LoggerTap
 from switchboard.dashboard import Dashboard, DashboardTap
+
+logger = logging.getLogger(__name__)
+
+# How far a session's idle TTL must sit above the watchdog's window. Any factor
+# > 1 restores the ordering; 2.0 leaves room for a session to be freed and then
+# live a while before it is old enough to expire, instead of being freed and
+# immediately ended. At defaults nothing is clamped -- the floor lands near
+# 6300s against a 14400s TTL.
+SESSION_TTL_STUCK_FACTOR = 2.0
 
 DISCORD_COMMANDS = [
     CommandSpec("ping", "Ping Switchboard"),
@@ -136,6 +146,27 @@ def build(config: dict):
         if backend is not None:
             agent_post = _discord_post()
             bus.add_actuator(LlmActuator(backend))
+            _stuck_after = (bus.worst_case_retry_seconds
+                            * max(1.0, float(config.get("stuck_margin", 1.2))))
+            # The two thresholds are not independent. `_end_if_expired` is only
+            # harmless because the stuck check always gets to fire first; invert
+            # them and a busy session whose command is still LEGITIMATELY
+            # retrying is deleted mid-turn and its result dropped. Nothing about
+            # SB_SESSION_TTL_S stops an operator inverting them —
+            # SB_SESSION_TTL_S=1800 does it, and it is a plausible thing to
+            # want. So the relationship is made structurally true here, where
+            # both numbers are derived, rather than documented and hoped for.
+            # Raising the TTL rather than refusing to boot: a service that
+            # keeps conversations alive too long is recoverable, one that will
+            # not start on a config typo is an outage.
+            _floor = _stuck_after * SESSION_TTL_STUCK_FACTOR
+            _session_ttl_s = config.get("session_ttl_s", 14400.0)
+            if _session_ttl_s is not None and _session_ttl_s < _floor:
+                logger.warning(
+                    "session_ttl_s %.0fs is below the watchdog's %.0fs window; "
+                    "raising to %.0fs so expiry cannot preempt the watchdog",
+                    _session_ttl_s, _stuck_after, _floor)
+                _session_ttl_s = _floor
             bus.add_decider(AgentDecider(
                 model=config["llm_model"],
                 # The watchdog's threshold is derived from the Bus's own
@@ -151,9 +182,8 @@ def build(config: dict):
                 # watchdog that frees a session whose command is still in
                 # flight delivers the result to a session that moved on.
                 # Clamped at 1.0 so even a hostile value keeps the invariant.
-                stuck_after=(bus.worst_case_retry_seconds
-                             * max(1.0, float(config.get("stuck_margin", 1.2)))),
-                session_ttl_s=config.get("session_ttl_s", 14400.0),
+                stuck_after=_stuck_after,
+                session_ttl_s=_session_ttl_s,
                 tools=[agent_post.tool_spec | {"name": agent_post.name},
                        history.tool_spec | {"name": history.name},
                        react.tool_spec | {"name": react.name}]))
@@ -171,7 +201,12 @@ def build(config: dict):
     # ingest endpoint. There is deliberately no default token.
     if config.get("dashboard_token"):
         dash = Dashboard(topology=bus.topology(), token=config["dashboard_token"],
-                         db_path=config["mamamia_db_path"])
+                         db_path=config["mamamia_db_path"],
+                         # The same ceiling the Bus trims DEAD rows at. Passed
+                         # rather than duplicated: the dashboard cannot show
+                         # what the Bus has already trimmed, and a dashboard
+                         # bound BELOW it would hide rows that still exist.
+                         dead_max=int(config.get("log_max_dead", 500)))
         http.route("/", dash.page, owner="dashboard")
         http.route("/dashboard/stream", dash.stream, owner="dashboard")
         http.route("/dashboard/ingest", dash.ingest, methods=["POST"], owner="dashboard")
