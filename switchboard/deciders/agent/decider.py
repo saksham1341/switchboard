@@ -35,12 +35,19 @@ def _tool_outcome(obs) -> tuple[str, bool]:
     read as trusted transcript content once it lands.
     """
     payload = obs.payload if isinstance(obs.payload, dict) else {}
-    if obs.name.endswith(".error"):
-        message = payload.get("message")
-        body = message if isinstance(message, str) else json.dumps(payload)
-        return escape_delimiters(body), True
+    is_error = obs.name.endswith(".error")
     if obs.text is not None:
-        return obs.text, False
+        # Verbatim, error or not: it was escaped at write time by the producer.
+        # Re-escaping would double-escape legitimate content, and discarding it
+        # on the error path would silently throw away a producer's rendering.
+        return obs.text, is_error
+    if is_error:
+        message = payload.get("message")
+        # `obs.rendered` is the guarded json.dumps fallback (text is None here),
+        # so an unserialisable payload degrades instead of raising out of
+        # decide() -- which is what this docstring promises.
+        body = message if isinstance(message, str) else obs.rendered
+        return escape_delimiters(body), True
     return escape_delimiters(obs.rendered), False
 
 
@@ -164,7 +171,13 @@ class AgentDecider:
         already_buffered = isinstance(message_id, str) and any(
             b.get("message_id") == message_id for b in s["buffer"])
         if not already_buffered:
-            s["buffer"].append({"rendered": obs.rendered,
+            # Same rule as _tool_outcome: a producer's text is verbatim, the
+            # JSON fallback is escaped here because nobody else could have.
+            # Before this refactor the decider always escaped, so skipping it
+            # on the fallback would be a regression, not a new trade.
+            rendered = (obs.text if obs.text is not None
+                        else escape_delimiters(obs.rendered))
+            s["buffer"].append({"rendered": rendered,
                                 "is_mention": is_mention,
                                 "message_id": message_id})
         if is_mention and s["state"] == "idle":

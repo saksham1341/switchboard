@@ -357,3 +357,32 @@ async def test_on_message_emits_with_a_rendered_text():
     assert emitted
     text = emitted[0][2]
     assert text is not None and text.startswith("[discord.message]")
+
+
+# --- mention tagging: behaviours that moved here when the agent renderer died
+# `_tag_bot_mentions` implements all four cases; deleting tests/test_agent_render.py
+# left only the user-mention one pinned. These restore the rest.
+
+def test_render_tags_a_bot_role_mention():
+    from switchboard.sensors.discord import render_message
+    out = render_message({"channel_id": "222", "content": "<@&777> summarize",
+                          "bot_mention_ids": ["777"]})
+    assert "<@&777> (you)" in out
+
+
+def test_render_tags_an_everyone_and_here_broadcast():
+    from switchboard.sensors.discord import render_message
+    out = render_message({"channel_id": "222", "content": "@everyone deploy is live",
+                          "mention_everyone": True})
+    assert "@everyone (you are included)" in out
+    here = render_message({"channel_id": "222", "content": "@here standup",
+                           "mention_everyone": True})
+    assert "@here (you are included)" in here
+
+
+def test_render_leaves_someone_elses_mention_alone():
+    # Tagging every mention would tell the model it was addressed when it was not.
+    from switchboard.sensors.discord import render_message
+    out = render_message({"channel_id": "222", "content": "hey <@999> hi",
+                          "bot_mention_ids": ["555"]})
+    assert "<@999>" in out and "(you)" not in out
