@@ -67,7 +67,13 @@ class Sessions:
     # --- the pending map -------------------------------------------------
 
     async def put_pending(self, command_id: int, entry: dict) -> None:
-        await self._store.set(f"pending:{command_id}", json.dumps(entry))
+        # The session TTL, for the same reason the route carries it: a pending
+        # entry whose result never arrives (a command dropped on the floor, a
+        # crash between emit and result) would otherwise outlive the session it
+        # points at forever. Harmless -- load() returns None and decide() gives
+        # up -- but permanent, and sqlite keeps every one of them.
+        await self._store.set(f"pending:{command_id}", json.dumps(entry),
+                              ttl=self._ttl)
 
     async def take_pending(self, command_id: int) -> dict | None:
         """Read and delete. Deleting on read is what makes a redelivered result
@@ -78,3 +84,31 @@ class Sessions:
             return None
         await self._store.delete(key)
         return json.loads(raw)
+
+    async def clear_pending(self, sid: int) -> int:
+        """Drop every pending entry this session owns; returns how many.
+
+        The pending map is keyed by command id, so there is no index from a
+        session back to its commands and this has to scan. It lives here rather
+        than in the decider because the decider reaching into `pending:` keys
+        directly would put knowledge of this layout in two places.
+
+        Only the watchdog needs it: every ordinary path consumes its entries
+        one at a time through take_pending. Abandoning a turn is the one case
+        where results are expected that must never be honoured -- their gather
+        is already closed, and letting one back in restarts a turn that has
+        been replaced.
+        """
+        dropped = 0
+        for key in await self._store.keys("pending:"):
+            raw = await self._store.get(key)
+            if raw is None:
+                continue                # expired between keys() and get()
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(entry, dict) and entry.get("sid") == sid:
+                await self._store.delete(key)
+                dropped += 1
+        return dropped

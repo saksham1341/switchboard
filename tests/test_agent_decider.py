@@ -878,6 +878,151 @@ async def test_a_tick_with_no_sessions_is_harmless():
     assert rec.emitted == []
 
 
+# --- the watchdog must leave a REPAIRED session, not a half-open one ---------
+
+async def _stuck_mid_gather(a, tools=("toolu_A", "toolu_B")):
+    """A session frozen exactly where the watchdog finds one: an assistant turn
+    full of tool_use blocks, a gather open, tool commands in flight."""
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok([_use(t) for t in tools], command_id=cid))
+    s = await a._sessions.load(100)
+    s["busy_since"] = 500.0
+    await a._sessions.save(s)
+    return [c for _, _, c in rec.emitted]
+
+
+def _unanswered(messages) -> set:
+    """Every tool_use id with no matching tool_result anywhere after it. A
+    non-empty result is a transcript both Anthropic and OpenAI reject."""
+    open_ids = set()
+    for m in messages:
+        content = m["content"]
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if b.get("type") == "tool_use":
+                open_ids.add(b.get("id"))
+            elif b.get("type") == "tool_result":
+                open_ids.discard(b.get("tool_use_id"))
+    return open_ids
+
+
+async def test_a_sweep_closes_the_open_gather_it_frees():
+    """The bug this pins: the sweep wrote state/busy_since and left `gather`
+    populated, breaking the "gather is None whenever idle" invariant that every
+    other path upholds."""
+    a = _agent(stuck_after=100.0)
+    await _stuck_mid_gather(a)
+    await _deliver(a, _tick(at=1000.0))
+    s = await a._sessions.load(100)
+    assert s["state"] == "idle"
+    assert s["gather"] is None
+    last = s["messages"][-1]
+    assert last["role"] == "user"
+    assert {b["tool_use_id"] for b in last["content"]} == {"toolu_A", "toolu_B"}
+    assert all(b["is_error"] is True for b in last["content"])
+
+
+async def test_a_sweep_keeps_a_result_that_already_landed():
+    """Only the OUTSTANDING calls are synthesised. A tool that answered before
+    the session went stuck keeps its real result."""
+    a = _agent(stuck_after=100.0)
+    cids = await _stuck_mid_gather(a)
+    await _deliver(a, _obs("discord.post.ok", {"posted": True}, oid=300,
+                           command_id=cids[0]))
+    s = await a._sessions.load(100); s["busy_since"] = 500.0
+    await a._sessions.save(s)
+    await _deliver(a, _tick(at=1000.0))
+    blocks = {b["tool_use_id"]: b
+              for b in (await a._sessions.load(100))["messages"][-1]["content"]}
+    assert blocks["toolu_A"]["is_error"] is False
+    assert blocks["toolu_B"]["is_error"] is True
+
+
+async def test_the_transcript_after_a_sweep_is_valid_for_the_next_turn():
+    """Failure sequence (a): the swept session left a tool_use with no
+    tool_result, `_advance`'s merge rule appended a plain user turn after the
+    assistant, and the provider 400s on that shape forever -- a permanently
+    dead channel, since LlmError is not retryable and the decider is text-blind."""
+    a = _agent(stuck_after=100.0)
+    await _stuck_mid_gather(a)
+    await _deliver(a, _tick(at=1000.0))
+    rec = await _deliver(a, _obs("discord.message", _message(mid="2"), oid=101))
+    assert [n for n, _, _ in rec.emitted] == ["llm"]
+    assert _unanswered(rec.emitted[0][1]["messages"]) == set()
+
+
+async def test_the_synthesised_abandon_result_is_escaped():
+    a = _agent(stuck_after=100.0)
+    await _stuck_mid_gather(a)
+    await _deliver(a, _tick(at=1000.0))
+    block = (await a._sessions.load(100))["messages"][-1]["content"][0]
+    assert "</untrusted>" not in block["content"]
+    assert block["content"]                       # says something, not empty
+
+
+async def test_a_sweep_drops_the_pending_entries_of_the_session_it_frees():
+    a = _agent(stuck_after=100.0)
+    await _stuck_mid_gather(a)
+    assert await a.ctx.store.keys("pending:") != []
+    await _deliver(a, _tick(at=1000.0))
+    assert await a.ctx.store.keys("pending:") == []
+
+
+async def test_a_late_tool_result_after_a_sweep_starts_no_second_turn():
+    """Failure sequence (b): the pending entry outlived the sweep, so a late
+    result re-entered the still-open gather, closed it and called _advance --
+    two llm turns in flight on one session, each able to fan out its own
+    discord.post. A user-visible double post caused by the recovery mechanism."""
+    a = _agent(stuck_after=100.0)
+    cids = await _stuck_mid_gather(a)
+    await _deliver(a, _tick(at=1000.0))
+    rec = await _deliver(a, _obs("discord.message", _message(mid="2"), oid=101))
+    assert [n for n, _, _ in rec.emitted] == ["llm"]         # the new, legitimate turn
+    for i, cid in enumerate(cids):
+        late = await _deliver(a, _obs("discord.post.ok", {"posted": True},
+                                      oid=310 + i, command_id=cid))
+        assert late.emitted == []
+
+
+async def test_a_sweep_does_not_restart_the_turn_it_repaired():
+    """The sweep restores a re-enterable state and stops. Re-entering _advance
+    from the recovery path would loop on a session that is stuck precisely
+    because its llm leg keeps failing."""
+    a = _agent(stuck_after=100.0)
+    await _stuck_mid_gather(a)
+    rec = await _deliver(a, _tick(at=1000.0))
+    assert rec.emitted == []
+
+
+async def test_a_sweep_of_a_session_with_no_open_gather_appends_nothing():
+    """The other stuck shape: crashed between _advance's save and put_pending,
+    so it is busy with gather still None. Nothing to repair, nothing to append."""
+    a = _agent(stuck_after=100.0)
+    await _mint(a)
+    s = await a._sessions.load(100); s["busy_since"] = 500.0
+    await a._sessions.save(s)
+    before = len((await a._sessions.load(100))["messages"])
+    await _deliver(a, _tick(at=1000.0))
+    s = await a._sessions.load(100)
+    assert s["state"] == "idle" and s["gather"] is None
+    assert len(s["messages"]) == before
+
+
+async def test_a_sweep_leaves_another_sessions_pending_entries_alone():
+    a = _agent(stuck_after=100.0)
+    await _stuck_mid_gather(a)
+    # a second, healthy session on another channel, mid-flight
+    cid = (await _deliver(a, _obs("discord.message",
+                                  _message(mid="9", thread="777", channel="777"),
+                                  oid=700))).emitted[0][2]
+    rec = await _deliver(a, _llm_ok([_use("toolu_Z")], oid=701, command_id=cid))
+    other = rec.emitted[0][2]
+    await _deliver(a, _tick(at=1000.0))
+    assert await a.ctx.store.get(f"pending:{other}") is not None
+    assert (await a._sessions.load(700))["state"] == "busy"
+
+
 # --- /reset (Task 4) ----------------------------------------------------
 
 async def test_reset_clears_the_session_for_its_channel():

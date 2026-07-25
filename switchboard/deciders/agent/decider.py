@@ -439,6 +439,50 @@ class AgentDecider:
 
     # --- the watchdog ------------------------------------------------------
 
+    def _abandon_gather(self, s) -> None:
+        """Close an open gather the way `_maybe_close_gather` would, but with a
+        synthesised error for every call that never answered.
+
+        Repair, not restart. `_finish` — the only other route to idle — is
+        never reached with a gather still open, so the watchdog is the one path
+        that could leave one behind, and leaving one behind is not merely
+        untidy. The transcript would end with an assistant turn whose
+        `tool_use` blocks have no `tool_result`; the next mention takes
+        `_advance`, whose merge rule sees `role == "assistant"` and appends a
+        plain user turn, and BOTH backends reject that shape (Anthropic 400s on
+        an unanswered tool_use, OpenAI on `tool_calls` with no following
+        `role: "tool"` message). `LlmError` is PERMANENT, so the failure is not
+        retried, and the decider is text-blind so nothing is posted: the
+        channel is silently dead until `/reset` or the session TTL.
+
+        No `_advance` from here. A session is usually stuck precisely because
+        its llm leg keeps failing, and re-entering the turn from the recovery
+        path is how a watchdog becomes a loop. This restores a re-enterable
+        state and stops; the next user message takes the next turn normally.
+        """
+        gather = s["gather"]
+        if gather is not None:
+            for tid in gather["order"]:
+                if tid in gather["results"]:
+                    continue            # answered before the session froze
+                gather["results"][tid] = {
+                    "type": "tool_result", "tool_use_id": tid,
+                    # Escaped like every other model-facing string, even though
+                    # this one is ours: the boundary is the rule, not the
+                    # provenance of any single line.
+                    "content": escape_delimiters(
+                        "This tool call was abandoned: the turn stopped making "
+                        "progress and was reset. The call may or may not have "
+                        "taken effect. Check before assuming, and try again if "
+                        "it still matters."),
+                    "is_error": True}
+            # Same shape _maybe_close_gather appends: one user turn carrying
+            # every tool_result, in the model's original order.
+            s["messages"].append(
+                {"role": "user",
+                 "content": [gather["results"][t] for t in gather["order"]]})
+        s["gather"] = None
+
     async def _sweep_stuck(self, obs, ctx) -> None:
         """Free sessions that have been busy longer than any legitimate retry
         chain could take.
@@ -467,6 +511,14 @@ class AgentDecider:
                 continue
             logger.warning("session %s stuck busy for %.0fs; freeing",
                            s["sid"], now - since)
+            self._abandon_gather(s)
+            # Before the save, deliberately. A crash between the two leaves the
+            # session busy with a repaired transcript and no pending entries —
+            # the next tick sweeps it again and finishes the job. The reverse
+            # order (save first) would leave an IDLE session whose abandoned
+            # commands can still come back: take_pending would succeed, and a
+            # result belonging to a turn that no longer exists would reopen it.
+            await self._sessions.clear_pending(s["sid"])
             s["state"] = "idle"
             s["busy_since"] = None
             await self._sessions.save(s)
