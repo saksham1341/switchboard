@@ -180,10 +180,12 @@ def test_worst_case_covers_both_retry_paths_and_handler_time():
     from switchboard.bus import Bus
     bus = Bus(":memory:", message_max_retries=10, handler_timeout_s=100.0,
               retry_backoff_max_s=300.0, retry_after_max_s=120.0)
-    # jittered ceiling sum = 1+2+4+...+256 capped at 300 for the last = 811
-    # explicit = 10 * 120 = 1200  (the worse path)
-    # handler  = 11 * 100 = 1100
-    assert bus.worst_case_retry_seconds == 1200 + 1100
+    # per-attempt max(backoff_ceiling, retry_after_max):
+    #   i=0..6 -> 120 each (retry_after dominates the small early ceilings)
+    #   i=7 -> 128, i=8 -> 256, i=9 -> 300 (backoff overtakes)
+    # delay   = 120*7 + 128 + 256 + 300 = 1524
+    # handler = 11 * 100 = 1100
+    assert bus.worst_case_retry_seconds == 1524 + 1100
 
 
 def test_worst_case_takes_the_backoff_path_when_it_dominates():
@@ -223,3 +225,26 @@ async def test_a_retry_after_under_the_cap_is_honoured_exactly():
     async def handle(v): raise RetryableError("slow", retry_after=2.5)
     await bus._consume(CMD_LOG, "actuator/boom", Command.from_message, lambda v: True, handle)
     assert orch.retry_afters == [2.5]
+
+
+def test_worst_case_sums_per_attempt_maxima_not_the_larger_total():
+    """_consume picks the retry path PER ATTEMPT — a plain exception backs off,
+    a RetryableError uses its retry_after — so one message can alternate. Maxing
+    the two TOTALS assumes a message commits to one path and undercuts the real
+    ceiling; a watchdog trusting that number would free a session still
+    legitimately retrying."""
+    from switchboard.bus import Bus
+    bus = Bus(":memory:", message_max_retries=10, handler_timeout_s=0.0,
+              retry_backoff_max_s=300.0, retry_after_max_s=120.0)
+    naive = max(sum(min(300.0, 2.0 ** i) for i in range(10)), 10 * 120.0)
+    assert bus.worst_case_retry_seconds == 1524.0
+    assert bus.worst_case_retry_seconds > naive        # 1524 > 1200
+
+
+def test_worst_case_ignores_a_retry_after_smaller_than_every_backoff():
+    """When retry_after_max is below the smallest backoff ceiling it can never
+    dominate, and the bound collapses to the pure backoff sum."""
+    from switchboard.bus import Bus
+    bus = Bus(":memory:", message_max_retries=10, handler_timeout_s=0.0,
+              retry_backoff_max_s=300.0, retry_after_max_s=0.5)
+    assert bus.worst_case_retry_seconds == 811.0

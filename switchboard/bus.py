@@ -71,21 +71,26 @@ class Bus:
     def worst_case_retry_seconds(self) -> float:
         """Longest a message can legitimately stay in flight before it dead-letters.
 
-        Two retry paths exist and a message takes the worse of them: the
-        jittered backoff ceiling, or an explicit retry_after. Both are then
-        paid on top of the handler's own time on EVERY attempt — the term
-        people forget, and it is multiplied by (retries + 1).
+        `_consume` chooses the retry path PER ATTEMPT — a plain exception takes
+        the jittered backoff, a RetryableError takes its (clamped) retry_after —
+        so one message can alternate between them. The bound is therefore the
+        sum of the per-attempt maxima, NOT the larger of the two totals: at the
+        defaults the latter undercounts by 324s, because seven early backoff
+        delays are individually smaller than retry_after while the last three
+        are larger.
+
+        Paid on top is the handler's own time on EVERY attempt — the term
+        people omit, and it is multiplied by (retries + 1) because a message
+        gets an initial try plus each retry.
 
         Anything watching for a stuck consumer must sit above this or it will
         kill live work. Derived rather than chosen precisely because the
-        handler timeout is the most leveraged knob here: an 80s change to it
-        moves this by 15 minutes.
+        handler timeout is the most leveraged knob here.
         """
-        jittered = sum(min(self._retry_backoff_max_s, BACKOFF_BASE * 2 ** i)
-                       for i in range(self._message_max_retries))
-        explicit = self._message_max_retries * self._retry_after_max_s
-        return (max(jittered, explicit)
-                + (self._message_max_retries + 1) * self._handler_timeout_s)
+        delay = sum(max(min(self._retry_backoff_max_s, BACKOFF_BASE * 2 ** i),
+                        self._retry_after_max_s)
+                    for i in range(self._message_max_retries))
+        return delay + (self._message_max_retries + 1) * self._handler_timeout_s
 
     def topology(self) -> dict:
         """What is actually wired, by kind and name — so a view draws the real
