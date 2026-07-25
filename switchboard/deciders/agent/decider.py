@@ -391,6 +391,17 @@ class AgentDecider:
         # take_pending succeeds, _record_result sees gather is None and
         # silently drops the result, and the session is stuck busy forever
         # with nothing to distinguish it from a legitimately-closed gather.
+        #
+        # The turn made progress: the llm leg answered, and every tool command
+        # for this turn goes out in the synchronous burst immediately below, so
+        # this stamp is that emit's. `stuck_after` is derived (app.py) from the
+        # worst case for ONE message's retry chain, so the field it is compared
+        # against must advance per message too. Stamped once in `_advance` it
+        # spanned four legs — llm command, llm result, tool command, tool
+        # result — and a session merely unlucky with 429s crossed a threshold
+        # meant to catch a session that had stopped moving. `busy_since` means
+        # "since the last progress", which is what stuck actually means.
+        s["busy_since"] = time.time()
         await self._sessions.save(s)
         for tid, name, args in to_emit:
             cid = await ctx.command(name, args)
@@ -407,6 +418,12 @@ class AgentDecider:
         gather = s["gather"]
         if gather is None or tool_use_id in gather["results"]:
             return
+        # Progress, same as the emit in _on_response: one leg of the fan-out
+        # answered. A gather still waiting on a slow sibling is a session doing
+        # exactly what it should, and must not be swept out from under it.
+        # Persisted by _maybe_close_gather, which either saves the partial
+        # gather or advances (which stamps again).
+        s["busy_since"] = time.time()
         gather["results"][tool_use_id] = {"type": "tool_result",
                                           "tool_use_id": tool_use_id,
                                           "content": content,

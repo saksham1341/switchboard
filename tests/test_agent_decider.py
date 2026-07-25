@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -1071,6 +1072,61 @@ async def test_the_threshold_boundary_is_inclusive():
     await _deliver(a, _obs("clock.tick", {"at": 999.0}, oid=902))   # 99s
     assert (await a._sessions.load(100))["state"] == "busy"
     await _deliver(a, _obs("clock.tick", {"at": 1000.0}, oid=903))  # exactly 100s
+    assert (await a._sessions.load(100))["state"] == "idle"
+
+
+# --- busy_since measures time since PROGRESS, not since the turn began -------
+
+async def test_the_llm_leg_answering_refreshes_the_stuck_clock(monkeypatch):
+    """`stuck_after` is derived from the worst case for ONE message's retry
+    chain (see app.py). One busy window used to span four legs — the llm
+    command, the llm result, the tool command, the tool result — so a session
+    doing nothing wrong could cross the threshold: the provider 429s for most
+    of its budget, answers, and the tool it then calls starts its own retry
+    chain. The field the threshold is compared against has to advance per
+    message, or the derivation bounds the wrong thing."""
+    a = _agent(stuck_after=100.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    cid = await _mint(a)                              # busy_since = 1000
+    clock[0] = 1090.0                                 # 90s of legitimate retrying
+    await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    # 180s since _advance — past the threshold — but the llm answered at 1090
+    # and the tool leg has only been running 90s.
+    await _deliver(a, _tick(at=1180.0))
+    assert (await a._sessions.load(100))["state"] == "busy"
+
+
+async def test_a_tool_result_landing_refreshes_the_stuck_clock(monkeypatch):
+    """The other half: a fan-out of two tools where one answers late. The
+    session is making progress and must not be swept out from under the one
+    still running."""
+    a = _agent(stuck_after=100.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok([_use("toolu_A"), _use("toolu_B")],
+                                    command_id=cid))
+    cids = [c for _, _, c in rec.emitted]
+    clock[0] = 1180.0
+    await _deliver(a, _obs("discord.post.ok", {"posted": True}, oid=300,
+                           command_id=cids[0]))       # progress at 1180
+    s = await a._sessions.load(100)
+    assert s["gather"] is not None                    # still waiting on toolu_B
+    await _deliver(a, _tick(at=1270.0))               # 90s since that progress
+    assert (await a._sessions.load(100))["state"] == "busy"
+
+
+async def test_a_session_making_no_progress_is_still_swept(monkeypatch):
+    """The refresh must not defang the watchdog: silence past the threshold
+    still frees the session."""
+    a = _agent(stuck_after=100.0)
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    cid = await _mint(a)
+    clock[0] = 1090.0
+    await _deliver(a, _llm_ok([_use("toolu_A")], command_id=cid))
+    await _deliver(a, _tick(at=1191.0))               # 101s with no result
     assert (await a._sessions.load(100))["state"] == "idle"
 
 

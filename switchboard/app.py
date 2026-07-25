@@ -140,8 +140,11 @@ def build(config: dict):
                 model=config["llm_model"],
                 # The watchdog's threshold is derived from the Bus's own
                 # worst-case retry window, never a literal: that window is
-                # the longest a message can honestly stay in flight, and a
-                # decider guessing its own number is exactly the failure the
+                # the longest ONE message can honestly stay in flight — which
+                # is why the decider stamps `busy_since` on every leg of a
+                # turn rather than once when the turn began. A per-message
+                # bound compared against a per-turn clock would fire on live
+                # work. A decider guessing its own number is the failure the
                 # derivation exists to prevent. SB_STUCK_MARGIN scales that
                 # window, it does not replace it: a duration knob would make
                 # "fire before the retries are done" expressible, and a
