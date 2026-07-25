@@ -902,3 +902,28 @@ async def test_reset_on_a_channel_with_no_session_still_acknowledges():
 
 def test_subscribes_to_reset():
     assert _agent().subscribes(_obs("discord.command.reset", {}))
+
+
+async def test_a_malformed_tick_does_not_raise_out_of_decide():
+    """A raising handler is retried by the Bus, which would re-run the sweep.
+    Guarded in code but previously unpinned: a tick with no `at`, a string
+    `at`, or a non-dict payload must all return cleanly."""
+    a = _agent(stuck_after=100.0)
+    await _mint(a)
+    for payload in [{}, {"at": "soon"}, {"at": None}, "not a dict", None]:
+        rec = await _deliver(a, _obs("clock.tick", payload, oid=901))
+        assert rec.emitted == []
+    assert (await a._sessions.load(100))["state"] == "busy"   # untouched
+
+
+async def test_the_threshold_boundary_is_inclusive():
+    """Exactly at the threshold frees; one second under does not. Unspecified
+    by the design, so pinned here rather than left to drift."""
+    a = _agent(stuck_after=100.0)
+    await _mint(a)
+    s = await a._sessions.load(100); s["busy_since"] = 900.0
+    await a._sessions.save(s)
+    await _deliver(a, _obs("clock.tick", {"at": 999.0}, oid=902))   # 99s
+    assert (await a._sessions.load(100))["state"] == "busy"
+    await _deliver(a, _obs("clock.tick", {"at": 1000.0}, oid=903))  # exactly 100s
+    assert (await a._sessions.load(100))["state"] == "idle"
