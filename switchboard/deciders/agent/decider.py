@@ -9,7 +9,8 @@ import json
 import logging
 import time
 
-from switchboard.deciders.agent.memory import MEMORY_TOOLS, rewrite
+from switchboard.deciders.agent.memory import (
+    MEMORY_TOOLS, MEMORY_TOOL_NAMES, rewrite)
 from switchboard.deciders.agent.prompt import SYSTEM
 from switchboard.deciders.agent.session import Sessions
 from switchboard.message import CMD_LOG
@@ -334,10 +335,22 @@ class AgentDecider:
             # tool_use_id the model actually used, so the eventual kv.ok/
             # kv.error is attributed back to the memory tool call, not to a
             # `kv` tool_use that never existed in the transcript.
-            rewritten = rewrite(name, args, s["sid"], self._session_ttl_s) \
-                if isinstance(name, str) else None
-            if rewritten is not None:
-                to_emit.append((tid, "kv", rewritten))
+            if isinstance(name, str) and name in MEMORY_TOOL_NAMES:
+                # Handled entirely here, success or failure. Falling through to
+                # the `known` branch on a bad op would emit a command named
+                # `memory`, which no actuator consumes — never acquired, never
+                # retried, never dead-lettered (§7.5), so the session hangs
+                # until the watchdog frees it. An invalid op is a tool error
+                # the model can read and correct, not silence.
+                rewritten = rewrite(name, args, s["sid"], self._session_ttl_s)
+                if rewritten is not None:
+                    to_emit.append((tid, "kv", rewritten))
+                else:
+                    gather["results"][tid] = {
+                        "type": "tool_result", "tool_use_id": tid,
+                        "content": escape_delimiters(
+                            f"{name}: unsupported op {args.get('op')!r}"),
+                        "is_error": True}
             # A non-string name (list/dict/etc) would raise on `in known` —
             # guard with isinstance before the hashable-membership check and
             # treat it the same as an unknown tool.

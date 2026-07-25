@@ -962,3 +962,31 @@ async def test_a_kv_result_is_attributed_to_the_memory_tool_use():
     assert [n for n, _, _ in rec2.emitted] == ["llm"]
     s = await a._sessions.load(100)
     assert s["messages"][-1]["content"][0]["tool_use_id"] == "toolu_A"
+
+
+async def test_a_memory_tool_with_a_bad_op_errors_in_band_not_as_a_phantom_command():
+    """The failure this guards is silent and expensive: emitting a command
+    named `memory` addresses an actuator that does not exist, so it is never
+    acquired, never retried, never dead-lettered (§7.5) — the session hangs
+    until the watchdog frees it ~52 minutes later. An invalid op must come
+    back as a tool error the model can read and correct."""
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok(
+        [_use("toolu_A", name="memory", args={"op": "drop_everything", "key": "k"})],
+        command_id=cid))
+    # no command emitted at all for this turn -- the gather closed immediately
+    assert [n for n, _, _ in rec.emitted] == ["llm"]
+    s = await a._sessions.load(100)
+    block = s["messages"][-1]["content"][0]
+    assert block["is_error"] is True
+    assert "drop_everything" in block["content"]
+
+
+async def test_a_valid_memory_op_still_emits_kv():
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok(
+        [_use("toolu_A", name="memory", args={"op": "set", "key": "k", "value": "v"})],
+        command_id=cid))
+    assert [n for n, _, _ in rec.emitted] == ["kv"]

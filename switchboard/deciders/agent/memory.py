@@ -106,6 +106,14 @@ def _tool_spec(name: str, what_for: str) -> dict:
     }
 
 
+# The names the decider owns end to end. A call to one of these NEVER falls
+# through to the ordinary tool path: rewrite() either produces kv args or the
+# call is answered in-band as an error. Emitting a command under one of these
+# names would address an actuator that does not exist, and an unconsumed
+# command is never acquired, never retried, never dead-lettered (§7.5) — the
+# session would simply hang until the watchdog frees it.
+MEMORY_TOOL_NAMES = frozenset({"scratchpad", "memory"})
+
 MEMORY_TOOLS = [
     _tool_spec(
         SCRATCHPAD,
