@@ -9,6 +9,7 @@ import json
 import logging
 import time
 
+from switchboard.deciders.agent.memory import MEMORY_TOOLS, rewrite
 from switchboard.deciders.agent.prompt import SYSTEM
 from switchboard.deciders.agent.session import Sessions
 from switchboard.message import CMD_LOG
@@ -69,6 +70,10 @@ class AgentDecider:
     def __init__(self, *, tools, model, stuck_after: float, system: str | None = None,
                  max_tokens: int = AGENT_MAX_TOKENS, session_ttl_s: float | None = None):
         self._tools = list(tools)
+        # The model sees its configured tools plus the two memory tools
+        # (§7.3) on every turn; `rewrite()` is what actually reaches `kv`, so
+        # `kv` itself is never in this list and never offered to the model.
+        self._all_tools = self._tools + MEMORY_TOOLS
         self._system = system if system is not None else SYSTEM
         self._model = model
         self._max_tokens = max_tokens
@@ -261,7 +266,7 @@ class AgentDecider:
             s["buffer"] = []
 
         args = {"system": self._system, "messages": s["messages"],
-                "tools": self._tools, "model": self._model,
+                "tools": self._all_tools, "model": self._model,
                 "max_tokens": self._max_tokens}
         cid = await ctx.command("llm", args)
         # The store has no transactions, so these two writes can never be made
@@ -301,7 +306,7 @@ class AgentDecider:
             # nothing. A reply reaches the user only via a reply tool.
             return await self._finish(s, ctx)
 
-        known = {t["name"] for t in self._tools}
+        known = {t["name"] for t in self._all_tools}
         # Only one gather is ever open per session: a session is "busy" from
         # advance until finish and emits one llm at a time, so the session
         # record itself is the gather key. The spec's turn_key is unnecessary
@@ -320,11 +325,23 @@ class AgentDecider:
                 continue
             gather["order"].append(tid)
             name = b.get("name")
+            args = b.get("input") if isinstance(b.get("input"), dict) else {}
+            # `scratchpad`/`memory` never reach the actuator under their own
+            # name: the model addresses one of them, but `rewrite()` -- not
+            # the model -- decides the real (namespaced) `kv` args, so the
+            # command emitted is always `kv`. Checked before the `known`
+            # lookup below; the pending entry still keys on `tid`, the
+            # tool_use_id the model actually used, so the eventual kv.ok/
+            # kv.error is attributed back to the memory tool call, not to a
+            # `kv` tool_use that never existed in the transcript.
+            rewritten = rewrite(name, args, s["sid"], self._session_ttl_s) \
+                if isinstance(name, str) else None
+            if rewritten is not None:
+                to_emit.append((tid, "kv", rewritten))
             # A non-string name (list/dict/etc) would raise on `in known` —
             # guard with isinstance before the hashable-membership check and
             # treat it the same as an unknown tool.
-            if isinstance(name, str) and name in known:
-                args = b.get("input") if isinstance(b.get("input"), dict) else {}
+            elif isinstance(name, str) and name in known:
                 to_emit.append((tid, name, args))
             else:
                 # Hallucinated tool (spec 8): answered immediately, in-band, so

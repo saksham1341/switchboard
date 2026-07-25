@@ -927,3 +927,38 @@ async def test_the_threshold_boundary_is_inclusive():
     assert (await a._sessions.load(100))["state"] == "busy"
     await _deliver(a, _obs("clock.tick", {"at": 1000.0}, oid=903))  # exactly 100s
     assert (await a._sessions.load(100))["state"] == "idle"
+
+
+# --- scratchpad / memory (Task 5) ---------------------------------------
+
+async def test_a_memory_tool_call_becomes_a_kv_command():
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok(
+        [_use("toolu_A", name="memory", args={"op": "set", "key": "n", "value": "sak"})],
+        command_id=cid))
+    name, args, _ = rec.emitted[0]
+    assert name == "kv"                       # the agent never addresses kv itself
+    assert args["key"] == "global:n"
+
+
+async def test_the_memory_tools_are_offered_to_the_model():
+    a = _agent()
+    rec = await _deliver(a, _obs("discord.message", _message()))
+    _, args, _ = rec.emitted[0]
+    assert {"scratchpad", "memory"} <= {t["name"] for t in args["tools"]}
+
+
+async def test_a_kv_result_is_attributed_to_the_memory_tool_use():
+    """The command emitted is kv, but the tool_result must carry the memory
+    tool_use_id or the gather never closes."""
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok(
+        [_use("toolu_A", name="memory", args={"op": "get", "key": "n"})],
+        command_id=cid))
+    kv_cid = rec.emitted[0][2]
+    rec2 = await _deliver(a, _obs("kv.ok", {"value": "sak"}, oid=400, command_id=kv_cid))
+    assert [n for n, _, _ in rec2.emitted] == ["llm"]
+    s = await a._sessions.load(100)
+    assert s["messages"][-1]["content"][0]["tool_use_id"] == "toolu_A"
