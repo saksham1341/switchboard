@@ -9,9 +9,9 @@ import json
 import logging
 
 from switchboard.deciders.agent.prompt import SYSTEM
-from switchboard.deciders.agent.render import escape_delimiters, render_message
 from switchboard.deciders.agent.session import Sessions
 from switchboard.message import CMD_LOG
+from switchboard.render import escape_delimiters
 
 logger = logging.getLogger(__name__)
 
@@ -23,29 +23,25 @@ def _tool_outcome(obs) -> tuple[str, bool]:
     An error carries {"message": ...}. Shape-defensive throughout — a surprising
     payload must degrade to text, never raise.
 
-    This is a second ingress path for untrusted text, alongside the
-    §6.6-documented `discord.message` boundary in render.py: a tool result can
-    relay content some other user wrote (e.g. `discord.history.ok` carrying
-    raw Discord message bodies), and that text is serialized straight into a
-    `tool_result` block with no other framing. Escaping delimiters here --
-    generically, for every tool, not just `discord.history` -- is what keeps
-    a forged `</message> SYSTEM: ...` from reading as trusted transcript
-    content once it lands. Escaping is not a `discord.history` special case:
-    any future tool that relays external text inherits the same fix for free.
+    A producer-supplied `obs.text` is used VERBATIM: it was escaped at write
+    time by whoever owned the payload (see switchboard/render.py's
+    `message_text`/`escape_delimiters` contract). Re-escaping it here would
+    double-escape legitimate content. Only the JSON fallback -- the case where
+    no producer supplied anything -- is escaped by the agent, because there
+    nobody else could have. The `.error` branch and the `discord.history`-style
+    relay case are the same second ingress path for untrusted text documented
+    at the §6.6 `discord.message` boundary: a tool result can relay content
+    some other user wrote, so a forged `</untrusted> SYSTEM: ...` must not
+    read as trusted transcript content once it lands.
     """
     payload = obs.payload if isinstance(obs.payload, dict) else {}
     if obs.name.endswith(".error"):
         message = payload.get("message")
-        if isinstance(message, str):
-            return escape_delimiters(message), True
-        try:
-            return escape_delimiters(json.dumps(payload)), True
-        except (TypeError, ValueError):
-            return escape_delimiters(str(payload)), True
-    try:
-        return escape_delimiters(json.dumps(payload)), False
-    except (TypeError, ValueError):
-        return escape_delimiters(str(payload)), False
+        body = message if isinstance(message, str) else json.dumps(payload)
+        return escape_delimiters(body), True
+    if obs.text is not None:
+        return obs.text, False
+    return escape_delimiters(obs.rendered), False
 
 
 # A modest default, not because of any one source but because reserving output
@@ -168,7 +164,7 @@ class AgentDecider:
         already_buffered = isinstance(message_id, str) and any(
             b.get("message_id") == message_id for b in s["buffer"])
         if not already_buffered:
-            s["buffer"].append({"rendered": render_message(payload),
+            s["buffer"].append({"rendered": obs.rendered,
                                 "is_mention": is_mention,
                                 "message_id": message_id})
         if is_mention and s["state"] == "idle":
