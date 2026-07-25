@@ -22,7 +22,8 @@ from pathlib import Path
 import httpx
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from switchboard.dashboard.stats import FRAME_KEYS, backfill, dead_message_ids
+from switchboard.dashboard.stats import FRAME_KEYS, backfill
+from switchboard.sensors.deadletter import DEADLETTER
 
 
 def _reframe(frame: dict) -> dict:
@@ -43,7 +44,17 @@ def project(log: str, view) -> dict:
 
     Observation payloads carry GitHub bodies, Discord user ids, and a live
     interaction_token — which is a capability, not merely data.
+
+    A `switchboard.deadletter` observation is the one exception worth naming:
+    its payload IS structure (which log, which message died), never producer
+    content, so `dead_log`/`dead_id` are read from it deliberately — every
+    other field below stays name/id/link, same as always.
     """
+    dead_log = dead_id = None
+    if view.name == DEADLETTER:
+        payload = getattr(view, "payload", None) or {}
+        dead_log = payload.get("log")
+        dead_id = payload.get("message_id")
     return {
         "log": log,
         "id": view.id,
@@ -51,6 +62,8 @@ def project(log: str, view) -> dict:
         "emitted_by": view.emitted_by,
         "observation_id": getattr(view, "observation_id", None),
         "command_id": getattr(view, "command_id", None),
+        "dead_log": dead_log,
+        "dead_id": dead_id,
         "seen_at": time.time(),
     }
 
@@ -151,10 +164,23 @@ class Dashboard:
             return JSONResponse({"error": "malformed json"}, status_code=400)
 
         self._dropped = body.get("dropped", self._dropped)
-        for frame in body.get("frames", []):
+        new_dead = False
+        for raw in body.get("frames", []):
             # Re-shape to the allowlist at the boundary too: the browser escapes
             # on render, but a frame with unexpected keys should never reach it.
-            self._broadcast({"type": "event", "frame": _reframe(frame)})
+            frame = _reframe(raw)
+            if (frame["name"] == DEADLETTER and frame["dead_log"] is not None
+                    and frame["dead_id"] is not None):
+                entry = {"log": frame["dead_log"], "id": frame["dead_id"]}
+                if entry not in self._dead:
+                    self._dead.append(entry)
+                    new_dead = True
+            self._broadcast({"type": "event", "frame": frame})
+        if new_dead:
+            # Same shape refresh_dead used to push: a dead command emits no
+            # result observation, so this list is the one signal the rest of
+            # the event stream cannot carry on its own.
+            self._broadcast({"type": "dead", "dead": self._dead})
         return JSONResponse({"status": "ok"}, status_code=202)
 
     async def stream(self, request):
@@ -192,15 +218,3 @@ class Dashboard:
             except asyncio.QueueFull:
                 # One stalled browser must not stall the others.
                 self._clients.discard(q)
-
-    def refresh_dead(self) -> None:
-        """Polled on a timer. Failure is the only signal the event stream cannot
-        carry, because a dead command produces no result observation at all."""
-        try:
-            dead = dead_message_ids(self._db)
-        except Exception as exc:
-            logger.debug("dead-letter refresh skipped: %s", exc)
-            return
-        if dead != self._dead:
-            self._dead = dead
-            self._broadcast({"type": "dead", "dead": dead})

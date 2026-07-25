@@ -210,3 +210,46 @@ def test_the_projection_never_carries_the_rendered_text():
                   "text": "[discord.message] SHOULD NOT APPEAR EITHER"}
     frame = project("obs", Observation.from_message(m))
     assert "SHOULD NOT APPEAR" not in repr(frame)
+
+
+# --- dead-letter subscription (replaces the poll) ----------------------------
+
+def test_the_deadletter_projection_carries_the_link_and_no_payload():
+    class M:
+        id = 9
+    m = M()
+    m.payload = {"log": "cmd", "message_id": 44, "name": "llm",
+                 "secret": "SHOULD NOT APPEAR"}
+    m.metadata = {"name": "switchboard.deadletter", "emitted_by": "sensor/deadletter"}
+    frame = project("obs", Observation.from_message(m))
+    assert set(frame) == set(FRAME_KEYS)
+    assert frame["dead_log"] == "cmd" and frame["dead_id"] == 44
+    assert "SHOULD NOT APPEAR" not in repr(frame)
+
+
+def test_an_ordinary_frame_has_no_dead_fields():
+    frame = project("obs", _obs())
+    assert frame["dead_log"] is None and frame["dead_id"] is None
+
+
+async def test_ingest_marks_dead_from_a_deadletter_frame(tmp_path):
+    dash = _dash(tmp_path)
+    seen = asyncio.Queue(); dash._clients.add(seen)
+    app = Starlette(routes=[Route("/dashboard/ingest", dash.ingest, methods=["POST"])])
+    TestClient(app).post("/dashboard/ingest",
+        json={"frames": [{"log": "obs", "id": 9, "name": "switchboard.deadletter",
+                          "dead_log": "cmd", "dead_id": 44, "seen_at": 0}]},
+        headers={"Authorization": "Bearer t0ken"})
+    assert {"log": "cmd", "id": 44} in dash._dead
+
+
+def test_the_dashboard_no_longer_polls(tmp_path):
+    from switchboard.app import build
+    from switchboard.dashboard import Dashboard
+    assert not hasattr(Dashboard, "refresh_dead")
+    bus, _ = build({"mamamia_db_path": str(tmp_path / "mm.db"),
+                    "switchboard_db_path": str(tmp_path / "sb.db"),
+                    "github_secret": "s", "port": 8167,
+                    "dashboard_token": "t0ken",
+                    "dashboard_ingest_url": "http://127.0.0.1:8167/dashboard/ingest"})
+    assert "dashboard-dead" not in bus._maintenance

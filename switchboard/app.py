@@ -174,9 +174,6 @@ def build(config: dict):
         http.route("/dashboard/ingest", dash.ingest, methods=["POST"], owner="dashboard")
         bus.add_tap(DashboardTap(url=config["dashboard_ingest_url"],
                                  token=config["dashboard_token"]))
-        # The only polling in the design: a dead command emits no result
-        # observation, so absence is all the stream can show.
-        bus.schedule_maintenance("dashboard-dead", 5.0, dash.refresh_dead)
 
     return bus, sensors
 

@@ -6,9 +6,8 @@ precedent: read-only, never written to, and pinned to a mamamia version.
 """
 import sqlite3
 
-from mamamia.core.models import MessageState
-
-FRAME_KEYS = ("log", "id", "name", "emitted_by", "observation_id", "command_id", "seen_at")
+FRAME_KEYS = ("log", "id", "name", "emitted_by", "observation_id", "command_id",
+              "dead_log", "dead_id", "seen_at")
 
 
 def _decode(blob):
@@ -19,24 +18,6 @@ def _decode(blob):
 def _connect(db_path: str) -> sqlite3.Connection:
     # uri=True + mode=ro so a bug here can never write to the relay's database.
     return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-
-
-def dead_message_ids(db_path: str) -> list[dict]:
-    """Ids of messages that dead-lettered, so the page can mark a trace failed.
-
-    Failure is the one signal the event stream cannot carry: a dead command
-    produces no result observation, and absence alone cannot distinguish "died"
-    from "still working".
-    """
-    conn = _connect(db_path)
-    try:
-        rows = conn.execute(
-            "SELECT log_id, message_id FROM message_state WHERE state = ?",
-            (MessageState.DEAD.value,),
-        ).fetchall()
-        return [{"log": log_id, "id": message_id} for log_id, message_id in rows]
-    finally:
-        conn.close()
 
 
 def backfill(db_path: str, limit: int = 50) -> list[dict]:
