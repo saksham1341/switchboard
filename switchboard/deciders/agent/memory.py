@@ -15,9 +15,9 @@ namespace it was supposed to land in.
 - `scratchpad` is namespaced to the calling session (`session:<sid>:`) and
   is removed when that session ends -- working notes for one conversation,
   gone when it ends. Neither tool injects a TTL: the entry lives until the
-  decider ends the session and drains the whole prefix in one `kv`
-  `delete_prefix` command. A TTL stamped at write would run on its own clock
-  and expire a note the live conversation was still using.
+  decider ends the session and drains the prefix (a `kv` `list`, then a `kv`
+  `delete` per key). A TTL stamped at write would run on its own clock and
+  expire a note the live conversation was still using.
 - `memory` is namespaced globally (`global:`) and is never drained -- it
   outlives any single conversation, so it is for what is worth still knowing
   weeks from now, not scratch state.
