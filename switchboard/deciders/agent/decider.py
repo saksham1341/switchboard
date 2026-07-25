@@ -176,11 +176,47 @@ class AgentDecider:
             if sid is not None:
                 s = await self._sessions.load(sid)
                 if s is not None:
-                    await self._sessions.delete(s)
+                    await self._end_session(s, ctx)
         await ctx.command("discord.reply_to_command", {
             "interaction_token": payload.get("interaction_token"),
             "content": "Conversation cleared.",
         })
+
+    async def _end_session(self, s, ctx) -> None:
+        """The one path by which a session ends. `/reset` and idle expiry both
+        come through here, because "ended" has to mean the same thing either
+        way — before this, `/reset` deleted the record and left every scratchpad
+        key behind with the sid gone, so nothing could ever find them again.
+
+        The drain is a COMMAND, not a store call, and that is structural rather
+        than stylistic: the scratchpad lives in `actuator/kv/` and this decider
+        is scoped to `decider/agent/`. It cannot read or write those keys, which
+        is the whole point of the scoping — so the only way to remove them is to
+        ask the actuator that owns them, on the cmd log, where the removal is
+        visible like every other effect.
+
+        Emitted BEFORE the record is deleted, deliberately. The store has no
+        transactions, so a crash between the two is possible whichever order we
+        pick, and this is the order that fails safe: a crash after the command
+        leaves a session record that is drained but still routable, and the next
+        tick expires it again — a duplicate `delete_prefix` is a no-op that
+        reports removed=0. Deleting first and crashing would strand the keys
+        with no sid left to name them, which is the exact failure this method
+        exists to remove.
+        """
+        # Built here from the int sid, never from anything the model supplied,
+        # so it cannot be made to name another session or reach `global:`. The
+        # actuator re-checks it anyway (an empty prefix would drain the store).
+        await ctx.command("kv", {"op": "delete_prefix",
+                                 "prefix": f"session:{s['sid']}:"})
+        # A /reset lands on a busy session more often than not — that is usually
+        # why someone types it. Its in-flight commands will still come back, and
+        # a pending entry pointing at a session that no longer loads is a
+        # warning logged per orphan for an ending the user asked for. Dropped
+        # here so the late result is genuinely silent (decide() finds no pending
+        # entry and returns), the same reason the watchdog clears them.
+        await self._sessions.clear_pending(s["sid"])
+        await self._sessions.delete(s)
 
     async def _on_message(self, obs, ctx) -> None:
         payload = obs.payload if isinstance(obs.payload, dict) else {}

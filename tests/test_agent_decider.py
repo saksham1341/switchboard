@@ -1027,6 +1027,8 @@ async def test_a_sweep_leaves_another_sessions_pending_entries_alone():
 # --- /reset (Task 4) ----------------------------------------------------
 
 async def test_reset_clears_the_session_for_its_channel():
+    """The record and route still go, and the ack is still unconditional. The
+    drain that now rides alongside them is pinned separately, below."""
     a = _agent()
     await _deliver(a, _obs("discord.message", _message()))
     assert await a._sessions.load(100) is not None
@@ -1035,7 +1037,7 @@ async def test_reset_clears_the_session_for_its_channel():
                                  oid=300))
     assert await a._sessions.load(100) is None
     assert await a._sessions.route("discord", "222") is None
-    assert [n for n, _, _ in rec.emitted] == ["discord.reply_to_command"]
+    assert [n for n, _, _ in rec.emitted] == ["kv", "discord.reply_to_command"]
 
 
 async def test_reset_on_a_channel_with_no_session_still_acknowledges():
@@ -1191,3 +1193,111 @@ async def test_a_valid_memory_op_still_emits_kv():
         [_use("toolu_A", name="memory", args={"op": "set", "key": "k", "value": "v"})],
         command_id=cid))
     assert [n for n, _, _ in rec.emitted] == ["kv"]
+
+
+async def test_a_scratchpad_set_carries_no_ttl_into_the_kv_command():
+    """End of the chain the memory unit test starts: what actually reaches the
+    cmd log has no ttl, so nothing but the drain removes the note."""
+    a = _agent(session_ttl_s=3600.0)
+    cid = await _mint(a)
+    rec = await _deliver(a, _llm_ok(
+        [_use("toolu_A", name="scratchpad",
+              args={"op": "set", "key": "draft", "value": "v"})], command_id=cid))
+    _, args, _ = rec.emitted[0]
+    assert args["key"] == "session:100:draft"
+    assert "ttl" not in args
+
+
+# --- ending a session: one path, drain included ------------------------------
+#
+# The decider owns `decider/agent/`; the scratchpad lives in `actuator/kv/`. It
+# physically cannot delete those keys, so the drain goes out as a command like
+# any other side effect. These tests drive that command through a REAL
+# KvActuator, because "the decider emitted something plausible" is not the
+# property that matters — "the keys are gone and `global:` is not" is.
+
+def _drain_of(rec):
+    """The kv delete_prefix command a decide() emitted, or None."""
+    for name, args, _ in rec.emitted:
+        if name == "kv" and args.get("op") == "delete_prefix":
+            return args
+    return None
+
+
+async def _kv_over(store):
+    from switchboard.actuators.kv import KvActuator
+    from switchboard.message import ActCtx, ActuatorCtx, Command
+
+    a = KvActuator()
+    a.bind(ActuatorCtx(store=store))
+
+    async def run(args):
+        class M:
+            id = 1
+            payload = args
+            metadata = {"name": "kv", "observation_id": 7}
+        out = []
+        async def emit(name, payload, cid):
+            out.append((name, payload)); return 0
+        cmd = Command.from_message(M())
+        await a.act(cmd, ActCtx(cmd=cmd, _emit_result=emit))
+        return out[0]
+    return run
+
+
+async def test_reset_drains_the_sessions_scratchpad():
+    """The gap this closes: /reset deleted the session record and left every
+    scratchpad key behind, with the sid gone so nothing could ever find them."""
+    a = _agent()
+    await _deliver(a, _obs("discord.message", _message()))
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    assert _drain_of(rec) == {"op": "delete_prefix", "prefix": "session:100:"}
+
+
+async def test_a_global_memory_key_survives_a_session_drain():
+    """The prefix the decider builds is `session:<sid>:` from an int sid, so it
+    cannot reach `global:`. Asserted against a real actuator over a real store
+    rather than against the string, because the string is the easy half."""
+    a = _agent()
+    await _deliver(a, _obs("discord.message", _message()))
+    kv_store = MemoryStore()
+    run = await _kv_over(kv_store)
+    await run({"op": "set", "key": "global:prefs", "value": "keep me"})
+    await run({"op": "set", "key": "session:100:draft", "value": "scratch"})
+    await run({"op": "set", "key": "session:999:draft", "value": "someone else"})
+
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    name, payload = await run(_drain_of(rec))
+    assert name == "kv.ok" and payload["removed"] == 1
+    assert sorted(await kv_store.keys("")) == ["global:prefs", "session:999:draft"]
+
+
+async def test_reset_drops_the_pending_entries_of_the_session_it_ends():
+    """A /reset lands on a BUSY session all the time — that is usually why it is
+    typed. Leaving pending entries behind means the in-flight result comes back,
+    take_pending succeeds, the session no longer loads, and the decider logs a
+    warning per orphan for a session the user deliberately ended."""
+    a = _agent()
+    cid = await _mint(a)                              # busy, one pending llm
+    await _deliver(a, _obs("discord.command.reset",
+                           {"channel_id": "222", "interaction_token": "tok"},
+                           oid=300))
+    assert await a._sessions.take_pending(cid) is None
+
+
+async def test_a_late_result_after_a_reset_is_silent(caplog):
+    a = _agent()
+    cid = await _mint(a)
+    await _deliver(a, _obs("discord.command.reset",
+                           {"channel_id": "222", "interaction_token": "tok"},
+                           oid=300))
+    with caplog.at_level("WARNING"):
+        rec = await _deliver(a, _obs("llm.ok", {"stop_reason": "end_turn",
+                                                "content": []},
+                                     oid=400, command_id=cid))
+    assert rec.emitted == []
+    assert caplog.records == []
