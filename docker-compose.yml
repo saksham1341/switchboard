@@ -28,6 +28,16 @@ services:
       SB_LLM_API_KEY: ${SB_LLM_API_KEY:-}
       SB_LLM_BASE_URL: ${SB_LLM_BASE_URL:-}
       SB_LLM_MODEL: ${SB_LLM_MODEL:-}
+      # Sliding idle expiry (seconds) for an agent conversation, refreshed on
+      # every turn. With the transcript cap out of scope, this is the ONLY
+      # automatic bound on how long a conversation can run.
+      SB_SESSION_TTL_S: ${SB_SESSION_TTL_S:-14400}
+      # A MULTIPLIER on the Bus's own derived worst-case retry window, never a
+      # duration -- clamped to a minimum of 1.0 in app.py's build(). A seconds
+      # knob would make "fire while the command is still legitimately
+      # retrying" expressible, and freeing a session too early hands it the
+      # eventual result after it has already moved past that turn.
+      SB_STUCK_MARGIN: ${SB_STUCK_MARGIN:-1.2}
 
       # --- Dashboard ---
       # Set a token to enable the live dashboard; unset = no dashboard at all.
@@ -55,6 +65,9 @@ services:
       SB_LOG_MAX_MESSAGES: ${SB_LOG_MAX_MESSAGES:-100000}
       # How many dead-lettered messages are kept before the oldest are dropped.
       SB_LOG_MAX_DEAD: ${SB_LOG_MAX_DEAD:-500}
+      # How often (seconds) the clock sensor ticks (clock.tick); drives the
+      # agent's stuck-busy watchdog sweep.
+      SB_CLOCK_TICK_S: ${SB_CLOCK_TICK_S:-60}
       SB_PORT: ${SB_PORT:-8080}
     # Loopback only — never the LAN. Ingress (tunnel, reverse proxy, whatever)
     # is the host's concern, not this stack's; point it at 127.0.0.1:8080.
