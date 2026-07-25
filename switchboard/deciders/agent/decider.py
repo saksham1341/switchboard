@@ -342,7 +342,7 @@ class AgentDecider:
                 # retried, never dead-lettered (§7.5), so the session hangs
                 # until the watchdog frees it. An invalid op is a tool error
                 # the model can read and correct, not silence.
-                rewritten = rewrite(name, args, s["sid"], self._session_ttl_s)
+                rewritten = rewrite(name, args, s["sid"])
                 if rewritten is not None:
                     to_emit.append((tid, "kv", rewritten))
                 else:

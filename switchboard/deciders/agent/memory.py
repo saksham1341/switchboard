@@ -13,9 +13,12 @@ and the joined result is re-checked to confirm it still starts with the
 namespace it was supposed to land in.
 
 - `scratchpad` is namespaced to the calling session (`session:<sid>:`) and
-  expires with it (the same TTL Task 4 gives the session record itself) --
-  working notes for one conversation, gone when it ends.
-- `memory` is namespaced globally (`global:`) and carries no TTL -- it
+  is removed when that session ends -- working notes for one conversation,
+  gone when it ends. Neither tool injects a TTL: the entry lives until the
+  decider ends the session and drains the whole prefix in one `kv`
+  `delete_prefix` command. A TTL stamped at write would run on its own clock
+  and expire a note the live conversation was still using.
+- `memory` is namespaced globally (`global:`) and is never drained -- it
   outlives any single conversation, so it is for what is worth still knowing
   weeks from now, not scratch state.
 
@@ -160,7 +163,7 @@ MEMORY_TOOLS = [
 ]
 
 
-def rewrite(tool_name: str, args: dict, sid: int, ttl: float | None) -> dict | None:
+def rewrite(tool_name: str, args: dict, sid: int) -> dict | None:
     """Model-facing tool call -> kv command args, or None.
 
     None is returned both when `tool_name` is not one of ours (so the
@@ -171,10 +174,8 @@ def rewrite(tool_name: str, args: dict, sid: int, ttl: float | None) -> dict | N
     """
     if tool_name == SCRATCHPAD:
         prefix = f"session:{sid}:"
-        item_ttl = ttl
     elif tool_name == MEMORY:
         prefix = "global:"
-        item_ttl = None
     else:
         return None
 
@@ -188,9 +189,14 @@ def rewrite(tool_name: str, args: dict, sid: int, ttl: float | None) -> dict | N
         # unscoped list would hand one session every other session's keys.
         return {"op": "list", "prefix": prefix}
 
+    # No `ttl`, on either tool. A scratchpad entry used to carry the session's
+    # TTL duration, but a kv entry is written once and nothing rewrites it, so
+    # that clock ran from the write while the session's own TTL slid forward on
+    # every turn: a note taken early in a long LIVE conversation expired
+    # underneath the conversation that was still using it. Expiry is the
+    # decider's job now — it ends a session explicitly and drains
+    # `session:<sid>:` as part of ending it (AgentDecider._end_session).
     out = {"op": op, "key": _namespaced_key(prefix, args.get("key"))}
     if op == "set":
         out["value"] = args.get("value")
-        if item_ttl is not None:
-            out["ttl"] = item_ttl
     return out
