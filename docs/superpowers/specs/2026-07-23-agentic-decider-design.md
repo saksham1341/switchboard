@@ -104,6 +104,10 @@ Everything the agent does is one of these messages. `emitted_by` is stamped by t
 | `discord.react` | actuator/discord.react | `{channel_id, message_id, emoji}` |
 | `discord.reply_to_command` | actuator/discord.reply_to_command | `{interaction_token, content}` — slash-command followup, **not** the agent's reply and not a tool |
 
+**Any message may carry its own rendered text.** A producer passes `text=` when it emits; the Bus stores it in metadata **only when supplied**. Absence is not a gap — it means "no custom view", and readers derive one through `Observation.rendered` / `Command.rendered`, which falls back to `json.dumps(payload)`. Defaulting it at write time would duplicate the payload byte-for-byte in metadata for zero information, so the log only grows for messages a producer actually rendered.
+
+The payoff is bigger than tidiness: the log now contains *what the model actually saw*. Replaying an episode no longer means re-running today's renderer against yesterday's payload and hoping the renderer has not changed.
+
 The names matter and were renamed once in flight: `discord.post` is how the agent speaks (optionally threading under a message via `reply_to_message_id`), while `discord.reply_to_command` answers a `/ping`-style interaction and carries no `tool_spec`. The original `discord.reply` name meant the latter but read as the former, which is exactly the confusion the rename removed.
 
 ---
@@ -253,9 +257,17 @@ and the system prompt tells the agent it may be mentioned mid-thread and should 
 
 This also covers the gap between expiry and the next mention, where thread messages are dropped rather than buffered: the agent fetches them back.
 
-### 6.6 Turn rendering — the source stays visible
+### 6.6 Turn rendering — the producer renders, the agent consumes
 
-**The boundary is not unique to `discord.message`.** Any text reaching the model from an untrusted source must cross the same neutralisation, and rendering is only the *first* ingress. The second is `tool_result` content: `discord.history` relays messages other people wrote, so a history entry containing a forged delimiter would otherwise land in the transcript unescaped — and read as *trusted tool output*, since the system prompt marks only delimiter-wrapped text as untrusted. `_tool_outcome` therefore escapes every tool result, not just the tools known to carry foreign text; enumerating which tools need it is how the next one gets missed. The system prompt says so explicitly as well, because escaping fixes structure and only the prompt can address provenance.
+**The producer owns the rendering, because it owns the payload shape.** The agent decider no longer renders other roles' payloads; it reads `obs.rendered`. The Discord *sensor* renders a live message, and the `discord.history` *actuator* renders a fetched one — **by calling the same function**. That is what makes a message read from history indistinguishable from one that arrived live: not two implementations kept in sync by discipline, one function.
+
+What that guarantee is, precisely: **format and escaping cannot drift**. The *field set* can — a fetched message carries only what the history API returns, so one read from inside a thread has no `thread_id`/`thread_messages` while the same message arriving live does. That is deliberate and pinned by test rather than papered over: those two fields are the *thread hint*, whose job is to prompt a `discord.history` call that has, by definition, already happened.
+
+**Escaping happens at write time, and the helper does it.** `message_text(name, fields, body)` escapes the body and sanitises the header fields for its caller, so a producer using it cannot forget. A stored `text` is then used **verbatim** by every reader; only the JSON fallback — where no producer supplied anything — is escaped by the agent, because there nobody else could have.
+
+**This moved a boundary, and the trade is worth stating.** Before, the agent escaped everything, so a producer *could not* forget. Now a producer that hand-builds a string instead of calling `message_text()` can ship an unescaped delimiter. That is the accepted hole, and it is the price of the history-consistency above — the alternative was a second rendering path in the decider, which is exactly the drift this removes. The mitigation is ergonomic rather than structural: the helper is the easy path, and it is the only path any producer currently takes.
+
+Two escaping rules survive unchanged because nobody else can apply them: a `<tool>.error` with no producer text, and the in-band result for a **hallucinated tool** (whose name is model-chosen and may echo user text), are both escaped by the agent.
 
 **The decider never normalizes an observation before the model sees it.** This is §1.1 applied: the LLM is the effective decider, and a decider sees everything. A tempting seam is to flatten every source into `{conversation_id, addressed, text}` so the decider is channel-agnostic. That is lossy in exactly the wrong place: the model chooses *tools*, and the source is what tells it `discord.post` rather than some future `slack.post`, with which id. Strip the source and the model has to guess. Source is semantic content, not transport noise.
 
@@ -265,9 +277,9 @@ So the split is: the **decider** does per-source extraction (which field is the 
 
 ```
 [discord.message] channel_id=222 message_id=111 user=alice#0001 user_id=669491511791976458
-<message>
+<untrusted>
 hey <@669491511791976458> (you) what do you think?
-</message>
+</untrusted>
 ```
 
 The ids the model needs to act are in the turn it is answering, so the system prompt carries only the pairing rule once — *act on a source using that source's tools; ids come from the message header* — instead of the whole burden. A second source is then a new renderer plus its tools, with no decider change.
@@ -277,9 +289,9 @@ Two fields earn their place by enabling an action the model otherwise cannot tak
 - **`message_id`** — what `discord.post`'s `reply_to_message_id` needs to thread a reply under the message being answered, and what `discord.react` needs to react to it.
 - **`user_id`** — a real mention is `<@user_id>`. With only the display name in the header the model can write plain text and nothing else; it was observed doing exactly that (`<@dawkrish>`, which pings nobody) before the id was surfaced.
 
-**Mentions of the bot are tagged, never stripped.** A `<@id>` or `<@&role>` referring to the bot renders as `<@id> (you)`, and an `@everyone`/`@here` as `@everyone (you are included)`. The model must know *when and where* it was addressed, but removing the mention would also stop it mentioning itself and hide the id. The tag is an informational hint, **not** a trust boundary — the trusted signal is `mentions_bot`, computed by the sensor, so a user typing "(you)" changes nothing.
+**Mentions of the bot are tagged, never stripped** (in the sensor's renderer, since it is Discord syntax). A `<@id>` or `<@&role>` referring to the bot renders as `<@id> (you)`, and an `@everyone`/`@here` as `@everyone (you are included)`. The model must know *when and where* it was addressed, but removing the mention would also stop it mentioning itself and hide the id. The tag is an informational hint, **not** a trust boundary — the trusted signal is `mentions_bot`, computed by the sensor, so a user typing "(you)" changes nothing.
 
-**The header must be unforgeable by construction.** Message content is untrusted (§12, hole 4) and a user can type `[slack.message] channel_id=…` straight into Discord. The decider writes the header; content goes inside delimiters the decider never emits. Without that separation, prompt injection gets a second and much easier route to the distribution problem hole 4 describes.
+**The header must be unforgeable by construction.** Message content is untrusted (§12, hole 4) and a user can type `[slack.message] channel_id=…` straight into Discord. The header is written by `message_text`, never by the untrusted content; the body goes inside delimiters that the helper escapes out of the content first. Without that separation, prompt injection gets a second and much easier route to the distribution problem hole 4 describes.
 
 **Mis-pairing is self-correcting, not a hole.** A `slack.post` called with a Discord id 404s, returns as `is_error`, and the model retries. §7.5 already places the security boundary at the curated tool list rather than the model's judgment, so a prompt-enforced pairing rule is adequate for correctness and weakens nothing.
 
@@ -498,6 +510,9 @@ Not agent holes — platform assumptions that only two sensors have ever exercis
 | `discord.react` (`tool_spec`) | actuator | **built** |
 | `discord.reply_to_command` — slash-command followup, no `tool_spec` | actuator | **built** (renamed from `discord.reply`) |
 | `AgentDecider` — dispatch, buffer, gather, advance, finish, hallucination check | decider | **built** |
+| `switchboard/render.py` — `message_text`, `escape_delimiters`, `sanitize_field` | framework | **built** (§6.6) |
+| message `text` contract — producer-supplied, stored only when given, `.rendered` fallback | framework | **built** (§4) |
+| `deciders/agent/render.py` | — | **removed** — escaping moved to `switchboard/render.py`, Discord specifics to the sensor |
 | `web_search` actuator | actuator | **not built** — referenced by earlier drafts of this doc; nothing depends on it |
 | session TTL, memory tools, `MAX_SPEND`, stuck-busy watchdog, `/reset`, transcript cap | — | **Phase 5** |
 
