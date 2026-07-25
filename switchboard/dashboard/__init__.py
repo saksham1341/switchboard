@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 QUEUE_MAX = 256          # tap-side buffer before the oldest frames are dropped
 CLIENT_MAX = 256         # per-browser buffer
+DEAD_MAX = 500           # matches Bus's log_max_dead: the poll this replaced
+                         # re-derived the list from message_state and was
+                         # bounded by that ceiling for free. Nothing rebuilds
+                         # it now, so the bound has to be stated here.
 POST_TIMEOUT = 2.0
 PAGE = Path(__file__).with_name("page.html")
 
@@ -144,6 +148,10 @@ class Dashboard:
         self._db = db_path
         self._clients: set[asyncio.Queue] = set()
         self._dead: list[dict] = []
+        # Membership index for _dead, trimmed with it. The list is what the
+        # browser gets (order matters); this is only so the dedupe below is not
+        # a linear scan of 500 entries per frame.
+        self._dead_seen: set[tuple] = set()
         self._dropped = 0
 
     # --- routes ----------------------------------------------------------
@@ -172,8 +180,19 @@ class Dashboard:
             if (frame["name"] == DEADLETTER and frame["dead_log"] is not None
                     and frame["dead_id"] is not None):
                 entry = {"log": frame["dead_log"], "id": frame["dead_id"]}
-                if entry not in self._dead:
+                mark = (frame["dead_log"], frame["dead_id"])
+                if mark not in self._dead_seen:
                     self._dead.append(entry)
+                    self._dead_seen.add(mark)
+                    # Bounded, oldest first. Losing pre-restart dead letters is
+                    # accepted (nothing rebuilds this list any more); an
+                    # unbounded one that is re-broadcast in full on every new
+                    # dead letter is not. The index is trimmed with the list, or
+                    # an evicted entry would be remembered as "already seen"
+                    # forever and could never reappear.
+                    while len(self._dead) > DEAD_MAX:
+                        gone = self._dead.pop(0)
+                        self._dead_seen.discard((gone["log"], gone["id"]))
                     new_dead = True
             self._broadcast({"type": "event", "frame": frame})
         if new_dead:

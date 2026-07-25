@@ -6,7 +6,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from switchboard.dashboard import Dashboard, DashboardTap, project
+from switchboard.dashboard import DEAD_MAX, Dashboard, DashboardTap, project
 from switchboard.dashboard.stats import FRAME_KEYS
 from switchboard.message import Observation, Command
 
@@ -241,6 +241,46 @@ async def test_ingest_marks_dead_from_a_deadletter_frame(tmp_path):
                           "dead_log": "cmd", "dead_id": 44, "seen_at": 0}]},
         headers={"Authorization": "Bearer t0ken"})
     assert {"log": "cmd", "id": 44} in dash._dead
+
+
+def _dead_frames(ids):
+    return [{"log": "obs", "id": 9, "name": "switchboard.deadletter",
+             "dead_log": "cmd", "dead_id": i, "seen_at": 0} for i in ids]
+
+
+def _post_dead(dash, ids):
+    app = Starlette(routes=[Route("/dashboard/ingest", dash.ingest, methods=["POST"])])
+    return TestClient(app).post("/dashboard/ingest", json={"frames": _dead_frames(ids)},
+                                headers={"Authorization": "Bearer t0ken"})
+
+
+async def test_the_dead_list_is_capped_and_drops_the_oldest(tmp_path):
+    """The poll this replaced re-derived the list from message_state every
+    time, so it was implicitly bounded by log_max_dead and self-healing. An
+    in-process list that is only ever appended to grows without limit and is
+    re-broadcast in full on every new dead letter."""
+    dash = _dash(tmp_path)
+    _post_dead(dash, range(DEAD_MAX + 5))
+    assert len(dash._dead) == DEAD_MAX
+    assert {"log": "cmd", "id": 0} not in dash._dead          # oldest dropped
+    assert {"log": "cmd", "id": DEAD_MAX + 4} in dash._dead   # newest kept
+
+
+async def test_a_repeated_dead_letter_is_not_listed_twice(tmp_path):
+    dash = _dash(tmp_path)
+    _post_dead(dash, [44, 44, 44])
+    assert dash._dead == [{"log": "cmd", "id": 44}]
+
+
+async def test_a_dead_letter_evicted_by_the_cap_can_be_listed_again(tmp_path):
+    """The dedupe index has to be trimmed with the list. If it is not, an
+    evicted entry is remembered forever as "already seen" and can never
+    reappear -- a leak of exactly the kind the cap exists to stop."""
+    dash = _dash(tmp_path)
+    _post_dead(dash, range(DEAD_MAX + 1))          # id 0 is evicted
+    _post_dead(dash, [0])
+    assert {"log": "cmd", "id": 0} in dash._dead
+    assert len(dash._dead) == DEAD_MAX
 
 
 def test_the_dashboard_no_longer_polls(tmp_path):
