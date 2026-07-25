@@ -1211,17 +1211,31 @@ async def test_a_scratchpad_set_carries_no_ttl_into_the_kv_command():
 # --- ending a session: one path, drain included ------------------------------
 #
 # The decider owns `decider/agent/`; the scratchpad lives in `actuator/kv/`. It
-# physically cannot delete those keys, so the drain goes out as a command like
-# any other side effect. These tests drive that command through a REAL
+# physically cannot delete those keys, so the drain goes out as commands like
+# any other side effect — and over the ops kv ALREADY has: a `list`, then one
+# `delete` per key that comes back. These tests drive both halves through a REAL
 # KvActuator, because "the decider emitted something plausible" is not the
 # property that matters — "the keys are gone and `global:` is not" is.
 
 def _drain_of(rec):
-    """The kv delete_prefix command a decide() emitted, or None."""
+    """The kv list command that opens a drain, or None."""
     for name, args, _ in rec.emitted:
-        if name == "kv" and args.get("op") == "delete_prefix":
+        if name == "kv" and args.get("op") == "list":
             return args
     return None
+
+
+def _drain_cid(rec):
+    for name, args, cid in rec.emitted:
+        if name == "kv" and args.get("op") == "list":
+            return cid
+    return None
+
+
+def _deletes_of(rec):
+    """The keys a drain result asked to be deleted, in order."""
+    return [args["key"] for name, args, _ in rec.emitted
+            if name == "kv" and args.get("op") == "delete"]
 
 
 async def _kv_over(store):
@@ -1253,13 +1267,40 @@ async def test_reset_drains_the_sessions_scratchpad():
     rec = await _deliver(a, _obs("discord.command.reset",
                                  {"channel_id": "222", "interaction_token": "tok"},
                                  oid=300))
-    assert _drain_of(rec) == {"op": "delete_prefix", "prefix": "session:100:"}
+    assert _drain_of(rec) == {"op": "list", "prefix": "session:100:"}
+
+
+async def test_a_drain_result_emits_one_delete_per_key():
+    a = _agent()
+    await _deliver(a, _obs("discord.message", _message()))
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    rec2 = await _deliver(a, _obs(
+        "kv.ok", {"keys": ["session:100:draft", "session:100:plan"],
+                  "truncated": False}, oid=400, command_id=_drain_cid(rec)))
+    assert _deletes_of(rec2) == ["session:100:draft", "session:100:plan"]
+
+
+async def test_a_drain_never_deletes_a_key_outside_its_own_session():
+    """A listing is an input like any other. The kv keyspace is shared —
+    `global:` memory and every other session's scratchpad live in it — so the
+    prefix is re-checked per key rather than trusted because we asked nicely."""
+    a = _agent()
+    await _deliver(a, _obs("discord.message", _message()))
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    rec2 = await _deliver(a, _obs(
+        "kv.ok", {"keys": ["global:prefs", "session:999:secret",
+                           "session:100:draft", "session:1000:x", None, 7],
+                  "truncated": False}, oid=400, command_id=_drain_cid(rec)))
+    assert _deletes_of(rec2) == ["session:100:draft"]
 
 
 async def test_a_global_memory_key_survives_a_session_drain():
-    """The prefix the decider builds is `session:<sid>:` from an int sid, so it
-    cannot reach `global:`. Asserted against a real actuator over a real store
-    rather than against the string, because the string is the easy half."""
+    """Both halves through a real actuator over a real store, because the
+    property that matters is what is left in the store, not what was emitted."""
     a = _agent()
     await _deliver(a, _obs("discord.message", _message()))
     kv_store = MemoryStore()
@@ -1271,9 +1312,84 @@ async def test_a_global_memory_key_survives_a_session_drain():
     rec = await _deliver(a, _obs("discord.command.reset",
                                  {"channel_id": "222", "interaction_token": "tok"},
                                  oid=300))
-    name, payload = await run(_drain_of(rec))
-    assert name == "kv.ok" and payload["removed"] == 1
+    name, payload = await run(_drain_of(rec))          # the list half
+    assert name == "kv.ok"
+    rec2 = await _deliver(a, _obs("kv.ok", payload, oid=400,
+                                  command_id=_drain_cid(rec)))
+    for key in _deletes_of(rec2):                      # the delete half
+        await run({"op": "delete", "key": key})
     assert sorted(await kv_store.keys("")) == ["global:prefs", "session:999:draft"]
+
+
+async def test_a_redelivered_drain_result_emits_nothing_and_does_not_raise():
+    """At-least-once: take_pending deletes on read, so the second delivery finds
+    no pending entry and the deletes go out exactly once."""
+    a = _agent()
+    await _deliver(a, _obs("discord.message", _message()))
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    result = _obs("kv.ok", {"keys": ["session:100:draft"], "truncated": False},
+                  oid=400, command_id=_drain_cid(rec))
+    assert _deletes_of(await _deliver(a, result)) == ["session:100:draft"]
+    assert (await _deliver(a, result)).emitted == []
+
+
+async def test_a_truncated_drain_does_not_paginate(caplog):
+    """No loop, no second list. Looping would be a decider driving an unbounded
+    fan-out from one observation; the remainder is a documented bounded leak."""
+    a = _agent()
+    await _deliver(a, _obs("discord.message", _message()))
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    with caplog.at_level("WARNING"):
+        rec2 = await _deliver(a, _obs(
+            "kv.ok", {"keys": ["session:100:a"], "truncated": True},
+            oid=400, command_id=_drain_cid(rec)))
+    assert _drain_of(rec2) is None                  # no follow-up list
+    assert _deletes_of(rec2) == ["session:100:a"]
+    assert caplog.records == []                     # debug, not warning
+
+
+async def test_a_drain_of_a_session_with_no_keys_emits_nothing():
+    a = _agent()
+    await _deliver(a, _obs("discord.message", _message()))
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    rec2 = await _deliver(a, _obs("kv.ok", {"keys": [], "truncated": False},
+                                  oid=400, command_id=_drain_cid(rec)))
+    assert rec2.emitted == []
+
+
+async def test_a_failed_drain_listing_is_logged_once_not_per_key(caplog):
+    a = _agent()
+    await _deliver(a, _obs("discord.message", _message()))
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    with caplog.at_level("WARNING"):
+        rec2 = await _deliver(a, _obs("kv.error", {"message": "boom"}, oid=400,
+                                      command_id=_drain_cid(rec)))
+    assert rec2.emitted == []
+    assert len(caplog.records) == 1
+
+
+async def test_a_drain_result_never_reaches_the_turn_machinery():
+    """A drain pending entry is routed before the session load. Falling into the
+    turn path would look up a session that was deleted on purpose and warn about
+    an absence that is the expected outcome."""
+    a = _agent()
+    cid = await _mint(a)
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    rec2 = await _deliver(a, _obs("kv.ok", {"keys": ["session:100:a"],
+                                            "truncated": False},
+                                  oid=400, command_id=_drain_cid(rec)))
+    assert [n for n, _, _ in rec2.emitted] == ["kv"]      # no llm, no turn
+    assert await a._sessions.load(100) is None            # not resurrected
 
 
 async def test_reset_drops_the_pending_entries_of_the_session_it_ends():
@@ -1337,7 +1453,7 @@ async def test_a_session_idle_past_the_limit_is_ended_on_tick(monkeypatch):
     await _deliver(a, _obs("llm.ok", {"stop_reason": "end_turn", "content": []},
                            oid=200, command_id=cid))          # idle at 1000
     rec = await _deliver(a, _tick(at=1101.0))                 # 101s idle
-    assert _drain_of(rec) == {"op": "delete_prefix", "prefix": "session:100:"}
+    assert _drain_of(rec) == {"op": "list", "prefix": "session:100:"}
     assert await a._sessions.load(100) is None
     assert await a._sessions.route("discord", "222") is None
 

@@ -163,7 +163,18 @@ class AgentDecider:
             return
         p = await self._sessions.take_pending(obs.command_id)
         if p is None:
-            return                      # not ours, or already handled
+            # Not ours, already handled, or the ordinary tail of a drain: every
+            # `delete` a drain emits produces a kv.ok nobody is waiting on.
+            # Quiet, and no log — otherwise a drained session would print a line
+            # per key it cleaned up.
+            return
+        if p["kind"] == "drain":
+            # Routed before the load, deliberately: the session was deleted the
+            # moment the drain was emitted, so loading it would find nothing and
+            # warn about a session whose absence is the expected outcome. A
+            # redelivered result finds no pending entry (take_pending deletes on
+            # read) and returns above, so the deletes go out exactly once.
+            return await self._on_drain(p, obs, ctx)
         s = await self._sessions.load(p["sid"])
         if s is None:
             logger.warning("result for a session that no longer exists: %s", p["sid"])
@@ -227,28 +238,78 @@ class AgentDecider:
         ask the actuator that owns them, on the cmd log, where the removal is
         visible like every other effect.
 
-        Emitted BEFORE the record is deleted, deliberately. The store has no
-        transactions, so a crash between the two is possible whichever order we
-        pick, and this is the order that fails safe: a crash after the command
-        leaves a session record that is drained but still routable, and the next
-        tick expires it again — a duplicate `delete_prefix` is a no-op that
-        reports removed=0. Deleting first and crashing would strand the keys
-        with no sid left to name them, which is the exact failure this method
-        exists to remove.
+        It is a two-step exchange over the ops `kv` ALREADY has — `list`, then
+        one `delete` per key — rather than a new bulk-delete op, and that is a
+        deliberate reversal. A `delete_prefix` primitive needed four separate
+        guards to be safe (reject an empty prefix, cap the blast radius, keep it
+        out of the model-facing schema, keep `rewrite()` from ever producing
+        it), and not one of them is a real boundary: the cmd log carries no
+        caller identity, so ANY decider could emit it against ANY prefix. That
+        is a habit, not an enforced privilege split. Two steps over existing ops
+        removes the possibility instead of fencing it — the widest thing anyone
+        can do with `delete` is delete one key they named.
+
+        Two steps is the idiom this decider is built on anyway: nothing awaits,
+        so the list result re-enters `decide()` like any other observation.
+
+        The session record and route go NOW, not when the drain completes. The
+        drain is fire-and-forget cleanup, not a precondition — making the
+        ending conditional on it would keep a dead session routable for as long
+        as the kv leg took, and a message arriving in that window would resume
+        a conversation that had already ended.
         """
-        # Built here from the int sid, never from anything the model supplied,
-        # so it cannot be made to name another session or reach `global:`. The
-        # actuator re-checks it anyway (an empty prefix would drain the store).
-        await ctx.command("kv", {"op": "delete_prefix",
-                                 "prefix": f"session:{s['sid']}:"})
-        # A /reset lands on a busy session more often than not — that is usually
-        # why someone types it. Its in-flight commands will still come back, and
-        # a pending entry pointing at a session that no longer loads is a
-        # warning logged per orphan for an ending the user asked for. Dropped
-        # here so the late result is genuinely silent (decide() finds no pending
-        # entry and returns), the same reason the watchdog clears them.
-        await self._sessions.clear_pending(s["sid"])
+        sid = s["sid"]
+        # Cleared BEFORE the drain entry is recorded, or clear_pending would
+        # sweep away the entry we are about to write — it drops every pending
+        # entry carrying this sid, and the drain carries it too.
+        #
+        # A /reset lands on a busy session more often than not; that is usually
+        # why someone types it. Its in-flight commands still come back, and a
+        # pending entry pointing at a session that no longer loads is a warning
+        # logged per orphan for an ending the user asked for.
+        await self._sessions.clear_pending(sid)
+        # The prefix is built here from the int sid, never from anything the
+        # model supplied, so it cannot be made to name another session or reach
+        # `global:` — and `_on_drain` re-checks every key that comes back.
+        cid = await ctx.command("kv", {"op": "list", "prefix": f"session:{sid}:"})
+        await self._sessions.put_pending(cid, {"kind": "drain", "sid": sid})
         await self._sessions.delete(s)
+
+    async def _on_drain(self, p, obs, ctx) -> None:
+        """The `list` half of a drain came back: delete what it found.
+
+        Reached only via a `drain` pending entry, which `decide()` routes before
+        it tries to load a session — by design there is no session left to load.
+
+        Known, bounded leak, stated rather than covered: if the process dies
+        between this list and its deletes, those scratchpad keys are orphaned.
+        The session record is already gone, so no later pass finds them and no
+        GC pass exists to. Same class as a process down past the backstop TTL.
+        """
+        if obs.name.endswith(".error"):
+            # One line for the whole drain, not one per key: a failed drain
+            # leaks a bounded number of keys and costs nothing else.
+            logger.warning("drain listing failed for session %s", p["sid"])
+            return
+        payload = obs.payload if isinstance(obs.payload, dict) else {}
+        keys = payload.get("keys")
+        if not isinstance(keys, list):
+            return
+        if payload.get("truncated"):
+            # Debug, and deliberately no pagination. Looping would mean a
+            # decider driving an unbounded command fan-out from one observation;
+            # the remainder is the same bounded leak documented above.
+            logger.debug("drain of session %s hit the list cap; "
+                         "the remainder is left behind", p["sid"])
+        prefix = f"session:{p['sid']}:"
+        for k in keys:
+            # The actuator's own keyspace is shared — `global:` memory lives in
+            # it, and so does every other session's scratchpad. A listing is an
+            # input like any other, so the prefix is re-checked per key rather
+            # than trusted because we asked nicely.
+            if not isinstance(k, str) or not k.startswith(prefix):
+                continue
+            await ctx.command("kv", {"op": "delete", "key": k})
 
     async def _on_message(self, obs, ctx) -> None:
         payload = obs.payload if isinstance(obs.payload, dict) else {}
