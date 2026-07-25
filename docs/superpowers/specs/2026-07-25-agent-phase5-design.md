@@ -77,13 +77,13 @@ A watchdog that fires while a message is legitimately retrying **kills live work
 
 | path | worst case to DEAD |
 |---|---|
-| jittered backoff — 13.5 min delay + 11 × 30s handler time | **19.0 min** |
-| explicit `retry_after` — 10 × 120s + handler time | **25.5 min** |
+| jittered backoff — 13.5 min delay + 11 × 100s handler time | **31.9 min** |
+| explicit `retry_after` — 10 × 120s + handler time | **38.3 min** |
 
 Two things people get wrong here, both observed while designing this:
 
 - **The backoff is jittered, not deterministic.** `backoff()` draws uniformly from `[ceiling/2, ceiling]`, so the delay total ranges 6.8–13.5 min. Sampling it once and treating the result as the value is a mistake.
-- **Handler time is a term.** `_consume` caps each attempt at `SB_HANDLER_TIMEOUT_S`, and there are `max_retries + 1` of them — 5.5 minutes of pure execution before any waiting.
+- **Handler time is a term, and it is multiplied by 11.** `_consume` caps each attempt at `SB_HANDLER_TIMEOUT_S`, and there are `max_retries + 1` of them — **18.3 minutes** of pure execution budget before any waiting. This makes the handler timeout the most leveraged knob in the system: raising it by 80s moved the watchdog by 15 minutes.
 
 So the Bus exposes the calculation:
 
@@ -101,7 +101,11 @@ def worst_case_retry_seconds(self) -> float:
     return max(jittered, explicit) + (self._message_max_retries + 1) * self._handler_timeout_s
 ```
 
-`app.py` wires `AgentDecider(stuck_after=bus.worst_case_retry_seconds * 1.2)` — ~1800s with today's defaults.
+`app.py` wires `AgentDecider(stuck_after=bus.worst_case_retry_seconds * 1.2)` — **~2760s (46 min)** with the values in §4.2.
+
+That is the accepted cost of letting slow work finish: a genuinely stuck session hangs ~46 minutes before the watchdog frees it. The trade is right because the watchdog exists for the *no-signal* case (§7.5's unconsumed command), which is rare, while cancelling live work would be routine.
+
+**This is the derivation earning its keep.** §4.3 raises `SB_HANDLER_TIMEOUT_S` from 30s to 100s, which moves the worst case from 25.5 to 38.3 minutes. Under a hand-picked constant the watchdog would have silently stayed at 30 minutes and begun cutting off legitimate work; derived, it follows automatically.
 
 **A registry was considered and rejected.** The idea was that components register their backoff policies and something reports the maximum. It cannot be complete — nothing forces registration — so it would report "the max someone remembered to tell me" while *looking* authoritative. False confidence in a safety number is worse than an honest constant. It is also unnecessary: `_consume` is the only retry site in the system, so the set of retry policies is closed at two.
 
@@ -124,7 +128,7 @@ Every knob moves to env, and every name is rewritten to state its job. Conventio
 | now | env | what it does |
 |---|---|---|
 | `max_retries` | `SB_MESSAGE_MAX_RETRIES` | redeliveries before mamamia marks a message DEAD |
-| `default_timeout_s` | `SB_HANDLER_TIMEOUT_S` | per-attempt cap on `handle()`; the lease is derived at 2× |
+| `default_timeout_s` | `SB_HANDLER_TIMEOUT_S` | **100** (was 30) — per-attempt cap on `handle()`; the lease is derived at 2× |
 | `backoff(cap=)` | `SB_RETRY_BACKOFF_MAX_S` | ceiling on one *computed* backoff delay |
 | `_RETRY_CAP` | `SB_RETRY_AFTER_MAX_S` | ceiling on a delay a *handler asks for* |
 | `wait_ms` | `SB_CONSUMER_WAIT_MS` | long-poll park before the acquire loop spins |
@@ -137,7 +141,20 @@ Every knob moves to env, and every name is rewritten to state its job. Conventio
 
 `default_timeout_s` → `SB_HANDLER_TIMEOUT_S` is the largest win: "default timeout" for *what* was unanswerable without reading `_consume`.
 
-**Known live consequence, unchanged by this phase:** `SB_HANDLER_TIMEOUT_S` (30s) fires before the llm backend's own `TIMEOUT = 120.0`, so an LLM call slower than 30s is cancelled by the consume loop, not by httpx. The 120 is effectively dead. Renaming makes this visible; deciding what it *should* be is out of scope here.
+### 4.3 Fixing the inverted timeouts
+
+Today `SB_HANDLER_TIMEOUT_S` is **30s** while the llm backend's own `TIMEOUT` is **120s**. The outer, generic cap fires first, so the consume loop cancels an LLM call before httpx can report anything — the specific error is never produced and the 120 is dead code.
+
+The rule is **inner timeout fires first, outer is the backstop**: a handler's own timeout should produce a meaningful error, and the generic cap should only catch a handler wedged in a way its own timeout missed.
+
+| | now | after |
+|---|---|---|
+| `SB_HANDLER_TIMEOUT_S` | 30 | **100** |
+| llm backend `TIMEOUT` | 120 | **60** |
+
+**Why 60s for the llm rather than keeping 120.** The actuator makes one HTTP call and returns a completion — it runs no tools itself. With `max_tokens` capped at 1024 generation is bounded, so only provider queueing varies. Beyond that, **a short timeout with retries beats a long one**: at 60s a request is far more likely dead than slow, and retrying gets a fresh connection, where waiting 120s mostly buys a longer hang before the same failure.
+
+**Why 100s and not 180s.** The handler timeout is the most leveraged knob in the system — it appears as `(max_retries + 1) ×` in the worst case, so it is multiplied by 11, and the lease derives at 2×. The alternative of 180s/120s costs 33 minutes of handler budget (vs 18.3), pushes the watchdog to **64 min** (vs 46), and doubles the orphan window if a consumer crashes mid-work to 360s (vs 200).
 
 **`pydantic-settings` is deliberately deferred.** Config roughly doubles in this phase, which is the moment the ad-hoc `os.environ.get` pattern starts to hurt — but adopting it now would inflate Phase 5 with a refactor of every existing variable, orthogonal to the agent work. Deferring is safe **because the names are the durable part**: adopting pydantic later is mechanical if the keys are right, and churning bad names twice is the cost of getting this wrong. The cost of waiting: no validation, so a valid-but-nonsense value like `SB_SESSION_TTL_S=0` (expire instantly) passes silently. Typos crash at `int()`, which is acceptable.
 
