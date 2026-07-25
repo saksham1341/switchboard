@@ -4,6 +4,7 @@ Only the two world-facing edges are faked (the Anthropic HTTP call and the
 Discord HTTP call). Everything between them is the real substrate.
 """
 import asyncio
+import json
 
 import pytest
 
@@ -90,5 +91,37 @@ async def test_a_mention_produces_a_reply_through_the_real_bus(tmp_path):
         last = llm.calls[-1]["messages"][-1]
         assert last["role"] == "user"
         assert last["content"][0]["tool_use_id"] == "toolu_A"
+    finally:
+        await bus.stop()
+
+
+async def test_a_producers_rendered_text_reaches_the_model(tmp_path):
+    llm, post = _FakeLlm(), _FakePost()
+    bus = Bus(str(tmp_path / "mm.db"), store=MemoryStore(),
+              wait_ms=50, reaper_interval=3600.0)
+    bus.add_decider(AgentDecider(tools=[TOOL], model="test-model"))
+    bus.add_actuator(llm)
+    bus.add_actuator(post)
+    await bus.start()
+    try:
+        await bus.emit_observation(
+            "discord.message",
+            {"message_id": "1", "channel_id": "222", "thread_id": "222",
+             "user_id": "669", "user_name": "alice", "content": "hi",
+             "mentions_bot": True,
+             "thread": {"is_thread": True, "message_count": 1}},
+            emitted_by="sensor/discord",
+            text="[discord.message] channel_id=222 user_id=669\n"
+                 "<untrusted>\nhi\n</untrusted>")
+
+        for _ in range(100):
+            if llm.calls:
+                break
+            await asyncio.sleep(0.05)
+
+        assert llm.calls, "the agent never called the model"
+        sent = json.dumps(llm.calls[0]["messages"])
+        assert "<untrusted>" in sent          # the producer's rendering, verbatim
+        assert '"channel_id": "222"' not in sent   # not the raw payload JSON
     finally:
         await bus.stop()

@@ -23,5 +23,8 @@ class LoggerTap:
             line["command_id"] = cid
         if oid is not None:
             line["observation_id"] = oid
+        text = getattr(view, "text", None)
+        if text is not None:
+            line["text"] = text
         self._stream.write(json.dumps(line) + "\n")
         self._stream.flush()

@@ -193,3 +193,20 @@ async def test_ingest_strips_unexpected_keys_before_broadcast(tmp_path):
     frame = (await asyncio.wait_for(seen.get(), 1))["frame"]
     assert set(frame) == set(FRAME_KEYS)          # no "evil" key survives
     assert "evil" not in frame
+
+
+def test_the_projection_never_carries_the_rendered_text():
+    """SECURITY. The dashboard page is public and unauthenticated, which is
+    only acceptable because the projection is structure-only. `text` is message
+    content — names, ids and causal links may cross; content may not."""
+    from switchboard.dashboard.stats import FRAME_KEYS
+    assert "text" not in FRAME_KEYS
+
+    class M:
+        id = 7
+    m = M()
+    m.payload = {"secret": "SHOULD NOT APPEAR"}
+    m.metadata = {"name": "discord.message", "emitted_by": "sensor/discord",
+                  "text": "[discord.message] SHOULD NOT APPEAR EITHER"}
+    frame = project("obs", Observation.from_message(m))
+    assert "SHOULD NOT APPEAR" not in repr(frame)
