@@ -23,6 +23,9 @@ def _obs(name, payload, *, oid=100, command_id=None, text=None):
 def _agent(**kw):
     kw.setdefault("model", "test-model")
     kw.setdefault("stuck_after", 1800.0)
+    # None keeps sessions non-expiring, so existing tests assert what they
+    # already assert -- see Sessions.__init__ in switchboard/deciders/agent/session.py.
+    kw.setdefault("session_ttl_s", None)
     a = AgentDecider(tools=[TOOL], **kw)
     a.bind(DeciderCtx(store=MemoryStore()))
     return a
@@ -873,3 +876,29 @@ async def test_a_tick_with_no_sessions_is_harmless():
     a = _agent(stuck_after=100.0)
     rec = await _deliver(a, _tick())
     assert rec.emitted == []
+
+
+# --- /reset (Task 4) ----------------------------------------------------
+
+async def test_reset_clears_the_session_for_its_channel():
+    a = _agent()
+    await _deliver(a, _obs("discord.message", _message()))
+    assert await a._sessions.load(100) is not None
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "222", "interaction_token": "tok"},
+                                 oid=300))
+    assert await a._sessions.load(100) is None
+    assert await a._sessions.route("discord", "222") is None
+    assert [n for n, _, _ in rec.emitted] == ["discord.reply_to_command"]
+
+
+async def test_reset_on_a_channel_with_no_session_still_acknowledges():
+    a = _agent()
+    rec = await _deliver(a, _obs("discord.command.reset",
+                                 {"channel_id": "999", "interaction_token": "tok"},
+                                 oid=300))
+    assert [n for n, _, _ in rec.emitted] == ["discord.reply_to_command"]
+
+
+def test_subscribes_to_reset():
+    assert _agent().subscribes(_obs("discord.command.reset", {}))

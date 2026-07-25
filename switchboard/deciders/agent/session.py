@@ -8,8 +8,12 @@ import json
 
 
 class Sessions:
-    def __init__(self, store):
+    def __init__(self, store, *, ttl: float | None = None):
         self._store = store
+        # None keeps a session immortal (existing tests, and any caller that
+        # does not opt in to expiry). §6.4 requires the record and its route
+        # to expire together — see save()/delete() below.
+        self._ttl = ttl
 
     # --- the session record ---------------------------------------------
 
@@ -17,8 +21,17 @@ class Sessions:
         raw = await self._store.get(f"session:{sid}")
         return json.loads(raw) if raw is not None else None
 
+    def _route_key(self, s: dict) -> str:
+        return f"thread:{s['source']}:{s.get('thread_id') or s['channel_id']}"
+
     async def save(self, s: dict) -> None:
-        await self._store.set(f"session:{s['sid']}", json.dumps(s))
+        await self._store.set(f"session:{s['sid']}", json.dumps(s), ttl=self._ttl)
+        # The route must slide with the session. It is written once at mint
+        # (set_route, below) but the session is rewritten every turn, so
+        # refreshing only the session record would let the route expire out
+        # from under a live conversation — the trap this task exists to avoid.
+        # §6.4: tracking and conversation expire together.
+        await self._store.set(self._route_key(s), str(s["sid"]), ttl=self._ttl)
 
     async def new(self, *, sid, source, channel_id, thread_id, anchor) -> dict:
         s = {"sid": sid, "source": source, "channel_id": channel_id,
@@ -27,6 +40,14 @@ class Sessions:
              "messages": [], "buffer": [], "gather": None}
         await self.save(s)
         return s
+
+    async def delete(self, s: dict) -> None:
+        """Remove both the record and its route. Leaving the route behind
+        after a delete means the next message resolves to a session id that
+        no longer loads -- the decider handles that (it returns early), but
+        it is a leak and a confusing state."""
+        await self._store.delete(f"session:{s['sid']}")
+        await self._store.delete(self._route_key(s))
 
     # --- the route map ---------------------------------------------------
 
@@ -38,7 +59,10 @@ class Sessions:
         return int(raw) if raw is not None else None
 
     async def set_route(self, source: str, key: str, sid: int) -> None:
-        await self._store.set(f"thread:{source}:{key}", str(sid))
+        # Ttl'd from mint: without it, a freshly minted session's route starts
+        # life immortal while the record expires (the mirror trap of the one
+        # above, at the other end of the session's life).
+        await self._store.set(f"thread:{source}:{key}", str(sid), ttl=self._ttl)
 
     # --- the pending map -------------------------------------------------
 

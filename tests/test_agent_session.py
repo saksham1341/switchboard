@@ -68,3 +68,42 @@ async def test_pending_is_read_and_deleted_in_one_go():
 
 async def test_take_pending_of_an_unknown_command_is_none():
     assert await _sessions().take_pending(999) is None
+
+
+class _TtlStore:
+    """Records the ttl every key was last written with."""
+    def __init__(self):
+        self._v = {}
+        self.ttls = {}
+    async def get(self, key): return self._v.get(key)
+    async def set(self, key, value, *, ttl=None):
+        self._v[key] = value; self.ttls[key] = ttl
+    async def delete(self, key): self._v.pop(key, None); self.ttls.pop(key, None)
+    async def keys(self, prefix=""):
+        return [k for k in self._v if k.startswith(prefix)]
+
+
+async def test_save_refreshes_the_ttl_on_both_the_session_and_its_route():
+    """The route is written once at mint but the session every turn. Without
+    refreshing both, an ACTIVE conversation loses its route after one TTL and
+    the next message cannot find the session."""
+    store = _TtlStore()
+    sess = Sessions(store, ttl=3600.0)
+    s = await sess.new(sid=100, source="discord", channel_id="222",
+                       thread_id="222", anchor="1")
+    await sess.set_route("discord", "222", 100)
+    store.ttls.clear()
+    await sess.save(s)
+    assert store.ttls["session:100"] == 3600.0
+    assert store.ttls["thread:discord:222"] == 3600.0
+
+
+async def test_delete_removes_both_keys():
+    store = _TtlStore()
+    sess = Sessions(store, ttl=3600.0)
+    s = await sess.new(sid=100, source="discord", channel_id="222",
+                       thread_id="222", anchor="1")
+    await sess.set_route("discord", "222", 100)
+    await sess.delete(s)
+    assert await sess.load(100) is None
+    assert await sess.route("discord", "222") is None

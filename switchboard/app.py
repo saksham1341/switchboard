@@ -24,6 +24,7 @@ DISCORD_COMMANDS = [
     CommandSpec("ping", "Ping Switchboard"),
     CommandSpec("echo", "Echo a message back",
                 options=(Option("message", "Text to echo back", type=str, required=True),)),
+    CommandSpec("reset", "Clear this channel's conversation"),
 ]
 
 
@@ -144,6 +145,7 @@ def build(config: dict):
                 # derivation exists to prevent. The 1.2x margin keeps the
                 # watchdog from firing on the last legitimate retry.
                 stuck_after=bus.worst_case_retry_seconds * 1.2,
+                session_ttl_s=config.get("session_ttl_s", 14400.0),
                 tools=[agent_post.tool_spec | {"name": agent_post.name},
                        history.tool_spec | {"name": history.name},
                        react.tool_spec | {"name": react.name}]))
@@ -191,6 +193,7 @@ async def run() -> None:
         "log_max_messages": int(os.environ.get("SB_LOG_MAX_MESSAGES", "100000")),
         "log_max_dead": int(os.environ.get("SB_LOG_MAX_DEAD", "500")),
         "clock_tick_s": float(os.environ.get("SB_CLOCK_TICK_S", "60")),
+        "session_ttl_s": float(os.environ.get("SB_SESSION_TTL_S", "14400")),
         "discord_bot_token": os.environ.get("DISCORD_BOT_TOKEN"),
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),

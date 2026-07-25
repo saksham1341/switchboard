@@ -67,7 +67,7 @@ class AgentDecider:
     name = "agent"
 
     def __init__(self, *, tools, model, stuck_after: float, system: str | None = None,
-                 max_tokens: int = AGENT_MAX_TOKENS):
+                 max_tokens: int = AGENT_MAX_TOKENS, session_ttl_s: float | None = None):
         self._tools = list(tools)
         self._system = system if system is not None else SYSTEM
         self._model = model
@@ -77,16 +77,20 @@ class AgentDecider:
         # a default here would be the decider guessing its own threshold --
         # precisely the failure the derivation in app.py exists to prevent.
         self._stuck_after = stuck_after
+        # Forwarded to Sessions in bind(). None keeps sessions non-expiring
+        # (the test default); production passes SB_SESSION_TTL_S via app.py.
+        self._session_ttl_s = session_ttl_s
 
     def bind(self, ctx) -> None:
         self.ctx = ctx
-        self._sessions = Sessions(ctx.store)
+        self._sessions = Sessions(ctx.store, ttl=self._session_ttl_s)
 
     def subscribes(self, obs) -> bool:
         # Coarse and synchronous — it cannot reach the store, so it cannot know
         # whether a command_id is ours. decide() makes that call by finding (or
         # not finding) a pending entry.
         return (obs.name == "discord.message"
+                or obs.name == "discord.command.reset"
                 or obs.name == "switchboard.deadletter"
                 or obs.name == "clock.tick"
                 or obs.command_id is not None)
@@ -96,6 +100,9 @@ class AgentDecider:
     async def decide(self, obs, ctx) -> None:
         if obs.name == "discord.message":
             return await self._on_message(obs, ctx)
+
+        if obs.name == "discord.command.reset":
+            return await self._on_reset(obs, ctx)
 
         if obs.name == "clock.tick":
             return await self._sweep_stuck(obs, ctx)
@@ -146,6 +153,28 @@ class AgentDecider:
         await self._on_gather(s, p, content, is_error, ctx)
 
     # --- input -----------------------------------------------------------
+
+    async def _on_reset(self, obs, ctx) -> None:
+        """The `/reset` slash command. Handled here, not by a standalone
+        discord_cmds decider, because session state lives entirely in this
+        decider's store scope -- nothing else can reach it to clear it.
+
+        Always acknowledges, even when the channel has no session: a slash
+        command that silently does nothing looks broken, and "nothing to
+        clear" is still an answer.
+        """
+        payload = obs.payload if isinstance(obs.payload, dict) else {}
+        channel_id = payload.get("channel_id")
+        if channel_id is not None:
+            sid = await self._sessions.route("discord", str(channel_id))
+            if sid is not None:
+                s = await self._sessions.load(sid)
+                if s is not None:
+                    await self._sessions.delete(s)
+        await ctx.command("discord.reply_to_command", {
+            "interaction_token": payload.get("interaction_token"),
+            "content": "Conversation cleared.",
+        })
 
     async def _on_message(self, obs, ctx) -> None:
         payload = obs.payload if isinstance(obs.payload, dict) else {}
