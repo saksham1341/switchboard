@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import discord
 from discord import app_commands
 
-from switchboard.render import message_text, escape_delimiters
+from switchboard.render import message_text
 
 logger = logging.getLogger(__name__)
 
