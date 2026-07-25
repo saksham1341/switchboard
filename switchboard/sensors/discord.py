@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import discord
 from discord import app_commands
 
+from switchboard.render import message_text, escape_delimiters
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +71,44 @@ def _message_observation(message, bot_id: int, bot_role_ids=()) -> tuple[str, di
         "thread": {"is_thread": is_thread,
                    "message_count": getattr(channel, "message_count", None) if is_thread else None},
     })
+
+
+def _tag_bot_mentions(content: str, payload: dict) -> str:
+    """Annotate — never remove — a mention of the bot. The model must know when
+    and where it was addressed, but the raw <@id> stays so it can still mention
+    itself and learn the id. The tag is a hint, not a trust boundary: the
+    trusted signal is `mentions_bot` from the sensor."""
+    for mid in payload.get("bot_mention_ids") or []:
+        content = content.replace(f"<@{mid}>", f"<@{mid}> (you)")
+        content = content.replace(f"<@&{mid}>", f"<@&{mid}> (you)")
+    if payload.get("mention_everyone"):
+        content = content.replace("@everyone", "@everyone (you are included)")
+        content = content.replace("@here", "@here (you are included)")
+    return content
+
+
+def render_message(payload: dict) -> str:
+    """A discord.message payload as text. The sensor owns this
+    because it owns the payload shape — and DiscordHistory calls the same
+    function, which is what makes history and live identical by construction."""
+    payload = payload if isinstance(payload, dict) else {}
+    thread = payload.get("thread")
+    thread = thread if isinstance(thread, dict) else {}
+
+    fields = {"channel_id": payload.get("channel_id"),
+              "message_id": payload.get("message_id"),
+              "user": payload.get("user_name"),
+              "user_id": payload.get("user_id")}
+    if payload.get("thread_id"):
+        fields["thread_id"] = payload.get("thread_id")
+        count = thread.get("message_count")
+        if isinstance(count, int):
+            fields["thread_messages"] = count
+
+    body = _tag_bot_mentions(
+        payload.get("content") if isinstance(payload.get("content"), str) else "",
+        payload)
+    return message_text("discord.message", fields, body)
 
 
 @dataclass(frozen=True)
@@ -217,7 +257,7 @@ class DiscordSensor:
         # Emit first, record second: a crash (or a failed emit) in between costs
         # a duplicate, the reverse order costs the event.
         try:
-            await self.ctx.emit(name, payload)
+            await self.ctx.emit(name, payload, text=render_message(payload))
         except Exception:
             # Nothing upstream can retry a gateway event: discord.py's dispatcher
             # would otherwise swallow this into its default on_error (a bare

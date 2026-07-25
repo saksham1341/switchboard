@@ -191,7 +191,7 @@ async def test_on_message_wakes_on_a_role_ping():
     # agent actually advances.
     emitted = []
     s = _sensor()
-    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    s.ctx = _ctx_with_store(lambda n, p, text=None: emitted.append((n, p)) or _done())
     msg = _FakeMessage(guild=_FakeGuild(bot_role_ids=[777]),
                        role_mentions=[_FakeRole(777)], content="<@&777> yo")
     await s._on_message(msg, bot_id=555)
@@ -205,7 +205,7 @@ async def test_on_message_does_not_match_the_default_role_in_the_role_list():
     # not through the role list.)
     emitted = []
     s = _sensor()
-    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    s.ctx = _ctx_with_store(lambda n, p, text=None: emitted.append((n, p)) or _done())
     g = _FakeGuild(gid=9, bot_role_ids=[])          # bot has only @everyone
     msg = _FakeMessage(guild=g, role_mentions=[_FakeRole(9, default=True)],
                        content="<@&9> hey all")
@@ -226,7 +226,7 @@ def test_message_observation_wakes_on_an_everyone_or_here_broadcast():
 async def test_on_message_emits_for_a_human():
     emitted = []
     s = _sensor()
-    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    s.ctx = _ctx_with_store(lambda n, p, text=None: emitted.append((n, p)) or _done())
     await s._on_message(_FakeMessage(), bot_id=555)
     assert emitted and emitted[0][0] == "discord.message"
 
@@ -234,7 +234,7 @@ async def test_on_message_emits_for_a_human():
 async def test_on_message_ignores_bots_including_itself():
     emitted = []
     s = _sensor()
-    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    s.ctx = _ctx_with_store(lambda n, p, text=None: emitted.append((n, p)) or _done())
     await s._on_message(_FakeMessage(author=_FakeAuthor(uid=555, bot=True)), bot_id=555)
     await s._on_message(_FakeMessage(author=_FakeAuthor(uid=777, bot=True)), bot_id=555)
     assert emitted == []
@@ -245,7 +245,7 @@ async def test_on_message_dedupes_a_replayed_message_id():
     # become a second observation.
     emitted = []
     s = _sensor()
-    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    s.ctx = _ctx_with_store(lambda n, p, text=None: emitted.append((n, p)) or _done())
     msg = _FakeMessage(mid=42)
     await s._on_message(msg, bot_id=555)
     await s._on_message(msg, bot_id=555)          # replay: same message id
@@ -255,7 +255,7 @@ async def test_on_message_dedupes_a_replayed_message_id():
 async def test_on_message_still_emits_a_different_message_id():
     emitted = []
     s = _sensor()
-    s.ctx = _ctx_with_store(lambda n, p: emitted.append((n, p)) or _done())
+    s.ctx = _ctx_with_store(lambda n, p, text=None: emitted.append((n, p)) or _done())
     await s._on_message(_FakeMessage(mid=1), bot_id=555)
     await s._on_message(_FakeMessage(mid=2), bot_id=555)
     assert len(emitted) == 2
@@ -266,7 +266,7 @@ async def test_on_message_does_not_mark_seen_when_emit_raises():
     # not write the seen-key, so a redelivered copy gets another chance.
     calls = {"n": 0}
 
-    async def flaky_emit(n, p):
+    async def flaky_emit(n, p, text=None):
         calls["n"] += 1
         raise RuntimeError("boom")
 
@@ -280,7 +280,7 @@ async def test_on_message_does_not_mark_seen_when_emit_raises():
 
 
 async def test_on_message_emit_failure_is_logged_at_error_level(caplog):
-    async def flaky_emit(n, p):
+    async def flaky_emit(n, p, text=None):
         raise RuntimeError("boom")
 
     s = _sensor()
@@ -320,3 +320,40 @@ def test_message_observation_records_everyone_for_tagging():
         _FakeMessage(mention_everyone=True), bot_id=555)
     assert payload["mention_everyone"] is True
     assert payload["bot_mention_ids"] == []
+
+
+def test_render_message_produces_an_message_text():
+    from switchboard.sensors.discord import render_message
+    out = render_message({
+        "message_id": "111", "channel_id": "222", "thread_id": None,
+        "user_id": "669", "user_name": "alice", "content": "hey",
+        "thread": {"is_thread": False, "message_count": None}})
+    head = out.splitlines()[0]
+    assert head.startswith("[discord.message]")
+    assert "channel_id=222" in head and "message_id=111" in head
+    assert "user_id=669" in head
+    assert "<untrusted>" in out and "hey" in out
+
+
+def test_render_message_tags_the_bot_mention_without_stripping_it():
+    from switchboard.sensors.discord import render_message
+    out = render_message({"channel_id": "222", "content": "yo <@555> hi",
+                          "bot_mention_ids": ["555"]})
+    assert "<@555> (you)" in out
+
+
+def test_render_message_degrades_on_a_junk_payload():
+    from switchboard.sensors.discord import render_message
+    assert isinstance(render_message({}), str)
+
+
+async def test_on_message_emits_with_a_rendered_text():
+    emitted = []
+    s = _sensor()
+    async def emit(name, payload, text=None):
+        emitted.append((name, payload, text)); return 1
+    s.ctx = type("C", (), {"emit": staticmethod(emit), "store": MemoryStore()})()
+    await s._on_message(_FakeMessage(content="hello"), bot_id=555)
+    assert emitted
+    text = emitted[0][2]
+    assert text is not None and text.startswith("[discord.message]")

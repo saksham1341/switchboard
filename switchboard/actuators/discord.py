@@ -1,5 +1,7 @@
 import httpx
 
+from switchboard.sensors.discord import render_message
+
 DISCORD_API = "https://discord.com/api/v10"
 
 
@@ -406,14 +408,25 @@ class DiscordHistory:
             messages.append({
                 "id": str(entry.get("id")),
                 "user": author.get("username"),
+                "user_id": str(author.get("id")) if author.get("id") else None,
                 "bot": bool(author.get("bot")),
                 "content": entry.get("content"),
             })
         messages.reverse()          # Discord returns newest-first; read it forwards
 
+        # Render each fetched message with the SAME function the live sensor
+        # uses, so a message read from history is indistinguishable from one
+        # that arrived live. Escaping happens inside message_text, which matters
+        # here more than anywhere: this is other people's text.
+        rendered = "\n\n".join(
+            render_message({"message_id": m["id"], "channel_id": channel_id,
+                            "user_name": m["user"], "user_id": m["user_id"],
+                            "content": m["content"]})
+            for m in messages)
         await ctx.result("ok", {"channel_id": channel_id,
                                 "messages": messages,
-                                "count": len(messages)})
+                                "count": len(messages)},
+                         text=rendered)
 
     async def close(self):
         if self._sender is not None:
