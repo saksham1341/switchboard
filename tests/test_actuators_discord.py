@@ -466,3 +466,38 @@ async def test_history_escapes_a_forged_delimiter_in_relayed_content():
     await a.act(cmd, ActCtx(cmd=cmd, _emit_result=emit))
     text = results[0][2]
     assert "&lt;/untrusted&gt;" in text
+
+
+def test_history_and_live_share_a_renderer_but_not_the_thread_hint():
+    """What the shared renderer actually guarantees, stated precisely.
+
+    Format and escaping cannot drift — same function, one implementation. The
+    FIELD SET can differ: a fetched message carries only what the history API
+    returns, so a message read from inside a thread has no thread_id or
+    thread_messages, while the same message arriving live does. That is not a
+    defect to paper over by faking the fields: the pair is the *thread hint*,
+    whose whole job is to prompt a discord.history call — redundant on a
+    message that arrived through one. Pinned so nobody 'fixes' it by inventing
+    data the actuator never had.
+    """
+    from switchboard.sensors.discord import render_message
+    live = render_message({"message_id": "9", "channel_id": "222",
+                           "thread_id": "222", "user_id": "669",
+                           "user_name": "alice", "content": "hi",
+                           "thread": {"is_thread": True, "message_count": 5}})
+    from_history = render_message({"message_id": "9", "channel_id": "222",
+                                   "user_id": "669", "user_name": "alice",
+                                   "content": "hi"})
+    # identical structure and body
+    assert from_history.splitlines()[0].startswith("[discord.message] ")
+    assert live.split("<untrusted>")[1] == from_history.split("<untrusted>")[1]
+    # the only difference is the thread hint
+    assert "thread_id=222 thread_messages=5" in live
+    assert "thread" not in from_history.splitlines()[0]
+
+
+def test_a_non_string_content_degrades_visibly_rather_than_vanishing():
+    from switchboard.sensors.discord import render_message
+    out = render_message({"channel_id": "222", "content": 12345})
+    assert "12345" in out
+    assert render_message({"channel_id": "222", "content": None}).count("<untrusted>") == 1

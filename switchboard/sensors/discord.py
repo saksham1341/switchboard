@@ -105,9 +105,13 @@ def render_message(payload: dict) -> str:
         if isinstance(count, int):
             fields["thread_messages"] = count
 
-    body = _tag_bot_mentions(
-        payload.get("content") if isinstance(payload.get("content"), str) else "",
-        payload)
+    # None is a legitimately empty message (an attachment-only post); anything
+    # else non-string is a malformed payload, and showing its repr degrades
+    # visibly rather than silently rendering an empty body.
+    content = payload.get("content")
+    if not isinstance(content, str):
+        content = "" if content is None else str(content)
+    body = _tag_bot_mentions(content, payload)
     return message_text("discord.message", fields, body)
 
 
