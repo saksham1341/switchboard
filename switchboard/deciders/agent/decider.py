@@ -7,6 +7,7 @@ no world access — even though the judgment inside the loop is none of those.
 """
 import json
 import logging
+import time
 
 from switchboard.deciders.agent.prompt import SYSTEM
 from switchboard.deciders.agent.session import Sessions
@@ -65,12 +66,17 @@ AGENT_MAX_TOKENS = 1024
 class AgentDecider:
     name = "agent"
 
-    def __init__(self, *, tools, model, system: str | None = None,
+    def __init__(self, *, tools, model, stuck_after: float, system: str | None = None,
                  max_tokens: int = AGENT_MAX_TOKENS):
         self._tools = list(tools)
         self._system = system if system is not None else SYSTEM
         self._model = model
         self._max_tokens = max_tokens
+        # Keyword-required, no default: the correct value depends on Bus
+        # configuration (worst_case_retry_seconds) the decider cannot see, so
+        # a default here would be the decider guessing its own threshold --
+        # precisely the failure the derivation in app.py exists to prevent.
+        self._stuck_after = stuck_after
 
     def bind(self, ctx) -> None:
         self.ctx = ctx
@@ -82,6 +88,7 @@ class AgentDecider:
         # not finding) a pending entry.
         return (obs.name == "discord.message"
                 or obs.name == "switchboard.deadletter"
+                or obs.name == "clock.tick"
                 or obs.command_id is not None)
 
     # --- dispatch --------------------------------------------------------
@@ -89,6 +96,9 @@ class AgentDecider:
     async def decide(self, obs, ctx) -> None:
         if obs.name == "discord.message":
             return await self._on_message(obs, ctx)
+
+        if obs.name == "clock.tick":
+            return await self._sweep_stuck(obs, ctx)
 
         if obs.name == "switchboard.deadletter":
             # A dead command emits no result. The sensor is the only signal and
@@ -236,6 +246,7 @@ class AgentDecider:
         # reply with no matching user turn: a structurally invalid transcript
         # that no watchdog can repair.
         s["state"] = "busy"
+        s["busy_since"] = time.time()
         await self._sessions.save(s)
         await self._sessions.put_pending(cid, {"kind": "llm", "sid": s["sid"]})
 
@@ -364,4 +375,39 @@ class AgentDecider:
         if any(b["is_mention"] for b in s["buffer"]):
             return await self._advance(s, ctx)      # a mention landed while busy
         s["state"] = "idle"                          # keep non-mention context buffered
+        s["busy_since"] = None
         await self._sessions.save(s)
+
+    # --- the watchdog ------------------------------------------------------
+
+    async def _sweep_stuck(self, obs, ctx) -> None:
+        """Free sessions that have been busy longer than any legitimate retry
+        chain could take.
+
+        This runs on a tick rather than on a timer, and that is the point: it
+        arrives as an observation through the decider's own consumer group, so
+        it is serial with every other handler. A maintenance timer would run
+        outside the consume loop and could interleave with an in-flight
+        decide() mid-await, clobbering the very session record it is reading
+        (§5.3 — the settle discipline IS the concurrency control).
+
+        Silent by design: the session goes idle and the event is logged, but
+        nothing is posted. Everything a user sees still comes from the model.
+        """
+        payload = obs.payload if isinstance(obs.payload, dict) else {}
+        now = payload.get("at")
+        if not isinstance(now, (int, float)):
+            return
+        for key in await self.ctx.store.keys("session:"):
+            sid = key.split(":", 1)[1]
+            s = await self._sessions.load(int(sid)) if sid.isdigit() else None
+            if s is None or s.get("state") != "busy":
+                continue
+            since = s.get("busy_since")
+            if not isinstance(since, (int, float)) or now - since < self._stuck_after:
+                continue
+            logger.warning("session %s stuck busy for %.0fs; freeing",
+                           s["sid"], now - since)
+            s["state"] = "idle"
+            s["busy_since"] = None
+            await self._sessions.save(s)

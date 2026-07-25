@@ -11,7 +11,7 @@ async def test_new_session_has_the_documented_shape():
                               thread_id="222", anchor="1234567890")
     assert s == {"sid": 100, "source": "discord", "channel_id": "222",
                  "thread_id": "222", "anchor": "1234567890",
-                 "state": "idle", "turn": 0,
+                 "state": "idle", "turn": 0, "busy_since": None,
                  "messages": [], "buffer": [], "gather": None}
 
 

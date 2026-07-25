@@ -328,3 +328,34 @@ def test_a_missing_model_fails_fast(tmp_path):
     with pytest.raises(ValueError):
         build(_cfg(tmp_path, 8156, llm_backend="openai", llm_api_key="k",
                    llm_base_url="http://x"))
+
+
+def test_the_watchdog_threshold_is_derived_from_the_bus_not_hardcoded(tmp_path):
+    """A literal would silently go stale: the handler timeout is multiplied by
+    (retries + 1), so changing it moves the legitimate-work window by minutes.
+    Derived, the watchdog follows."""
+    from switchboard.app import build
+    cfg = {"mamamia_db_path": str(tmp_path / "mm.db"),
+           "switchboard_db_path": str(tmp_path / "sb.db"),
+           "github_secret": "s", "port": 8164,
+           "discord_bot_token": "t", "discord_application_id": "1",
+           "llm_backend": "openai", "llm_api_key": "k",
+           "llm_base_url": "http://x", "llm_model": "m",
+           "handler_timeout_s": 100.0}
+    bus, _ = build(cfg)
+    agent = next(d for d in bus._deciders if d.name == "agent")
+    assert agent._stuck_after > bus.worst_case_retry_seconds
+
+
+def test_raising_the_handler_timeout_moves_the_watchdog(tmp_path):
+    from switchboard.app import build
+    def mk(port, t):
+        bus, _ = build({"mamamia_db_path": str(tmp_path / f"mm{port}.db"),
+                        "switchboard_db_path": str(tmp_path / f"sb{port}.db"),
+                        "github_secret": "s", "port": port,
+                        "discord_bot_token": "t", "discord_application_id": "1",
+                        "llm_backend": "openai", "llm_api_key": "k",
+                        "llm_base_url": "http://x", "llm_model": "m",
+                        "handler_timeout_s": t})
+        return next(d for d in bus._deciders if d.name == "agent")._stuck_after
+    assert mk(8165, 100.0) > mk(8166, 30.0)

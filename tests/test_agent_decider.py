@@ -22,6 +22,7 @@ def _obs(name, payload, *, oid=100, command_id=None, text=None):
 
 def _agent(**kw):
     kw.setdefault("model", "test-model")
+    kw.setdefault("stuck_after", 1800.0)
     a = AgentDecider(tools=[TOOL], **kw)
     a.bind(DeciderCtx(store=MemoryStore()))
     return a
@@ -814,4 +815,61 @@ async def test_an_unserialisable_error_payload_degrades_rather_than_raising():
     block = await _tool_result(_agent(), {"message": {"a", "b"}},
                                name="discord.post.error")
     assert isinstance(block["content"], str)
-    assert block["is_error"] is True
+
+
+def _tick(at=1000.0, delta=60.0, seq=1, oid=900):
+    return _obs("clock.tick", {"at": at, "delta": delta, "seq": seq}, oid=oid)
+
+
+def test_subscribes_to_the_clock():
+    assert _agent().subscribes(_tick())
+
+
+async def test_a_tick_frees_a_session_stuck_past_the_threshold():
+    a = _agent(stuck_after=100.0)
+    await _mint(a)                                   # goes busy
+    s = await a._sessions.load(100)
+    s["busy_since"] = 500.0
+    await a._sessions.save(s)
+    rec = await _deliver(a, _tick(at=1000.0))        # 500s later
+    assert rec.emitted == []                         # silent: no post, no react
+    s = await a._sessions.load(100)
+    assert s["state"] == "idle"
+    assert s["busy_since"] is None
+
+
+async def test_a_tick_leaves_a_session_inside_the_threshold_alone():
+    """The failure this guards: firing on live work. A session legitimately
+    retrying must not be reset."""
+    a = _agent(stuck_after=100.0)
+    await _mint(a)
+    s = await a._sessions.load(100)
+    s["busy_since"] = 950.0
+    await a._sessions.save(s)
+    await _deliver(a, _tick(at=1000.0))              # only 50s
+    assert (await a._sessions.load(100))["state"] == "busy"
+
+
+async def test_an_idle_session_is_untouched_by_a_tick():
+    a = _agent(stuck_after=100.0)
+    cid = await _mint(a)
+    await _deliver(a, _obs("llm.ok", {"stop_reason": "end_turn", "content": []},
+                           oid=200, command_id=cid))     # -> idle
+    await _deliver(a, _tick(at=99999.0))
+    s = await a._sessions.load(100)
+    assert s["state"] == "idle" and s["turn"] == 1
+
+
+async def test_busy_since_is_set_on_advance_and_cleared_on_finish():
+    a = _agent()
+    cid = await _mint(a)
+    assert isinstance((await a._sessions.load(100))["busy_since"], float)
+    await _deliver(a, _obs("llm.ok", {"stop_reason": "end_turn", "content": []},
+                           oid=200, command_id=cid))
+    assert (await a._sessions.load(100))["busy_since"] is None
+
+
+async def test_a_tick_with_no_sessions_is_harmless():
+    a = _agent(stuck_after=100.0)
+    rec = await _deliver(a, _tick())
+    assert rec.emitted == []

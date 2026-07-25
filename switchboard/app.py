@@ -137,6 +137,13 @@ def build(config: dict):
             bus.add_actuator(LlmActuator(backend))
             bus.add_decider(AgentDecider(
                 model=config["llm_model"],
+                # The watchdog's threshold is derived from the Bus's own
+                # worst-case retry window, never a literal: that window is
+                # the longest a message can honestly stay in flight, and a
+                # decider guessing its own number is exactly the failure the
+                # derivation exists to prevent. The 1.2x margin keeps the
+                # watchdog from firing on the last legitimate retry.
+                stuck_after=bus.worst_case_retry_seconds * 1.2,
                 tools=[agent_post.tool_spec | {"name": agent_post.name},
                        history.tool_spec | {"name": history.name},
                        react.tool_spec | {"name": react.name}]))

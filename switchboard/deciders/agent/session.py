@@ -23,7 +23,7 @@ class Sessions:
     async def new(self, *, sid, source, channel_id, thread_id, anchor) -> dict:
         s = {"sid": sid, "source": source, "channel_id": channel_id,
              "thread_id": thread_id, "anchor": anchor,
-             "state": "idle", "turn": 0,
+             "state": "idle", "turn": 0, "busy_since": None,
              "messages": [], "buffer": [], "gather": None}
         await self.save(s)
         return s
