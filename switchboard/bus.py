@@ -85,7 +85,7 @@ class Bus:
 
     # emit
     async def _append(self, log, name, payload, *, command_id=None, observation_id=None,
-                      emitted_by=None) -> int:
+                      emitted_by=None, text=None) -> int:
         md = {"name": name}
         if command_id is not None:
             md["command_id"] = command_id
@@ -93,6 +93,11 @@ class Bus:
             md["observation_id"] = observation_id
         if emitted_by is not None:
             md["emitted_by"] = emitted_by
+        if text is not None:
+            # Only when supplied. Defaulting to json.dumps(payload) here would
+            # duplicate the payload byte-for-byte in metadata for no gain;
+            # absence is the signal that readers should derive it themselves.
+            md["text"] = text
         mid = await self._registry.get_storage().append(log, payload, metadata=md)
         self._registry.notify(log)
         return mid
@@ -100,13 +105,15 @@ class Bus:
     # emitted_by is stamped by the Bus, never passed by a role: the Bus builds
     # each role's emit callable and so already knows who is calling. A role
     # cannot claim to be another role, and cannot forget to identify itself.
-    async def emit_observation(self, name, payload, command_id=None, emitted_by=None) -> int:
+    async def emit_observation(self, name, payload, command_id=None, emitted_by=None,
+                               text=None) -> int:
         return await self._append(OBS_LOG, name, payload, command_id=command_id,
-                                  emitted_by=emitted_by)
+                                  emitted_by=emitted_by, text=text)
 
-    async def emit_command(self, name, args, observation_id, emitted_by=None) -> int:
+    async def emit_command(self, name, args, observation_id, emitted_by=None,
+                           text=None) -> int:
         return await self._append(CMD_LOG, name, args, observation_id=observation_id,
-                                  emitted_by=emitted_by)
+                                  emitted_by=emitted_by, text=text)
 
     async def start(self) -> None:
         if self._started:
@@ -138,8 +145,8 @@ class Bus:
         for s in self._sensors:
             # _s binds the loop variable: without it every sensor would share the
             # last sensor's name and misattribute every observation.
-            async def _emit(name, payload, _s=s):
-                return await self.emit_observation(name, payload,
+            async def _emit(name, payload, text=None, _s=s):
+                return await self.emit_observation(name, payload, text=text,
                                                    emitted_by=f"sensor/{_s.name}")
             s.bind(SensorCtx(emit=_emit, http=self._http,
                              store=scoped("sensor", s.name),
@@ -276,9 +283,9 @@ class Bus:
     async def _run_decider(self, d):
         emitted_by = f"decider/{d.name}"
 
-        async def emit_command(name, args, observation_id):
+        async def emit_command(name, args, observation_id, text=None):
             return await self.emit_command(name, args, observation_id,
-                                           emitted_by=emitted_by)
+                                           emitted_by=emitted_by, text=text)
 
         async def handle(obs):
             ctx = DecideCtx(obs=obs, _emit_command=emit_command)
@@ -291,9 +298,9 @@ class Bus:
 
         async def handle(cmd):
             ctx = ActCtx(cmd=cmd,
-                         _emit_result=lambda name, payload, cid:
+                         _emit_result=lambda name, payload, cid, text=None:
                              self.emit_observation(name, payload, command_id=cid,
-                                                   emitted_by=emitted_by))
+                                                   emitted_by=emitted_by, text=text))
             await a.act(cmd, ctx)
         await self._consume(CMD_LOG, f"actuator/{a.name}",
                             Command.from_message, lambda c: c.name == a.name, handle)

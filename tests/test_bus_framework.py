@@ -152,3 +152,21 @@ async def test_plain_exception_uses_bus_backoff():
     await bus._consume(CMD_LOG, "actuator/boom", Command.from_message, lambda v: True, handle)
     assert orch.settled == [(5, Outcome.RETRY)]
     assert orch.retry_afters[0] > 0
+
+
+async def test_append_stores_text_only_when_given(tmp_path):
+    """Absence is the default. Storing json.dumps(payload) as `text` would
+    duplicate the payload byte-for-byte in metadata for zero information."""
+    from switchboard.bus import Bus
+    bus = Bus(str(tmp_path / "mm.db"), wait_ms=50, reaper_interval=3600.0)
+    await bus.start()
+    try:
+        await bus.emit_observation("a.thing", {"x": 1})
+        await bus.emit_observation("a.thing", {"x": 2}, text="PRETTY")
+        storage = bus._registry.get_storage()
+        rows = await storage.get_batch("obs", 0, 10)
+        metas = [r.metadata for r in rows]
+        assert "text" not in metas[0]
+        assert metas[1]["text"] == "PRETTY"
+    finally:
+        await bus.stop()

@@ -86,3 +86,38 @@ def test_emitted_by_is_none_when_absent():
         metadata = {"name": "x"}
     assert Observation.from_message(M()).emitted_by is None
     assert Command.from_message(M()).emitted_by is None
+
+
+import json
+
+
+def _msg(payload, metadata):
+    class M:
+        id = 5
+    m = M()
+    m.payload = payload
+    m.metadata = metadata
+    return m
+
+
+def test_observation_rendered_uses_the_stored_text_when_present():
+    obs = Observation.from_message(_msg({"a": 1}, {"name": "x", "text": "PRETTY"}))
+    assert obs.text == "PRETTY"
+    assert obs.rendered == "PRETTY"
+
+
+def test_observation_rendered_falls_back_to_json_when_absent():
+    obs = Observation.from_message(_msg({"a": 1}, {"name": "x"}))
+    assert obs.text is None
+    assert json.loads(obs.rendered) == {"a": 1}
+
+
+def test_command_rendered_falls_back_over_args():
+    cmd = Command.from_message(_msg({"b": 2}, {"name": "y"}))
+    assert json.loads(cmd.rendered) == {"b": 2}
+
+
+def test_rendered_survives_an_unserialisable_payload():
+    # Degrade, never raise: a reader asking for text must not take down a turn.
+    obs = Observation.from_message(_msg({"bad": {1, 2}}, {"name": "x"}))
+    assert isinstance(obs.rendered, str)
