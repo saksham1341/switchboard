@@ -138,6 +138,14 @@ Every knob moves to env, and every name is rewritten to state its job. Conventio
 | `max_dead` | `SB_LOG_MAX_DEAD` | DEAD-row trim limit |
 | — | `SB_SESSION_TTL_S` | 14400 (4h), sliding |
 | — | `SB_CLOCK_TICK_S` | 60 |
+| — | `SB_STUCK_MARGIN` | 1.2 — a **multiplier** on `worst_case_retry_seconds`, clamped at 1.0 |
+
+`SB_STUCK_MARGIN` is deliberately not a duration. The watchdog threshold must
+sit past the Bus's worst-case retry window; a seconds knob makes "fire while
+the command is still legitimately retrying" expressible, and a session freed
+early receives the eventual result after it has already moved on. A margin
+cannot express that, and `build()` clamps it at 1.0 so a hostile value still
+cannot.
 
 `default_timeout_s` → `SB_HANDLER_TIMEOUT_S` is the largest win: "default timeout" for *what* was unanswerable without reading `_consume`.
 

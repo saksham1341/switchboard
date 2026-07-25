@@ -359,3 +359,28 @@ def test_raising_the_handler_timeout_moves_the_watchdog(tmp_path):
                         "handler_timeout_s": t})
         return next(d for d in bus._deciders if d.name == "agent")._stuck_after
     assert mk(8165, 100.0) > mk(8166, 30.0)
+
+
+def _agent_with(tmp_path, port, **extra):
+    from switchboard.app import build
+    bus, _ = build({"mamamia_db_path": str(tmp_path / f"mm{port}.db"),
+                    "switchboard_db_path": str(tmp_path / f"sb{port}.db"),
+                    "github_secret": "s", "port": port,
+                    "discord_bot_token": "t", "discord_application_id": "1",
+                    "llm_backend": "openai", "llm_api_key": "k",
+                    "llm_base_url": "http://x", "llm_model": "m", **extra})
+    return bus, next(d for d in bus._deciders if d.name == "agent")
+
+
+def test_the_stuck_margin_is_a_multiplier_of_the_derived_window(tmp_path):
+    bus, agent = _agent_with(tmp_path, 8167, stuck_margin=2.0)
+    assert agent._stuck_after == bus.worst_case_retry_seconds * 2.0
+
+
+def test_a_stuck_margin_below_one_is_clamped(tmp_path):
+    """The whole point of deriving the threshold is that it sits PAST the
+    retry window. A margin under 1.0 would put it inside, freeing sessions
+    whose commands are still legitimately retrying -- so it cannot be
+    expressible, however the env is set."""
+    bus, agent = _agent_with(tmp_path, 8168, stuck_margin=0.1)
+    assert agent._stuck_after >= bus.worst_case_retry_seconds

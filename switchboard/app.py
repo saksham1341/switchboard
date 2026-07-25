@@ -142,9 +142,14 @@ def build(config: dict):
                 # worst-case retry window, never a literal: that window is
                 # the longest a message can honestly stay in flight, and a
                 # decider guessing its own number is exactly the failure the
-                # derivation exists to prevent. The 1.2x margin keeps the
-                # watchdog from firing on the last legitimate retry.
-                stuck_after=bus.worst_case_retry_seconds * 1.2,
+                # derivation exists to prevent. SB_STUCK_MARGIN scales that
+                # window, it does not replace it: a duration knob would make
+                # "fire before the retries are done" expressible, and a
+                # watchdog that frees a session whose command is still in
+                # flight delivers the result to a session that moved on.
+                # Clamped at 1.0 so even a hostile value keeps the invariant.
+                stuck_after=(bus.worst_case_retry_seconds
+                             * max(1.0, float(config.get("stuck_margin", 1.2)))),
                 session_ttl_s=config.get("session_ttl_s", 14400.0),
                 tools=[agent_post.tool_spec | {"name": agent_post.name},
                        history.tool_spec | {"name": history.name},
@@ -194,6 +199,8 @@ async def run() -> None:
         "log_max_dead": int(os.environ.get("SB_LOG_MAX_DEAD", "500")),
         "clock_tick_s": float(os.environ.get("SB_CLOCK_TICK_S", "60")),
         "session_ttl_s": float(os.environ.get("SB_SESSION_TTL_S", "14400")),
+        # A MULTIPLIER, not a duration -- see the clamp in build().
+        "stuck_margin": float(os.environ.get("SB_STUCK_MARGIN", "1.2")),
         "discord_bot_token": os.environ.get("DISCORD_BOT_TOKEN"),
         "discord_application_id": os.environ.get("DISCORD_APPLICATION_ID"),
         "discord_guild_id": os.environ.get("DISCORD_GUILD_ID"),
