@@ -17,6 +17,54 @@ testable, and it is why the agent is a flat event handler rather than a call
 stack: nothing awaits, and every result re-enters the decider as a new
 observation.
 
+```mermaid
+flowchart LR
+    W(("outside<br/>world"))
+
+    subgraph SEN["Sensors"]
+        SG["github"]
+        SD["discord"]
+        SC["clock"]
+        SL["deadletter"]
+    end
+
+    OBS[("obs log")]
+    CMD[("cmd log")]
+
+    subgraph DEC["Deciders — no world access"]
+        DA["agent"]
+        DG["github-notify"]
+        DP["ping · echo"]
+    end
+
+    subgraph ACT["Actuators"]
+        AL["llm"]
+        AK["kv"]
+        AD["discord.post · history<br/>react · reply"]
+    end
+
+    subgraph TAP["Taps — read only"]
+        TL["logger"]
+        TD["dashboard"]
+    end
+
+    W ==> SEN ==> OBS
+    OBS ==> DEC ==> CMD
+    CMD ==> ACT
+    ACT ==>|effect| W
+    ACT ==>|"result re-enters decide()"| OBS
+    OBS -.-> TAP
+    CMD -.-> TAP
+```
+
+**Read the arrows that are missing.** Nothing points from a Decider to the
+world: it cannot make an HTTP call, read a clock, or touch another component's
+store, so replaying its inputs replays its decisions exactly. Nothing points
+from a Tap back into either log. And every Actuator result returns as a *new
+observation* rather than as a return value — that loop is why the agent is a
+flat event handler rather than a call stack, and why a restart mid-turn loses
+only the in-flight call.
+
 ## Components
 
 | role | what runs |
